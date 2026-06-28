@@ -123,6 +123,10 @@ class MeetingJoinRequestCreateSerializer(serializers.Serializer):
         return value
 
 
+class MeetingAdmissionSerializer(MeetingJoinRequestCreateSerializer):
+    """Validate the user-facing request to enter a meeting session."""
+
+
 class MeetingJoinRequestReviewSerializer(serializers.Serializer):
     """Validate waiting-room review actions."""
 

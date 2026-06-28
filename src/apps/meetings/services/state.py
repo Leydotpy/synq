@@ -10,7 +10,11 @@ from apps.meetings.models import (
     MeetingRoomMembership,
     MeetingSession,
     Participant,
+    ParticipantStatus,
+    RealtimeConnectionStatus,
 )
+
+ACTIVE_CONNECTION_STATUSES = {RealtimeConnectionStatus.ACTIVE}
 
 
 class MeetingStateBuilder:
@@ -37,15 +41,16 @@ class MeetingStateBuilder:
             .get(pk=session.pk)
         )
         participants = list(hydrated_session.participants.all())
+        active_participants = [participant for participant in participants if MeetingStateBuilder.is_active_participant(participant)]
         local_participant = next(
             (
                 participant
-                for participant in participants
+                for participant in active_participants
                 if authenticated_profile is not None and participant.profile_id == authenticated_profile.id
             ),
             None,
         )
-        remote_participants = [participant for participant in participants if local_participant is None or participant.pk != local_participant.pk]
+        remote_participants = [participant for participant in active_participants if local_participant is None or participant.pk != local_participant.pk]
         membership = None
         if authenticated_profile is not None:
             membership = (
@@ -63,10 +68,11 @@ class MeetingStateBuilder:
             "room": MeetingStateBuilder.serialize_room(hydrated_session),
             "session": MeetingStateBuilder.serialize_session(hydrated_session),
             "counts": {
-                "participants": hydrated_session.participant_count or len(participants),
+                "participants": len(active_participants),
                 "publishers": hydrated_session.active_publisher_count,
                 "pending_join_requests": pending_requests.count() if can_manage_waiting_room else 0,
             },
+            "current_profile": MeetingStateBuilder.serialize_profile_summary(authenticated_profile),
             "coordinator_permissions": MeetingStateBuilder.serialize_membership(membership),
             "local_participant": MeetingStateBuilder.serialize_participant(local_participant),
             "remote_participants": [MeetingStateBuilder.serialize_participant(item) for item in remote_participants],
@@ -75,6 +81,14 @@ class MeetingStateBuilder:
             "recent_reactions": [MeetingStateBuilder.serialize_reaction(item) for item in reactions],
             "janus": hydrated_session.janus_state,
         }
+
+    @staticmethod
+    def is_active_participant(participant: Participant) -> bool:
+        """Return whether a participant should be shown as inside the live meeting."""
+
+        if participant.status != ParticipantStatus.ACTIVE:
+            return False
+        return any(connection.status in ACTIVE_CONNECTION_STATUSES for connection in participant.connections.all())
 
     @staticmethod
     def serialize_profile_summary(profile) -> dict | None:
@@ -183,6 +197,7 @@ class MeetingStateBuilder:
                     "metadata": connection.metadata,
                 }
                 for connection in participant.connections.all()
+                if connection.status in ACTIVE_CONNECTION_STATUSES
             ],
             "media_handles": [
                 {
@@ -234,6 +249,17 @@ class MeetingStateBuilder:
             "reviewed_at": join_request.reviewed_at.isoformat() if join_request.reviewed_at else None,
             "resolution_reason": join_request.resolution_reason,
             "created_at": join_request.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def serialize_admission_result(result) -> dict:
+        """Serialize a centralized admission decision for the joining client."""
+
+        return {
+            "status": result.status,
+            "direct_entry": result.direct_entry,
+            "participant": MeetingStateBuilder.serialize_participant(result.participant),
+            "join_request": MeetingStateBuilder.serialize_join_request(result.join_request) if result.join_request else None,
         }
 
     @staticmethod

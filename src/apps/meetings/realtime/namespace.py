@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from asgiref.sync import sync_to_async
 from socketio import AsyncNamespace
 
-from apps.meetings.models import MeetingJoinRequest, MeetingSession, Participant
+from django.conf import settings
+
+from apps.meetings.models import (
+    MeetingJoinRequest,
+    MeetingSession,
+    Participant,
+    ParticipantStatus,
+    RealtimeConnectionStatus,
+)
 from apps.meetings.realtime.auth import extract_ip_address, extract_scope_headers, resolve_socket_user
 from apps.meetings.realtime.emitter import MeetingSocketEmitter
 from apps.meetings.realtime.events import MeetingSocketEvents
@@ -14,6 +23,9 @@ from apps.meetings.services.permissions import MeetingPermissionService
 from apps.meetings.services.signaling import MeetingMediaSignalService
 from apps.meetings.services.state import MeetingStateBuilder
 from core.api.api import _get_or_create_profile_for_user
+
+
+logger = logging.getLogger(__name__)
 
 
 class MeetingNamespace(AsyncNamespace):
@@ -32,22 +44,22 @@ class MeetingNamespace(AsyncNamespace):
 
     async def on_connect(self, sid: str, environ: dict, auth: dict | None) -> None:
         """Authenticate the connecting socket and place it in a profile-scoped room."""
-        print(f"{sid=};{environ=};{auth}")
         user = await sync_to_async(resolve_socket_user)(environ, auth)
         if user is None:
             raise ConnectionRefusedError("Authentication required.")
         profile = await sync_to_async(_get_or_create_profile_for_user)(user)
         await self.save_session(sid, {"user_id": str(user.pk), "profile_id": str(profile.pk)})
         await self.enter_room(sid, MeetingSocketEmitter.profile_room_name(profile.pk))
+        if settings.DEBUG:
+            logger.debug("socket connected with session %s" % (await self.get_session(sid)))
 
     async def on_disconnect(self, sid: str) -> None:
         """Mark the backing realtime connection as disconnected."""
 
         await sync_to_async(MeetingLifecycleService.mark_connection_disconnected)(socket_id=sid)
 
-    async def on_session_subscribe(self, sid: str, data: dict) -> None:
+    async def on_session_subscribe(self, sid: str, data: dict) -> dict:
         """Subscribe a socket to a session room and send a personalized state snapshot."""
-
         profile = await self._get_profile(sid)
         session = await self._get_session(data["session_id"])
         environ = self.server.get_environ(sid, namespace=self.namespace) or {}
@@ -62,6 +74,8 @@ class MeetingNamespace(AsyncNamespace):
             client_session_key=data.get("client_session_key", ""),
             metadata=data.get("metadata", {}),
         )
+        if settings.DEBUG:
+            logger.debug("connection bound to session %s" % connection)
         await self.enter_room(sid, MeetingSocketEmitter.session_room_name(session.pk))
         membership = await sync_to_async(MeetingPermissionService.get_room_membership)(session.room, profile)
         if membership and membership.can_manage_waiting_room:
@@ -69,6 +83,10 @@ class MeetingNamespace(AsyncNamespace):
         state = await sync_to_async(MeetingStateBuilder.build)(session=session, authenticated_profile=profile)
         await self.emit(MeetingSocketEvents.SESSION_STATE, state, to=sid)
         await sync_to_async(MeetingLifecycleService.mark_connection_heartbeat)(socket_id=connection.socket_id)
+
+        if settings.DEBUG:
+            logger.debug("State Sync success %s" % state)
+        return state
 
     async def on_session_join_request(self, sid: str, data: dict) -> None:
         """Create a waiting-room join request for the authenticated profile."""
@@ -150,6 +168,20 @@ class MeetingNamespace(AsyncNamespace):
             reason=data.get("reason", ""),
         )
 
+    async def on_session_leave(self, sid: str, data: dict) -> None:
+        """Mark the current profile as intentionally leaving a session."""
+
+        profile = await self._get_profile(sid)
+        session = await self._get_session(data["session_id"])
+        await sync_to_async(MeetingLifecycleService.leave_participant)(
+            session=session,
+            profile=profile,
+            socket_id=sid,
+            reason=data.get("reason", ""),
+        )
+        await self.leave_room(sid, MeetingSocketEmitter.session_room_name(session.pk))
+        await self.leave_room(sid, MeetingSocketEmitter.coordinator_room_name(session.pk))
+
     async def on_session_heartbeat(self, sid: str, _: dict | None = None) -> None:
         """Refresh realtime heartbeat state for the socket connection."""
 
@@ -179,6 +211,9 @@ class MeetingNamespace(AsyncNamespace):
 
     async def on_session_media_sync_subscriptions(self, sid: str, data: dict) -> dict | None:
         """Join or update the participant subscriber handle to mirror active remote publishers."""
+
+        if settings.DEBUG:
+            logger.debug("on_session_media_sync_subscriptions: %s", data)
 
         participant = await sync_to_async(self._get_participant_for_session_socket)(data["session_id"], sid)
         connection = await sync_to_async(self._get_connection_by_socket)(sid)
@@ -239,8 +274,18 @@ class MeetingNamespace(AsyncNamespace):
 
         from apps.meetings.models import ParticipantConnection
 
-        connection = ParticipantConnection.objects.select_related("participant", "participant__session").get(socket_id=sid)
-        if connection.participant and str(connection.participant.session_id) == str(session_id):
+        connection = (
+            ParticipantConnection.objects.select_related("participant", "participant__session")
+            .filter(socket_id=sid, session_id=session_id, status=RealtimeConnectionStatus.ACTIVE)
+            .first()
+        )
+        if connection is None:
+            raise ValueError("Socket is not subscribed to this meeting session.")
+        if (
+            connection.participant
+            and connection.participant.status == ParticipantStatus.ACTIVE
+            and str(connection.participant.session_id) == str(session_id)
+        ):
             return connection.participant
         raise ValueError("Socket is not bound to an admitted participant in this session.")
 

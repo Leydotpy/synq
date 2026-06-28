@@ -10,6 +10,7 @@ from rest_framework import generics, permissions, response, status, views
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.meetings.api.serializers import (
+    MeetingAdmissionSerializer,
     MeetingJoinRequestCreateSerializer,
     MeetingJoinRequestReviewSerializer,
     MeetingRoomSerializer,
@@ -223,6 +224,34 @@ class MeetingJoinRequestCreateView(CurrentProfileMixin, views.APIView):
         except MeetingDomainError as exc:
             raise ValidationError(str(exc)) from exc
         return response.Response(MeetingStateBuilder.serialize_join_request(join_request), status=status.HTTP_201_CREATED)
+
+
+class MeetingAdmissionView(CurrentProfileMixin, views.APIView):
+    """Centrally decide whether a profile enters directly or waits for approval."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, session_id: str):
+        """Admit direct-entry users and create waiting-room requests only when required."""
+
+        serializer = MeetingAdmissionSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        session = get_object_or_404(MeetingSession.objects.select_related("room"), pk=session_id)
+        try:
+            admission = MeetingLifecycleService.request_admission(
+                session=session,
+                profile=self.get_profile(),
+                requested_display_name=serializer.validated_data.get("display_name", ""),
+                requested_role=serializer.validated_data.get("requested_role", "participant"),
+                note=serializer.validated_data.get("note", ""),
+                client_state=serializer.validated_data.get("client_state", {}),
+                passcode=serializer.validated_data.get("passcode"),
+                invite_token=serializer.validated_data.get("invite_token"),
+            )
+        except MeetingDomainError as exc:
+            raise ValidationError(str(exc)) from exc
+        response_status = status.HTTP_200_OK if admission.direct_entry else status.HTTP_201_CREATED
+        return response.Response(MeetingStateBuilder.serialize_admission_result(admission), status=response_status)
 
 
 class MeetingSessionShareView(CurrentProfileMixin, views.APIView):

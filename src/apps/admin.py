@@ -29,19 +29,14 @@ from django.utils.text import capfirst
 # App labels owned and maintained in this repository.
 FIRST_PARTY_APP_LABELS: set[str] = {
     "profiles",
-    "categories",
-    "channels",
-    "memberships",
-    "billing",
-    "sports",
-    "streams",
+    "meetings"
 }
 
 # Maximum number of related objects previewed in one list-display M2M column.
 M2M_LINK_PREVIEW_LIMIT = 6
 
-admin.site.site_header = "Brudkast Administration"
-admin.site.site_title = "Brudkast Admin"
+admin.site.site_header = "Synq Administration"
+admin.site.site_title = "Synq Admin"
 admin.site.index_title = "Operations Console"
 
 

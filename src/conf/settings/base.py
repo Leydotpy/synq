@@ -73,7 +73,7 @@ SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-bootstrap-meet-secr
 DEBUG = env_bool("DJANGO_DEBUG", default=env_bool("DJANGO_DEBUG", default=True))
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", default=["127.0.0.1", "localhost"])
 
-AUTH_USER_MODEL = config("DJANGO_AUTH_USER_MODEL", default="users.ClerkUser", cast=str)
+AUTH_USER_MODEL = "users.ClerkUser"
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -100,8 +100,11 @@ MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
+    "core.middleware.clerk.EnsureApiCsrfCookieMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    # "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
+    "core.middleware.clerk.StripClerkSessionCookieMiddleware",
+    "core.middleware.clerk.RejectExpiredClerkAuthorizationMiddleware",
+    "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
     "core.middleware.janus.JanusSessionMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -179,7 +182,7 @@ else:
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "core.api.authentication.SessionOrClerkAuthentication",
+        "core.api.clerk_authentication.LazyClerkAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
@@ -234,16 +237,29 @@ EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.console.Em
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "Synq Meet <no-reply@synq.local>")
 
 # Required in production, but allowed to fall back locally so imports and tooling stay usable.
-CLERK_SECRET_KEY = config("CLERK_SECRET_KEY", default="clerk-dev-placeholder", cast=str)
+CLERK_SECRET_KEY = config("CLERK_SECRET_KEY", cast=str)
 
 # Optional
-CLERK_AUTH_PARTIES = _config_list("CLERK_AUTH_PARTIES", default=["http://localhost:3000"])
-CLERK_AUDIENCE = _config_list("CLERK_AUDIENCE") or None
-# CLERK_JWT_KEY = "..."  # optional Clerk JWT verification key
-CLERK_API_URL = config("CLERK_API_URL", default="https://api.clerk.com", cast=str)
-CLERK_TIMEOUT_MS = 5000
-CLERK_CLOCK_SKEW_IN_MS = 5000
-CLERK_CACHE_TIMEOUT = 300
+CLERK_ACCEPT_BROWSER_SESSION_COOKIES = config(
+    "CLERK_ACCEPT_BROWSER_SESSION_COOKIES",
+    default=False,
+    cast=bool,
+)
+CLERK_AUTH_PARTIES = tuple(
+    origin.strip()
+    for origin in config(
+        "CLERK_AUTH_PARTIES",
+        default="http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+)
+# CLERK_AUTH_PARTIES = _config_list("CLERK_AUTH_PARTIES", default=["http://localhost:3000"])
+# CLERK_AUDIENCE = _config_list("CLERK_AUDIENCE") or None
+# CLERK_JWT_KEY = config("CLERK_JWT_KEY", default="", cast=str) or None
+# CLERK_API_URL = config("CLERK_API_URL", default="https://api.clerk.com", cast=str)
+# CLERK_TIMEOUT_MS = 5000
+# CLERK_CLOCK_SKEW_IN_MS = 5000
+# CLERK_CACHE_TIMEOUT = 300
 
 # CORS defaults are intentionally conservative at the shared/base layer.
 # Environment-specific modules can opt into allow-all behavior for local
