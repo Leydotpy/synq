@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
-from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+from django.core.exceptions import (
+    PermissionDenied as DjangoPermissionDenied,
+    ValidationError as DjangoValidationError,
+)
 from django.utils import timezone
 from rest_framework import generics, permissions, response, status, views
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, PermissionDenied
 
 from apps.meetings.api.serializers import (
     MeetingAdmissionSerializer,
@@ -15,6 +19,7 @@ from apps.meetings.api.serializers import (
     MeetingJoinRequestReviewSerializer,
     MeetingRoomSerializer,
     MeetingSessionCreateSerializer,
+    MeetingSessionEndSerializer,
     MeetingServiceSessionCreateSerializer,
     MeetingSessionStartSerializer,
     MeetingSessionShareSerializer,
@@ -22,13 +27,118 @@ from apps.meetings.api.serializers import (
     ParticipantUpdateSerializer,
 )
 from apps.meetings.exceptions import MeetingDomainError
-from apps.meetings.models import MeetingJoinRequest, MeetingRoom, MeetingSession, Participant
+from apps.meetings.models import (
+    ExternalMeetingBinding,
+    ExternalMeetingProvider,
+    MeetingJoinRequest,
+    MeetingRoom,
+    MeetingSession,
+    Participant,
+)
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.services.invitations import MeetingInvitationService
 from apps.meetings.services.permissions import MeetingPermissionService
 from apps.meetings.services.state import MeetingStateBuilder
 from core.api.api import CurrentProfileMixin
 from core.api.service_auth import ServiceTokenAuthentication
+
+
+SERVICE_MEETING_PROVIDER = ExternalMeetingProvider.LAW_FIRM_WORKSPACE
+
+
+class MeetingRequestError(APIException):
+    """Expose domain validation failures through one stable 400 envelope."""
+
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_detail = "Invalid meeting request."
+    default_code = "meeting_request_invalid"
+
+
+def _model_validation_detail(exc: DjangoValidationError) -> str:
+    """Flatten Django model validation into one stable API-facing message."""
+
+    if hasattr(exc, "message_dict"):
+        return "; ".join(
+            f"{field}: {', '.join(str(message) for message in messages)}"
+            for field, messages in sorted(exc.message_dict.items())
+        )
+    return "; ".join(str(message) for message in exc.messages)
+
+
+def _raise_detail_validation_error(exc: Exception) -> None:
+    """Raise a consistent DRF 400 envelope for domain and model failures."""
+
+    detail = _model_validation_detail(exc) if isinstance(exc, DjangoValidationError) else str(exc)
+    raise MeetingRequestError(detail) from exc
+
+
+def _validate_service_binding_owner(*, binding: ExternalMeetingBinding, profile) -> None:
+    """Prevent a changed service identity from taking over an existing binding."""
+
+    if binding.service_owner_profile_id != profile.pk:
+        raise MeetingDomainError(
+            "External meeting identity is owned by a different service profile."
+        )
+
+
+def _create_or_reuse_service_room_and_session(*, profile, payload: dict, metadata: dict):
+    """Resolve one service-owned room/session through a durable external binding."""
+
+    external_id = payload["external_id"]
+
+    def resolve_in_transaction():
+        with transaction.atomic():
+            binding = (
+                ExternalMeetingBinding.objects.select_for_update()
+                .select_related("room")
+                .filter(provider=SERVICE_MEETING_PROVIDER, external_id=external_id)
+                .first()
+            )
+            if binding is None:
+                room = MeetingLifecycleService.create_room(
+                    creator_profile=profile,
+                    title=payload["title"],
+                    description=payload.get("description", ""),
+                    scheduled_start_at=payload.get("scheduled_start_at"),
+                    scheduled_end_at=payload.get("scheduled_end_at"),
+                    metadata=metadata,
+                )
+                ExternalMeetingBinding.objects.create(
+                    provider=SERVICE_MEETING_PROVIDER,
+                    external_id=external_id,
+                    room=room,
+                    service_owner_profile=profile,
+                )
+            else:
+                _validate_service_binding_owner(binding=binding, profile=profile)
+                room = binding.room
+
+            session = MeetingLifecycleService.start_session(
+                room=room,
+                started_by_profile=profile,
+                metadata=metadata,
+            )
+            return room, session
+
+    try:
+        return resolve_in_transaction()
+    except IntegrityError:
+        # A concurrent request may have inserted the provider/external-id row
+        # after our initial lookup. Resolve the committed winner rather than
+        # leaving the caller with an orphan room or a non-idempotent retry.
+        binding = (
+            ExternalMeetingBinding.objects.select_related("room")
+            .filter(provider=SERVICE_MEETING_PROVIDER, external_id=external_id)
+            .first()
+        )
+        if binding is None:
+            raise
+        _validate_service_binding_owner(binding=binding, profile=profile)
+        return binding.room, MeetingLifecycleService.start_session(
+            room=binding.room,
+            started_by_profile=profile,
+            metadata=metadata,
+        )
 
 
 class MeetingRoomListCreateView(CurrentProfileMixin, generics.ListCreateAPIView):
@@ -57,8 +167,8 @@ class MeetingRoomListCreateView(CurrentProfileMixin, generics.ListCreateAPIView)
 
         try:
             serializer.save()
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
 
 
 class MeetingRoomDetailView(CurrentProfileMixin, generics.RetrieveAPIView):
@@ -98,8 +208,8 @@ class MeetingSessionStartView(CurrentProfileMixin, views.APIView):
             )
         except DjangoPermissionDenied as exc:
             raise PermissionDenied(str(exc)) from exc
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
         return response.Response(
             MeetingStateBuilder.build(session=session, authenticated_profile=profile),
             status=status.HTTP_201_CREATED,
@@ -164,8 +274,8 @@ class MeetingSessionCreateView(CurrentProfileMixin, views.APIView):
                     message=payload.get("message", ""),
                     expires_in_seconds=expires_in_seconds,
                 )
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
 
         return response.Response(
             {
@@ -199,6 +309,38 @@ class MeetingSessionStateView(CurrentProfileMixin, views.APIView):
         return response.Response(MeetingStateBuilder.build(session=session, authenticated_profile=self.get_profile()))
 
 
+class MeetingSessionEndView(CurrentProfileMixin, views.APIView):
+    """End a live session for every participant after a coordinator check."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, session_id: str):
+        """End the meeting idempotently and return the caller's terminal snapshot."""
+
+        serializer = MeetingSessionEndSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        session = get_object_or_404(
+            MeetingSession.objects.select_related("room", "started_by_profile"),
+            pk=session_id,
+        )
+        try:
+            session = MeetingLifecycleService.end_session(
+                session=session,
+                actor_profile=self.get_profile(),
+                reason=serializer.validated_data.get("reason", ""),
+            )
+        except DjangoPermissionDenied as exc:
+            raise PermissionDenied(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
+        return response.Response(
+            MeetingStateBuilder.build(
+                session=session,
+                authenticated_profile=self.get_profile(),
+            )
+        )
+
+
 class MeetingJoinRequestCreateView(CurrentProfileMixin, views.APIView):
     """Create a waiting-room join request for the authenticated profile."""
 
@@ -221,8 +363,8 @@ class MeetingJoinRequestCreateView(CurrentProfileMixin, views.APIView):
                 passcode=serializer.validated_data.get("passcode"),
                 invite_token=serializer.validated_data.get("invite_token"),
             )
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
         return response.Response(MeetingStateBuilder.serialize_join_request(join_request), status=status.HTTP_201_CREATED)
 
 
@@ -245,11 +387,12 @@ class MeetingAdmissionView(CurrentProfileMixin, views.APIView):
                 requested_role=serializer.validated_data.get("requested_role", "participant"),
                 note=serializer.validated_data.get("note", ""),
                 client_state=serializer.validated_data.get("client_state", {}),
+                client_session_key=serializer.validated_data.get("client_session_key", ""),
                 passcode=serializer.validated_data.get("passcode"),
                 invite_token=serializer.validated_data.get("invite_token"),
             )
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
         response_status = status.HTTP_200_OK if admission.direct_entry else status.HTTP_201_CREATED
         return response.Response(MeetingStateBuilder.serialize_admission_result(admission), status=response_status)
 
@@ -281,8 +424,8 @@ class MeetingSessionShareView(CurrentProfileMixin, views.APIView):
             )
         except DjangoPermissionDenied as exc:
             raise PermissionDenied(str(exc)) from exc
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
         return response.Response(payload, status=status.HTTP_201_CREATED)
 
 
@@ -310,8 +453,8 @@ class MeetingJoinRequestReviewView(CurrentProfileMixin, views.APIView):
             )
         except DjangoPermissionDenied as exc:
             raise PermissionDenied(str(exc)) from exc
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
         return response.Response(
             {
                 "join_request": MeetingStateBuilder.serialize_join_request(join_request),
@@ -341,8 +484,8 @@ class MeetingParticipantDetailView(CurrentProfileMixin, views.APIView):
             )
         except DjangoPermissionDenied as exc:
             raise PermissionDenied(str(exc)) from exc
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
         return response.Response(MeetingStateBuilder.serialize_participant(participant))
 
     def delete(self, request, session_id: str, participant_id: str):
@@ -360,8 +503,8 @@ class MeetingParticipantDetailView(CurrentProfileMixin, views.APIView):
             )
         except DjangoPermissionDenied as exc:
             raise PermissionDenied(str(exc)) from exc
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
         return response.Response(MeetingStateBuilder.serialize_participant(participant), status=status.HTTP_200_OK)
 
 
@@ -379,22 +522,12 @@ class MeetingServiceSessionCreateView(CurrentProfileMixin, views.APIView):
         metadata = {
             **payload.get("metadata", {}),
             "external_id": payload["external_id"],
-            "source": "law_firm_workspace",
+            "source": SERVICE_MEETING_PROVIDER,
         }
         try:
-            room = MeetingRoom.objects.filter(metadata__external_id=payload["external_id"]).first()
-            if room is None:
-                room = MeetingLifecycleService.create_room(
-                    creator_profile=profile,
-                    title=payload["title"],
-                    description=payload.get("description", ""),
-                    scheduled_start_at=payload.get("scheduled_start_at"),
-                    scheduled_end_at=payload.get("scheduled_end_at"),
-                    metadata=metadata,
-                )
-            session = MeetingLifecycleService.start_session(
-                room=room,
-                started_by_profile=profile,
+            room, session = _create_or_reuse_service_room_and_session(
+                profile=profile,
+                payload=payload,
                 metadata=metadata,
             )
             invite_token = MeetingInvitationService.create_invite_token(
@@ -416,8 +549,8 @@ class MeetingServiceSessionCreateView(CurrentProfileMixin, views.APIView):
                     message=payload.get("description", ""),
                     expires_in_seconds=payload.get("expires_in_seconds"),
                 )
-        except MeetingDomainError as exc:
-            raise ValidationError(str(exc)) from exc
+        except (MeetingDomainError, DjangoValidationError) as exc:
+            _raise_detail_validation_error(exc)
 
         return response.Response(
             {

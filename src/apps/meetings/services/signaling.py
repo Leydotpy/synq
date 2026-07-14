@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable, Sequence
 
 from django.db import transaction
@@ -20,16 +21,21 @@ from apps.meetings.models import (
     ParticipantConnection,
     ParticipantMediaHandle,
     ParticipantStream,
+    MeetingLifecycleState,
 )
 from apps.meetings.realtime.emitter import MeetingSocketEmitter
 from apps.meetings.services.janus import (
     call_plugin_method,
     ensure_participant_media_plugin,
     ensure_session_control_handle,
+    resolve_janus_session,
     serialize_janus_response,
 )
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.services.permissions import MeetingPermissionService
+
+
+logger = logging.getLogger(__name__)
 
 
 def _serialize_model(value: Any) -> dict[str, Any]:
@@ -87,6 +93,105 @@ def _track_source(track: dict[str, Any]) -> str:
     return str(track.get("source") or track.get("description") or track.get("kind") or "").strip().lower()
 
 
+def _sending_sdp_media_sections(sdp: str) -> list[dict[str, str]]:
+    """Return active audio/video m-lines that can send browser media."""
+
+    session_direction = "sendrecv"
+    sections: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+
+    def finish_section() -> None:
+        if not current:
+            return
+        if (
+            current.get("kind") in {"audio", "video"}
+            and current.get("port") != "0"
+            and current.get("direction", session_direction)
+            in {"sendrecv", "sendonly"}
+        ):
+            sections.append(dict(current))
+
+    for raw_line in sdp.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if line.startswith("m="):
+            finish_section()
+            parts = line[2:].split()
+            current = {
+                "kind": parts[0].lower() if parts else "",
+                "port": parts[1] if len(parts) > 1 else "0",
+                "direction": session_direction,
+                "mid": "",
+            }
+            continue
+        if line in {"a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"}:
+            direction = line[2:]
+            if current is None:
+                session_direction = direction
+            else:
+                current["direction"] = direction
+            continue
+        if current is not None and line.startswith("a=mid:"):
+            current["mid"] = line.removeprefix("a=mid:").strip()
+
+    finish_section()
+    return sections
+
+
+def _validate_track_descriptors_against_sdp(
+    sdp: str,
+    tracks: Sequence[dict[str, Any]],
+) -> None:
+    """Reject omitted, duplicated, or kind-spoofed active SDP media sections."""
+
+    if len(tracks) > 16 or any(not isinstance(track, dict) for track in tracks):
+        raise MeetingDomainError("Publisher track descriptors are invalid.")
+    descriptors_by_mid: dict[str, dict[str, Any]] = {}
+    allowed_sources = {
+        "audio": {"microphone", "screen_share_audio"},
+        "video": {"camera", "screen_share"},
+    }
+    for track in tracks:
+        mid = str(track.get("mid") or "").strip()
+        kind = str(track.get("kind") or "").strip().lower()
+        source = _track_source(track)
+        if not mid or mid in descriptors_by_mid:
+            raise MeetingDomainError("Every publisher track must declare a unique SDP MID.")
+        if kind not in allowed_sources or source not in allowed_sources[kind]:
+            raise MeetingDomainError("Publisher track kind or source is invalid.")
+        descriptors_by_mid[mid] = track
+
+    sending_sections = _sending_sdp_media_sections(sdp)
+    sending_mids = {section.get("mid", "") for section in sending_sections}
+    if "" in sending_mids:
+        raise MeetingDomainError("Every active publisher SDP media section must have a MID.")
+    if sending_mids != set(descriptors_by_mid):
+        raise MeetingDomainError(
+            "Publisher track descriptors must match every active SDP media section."
+        )
+    for section in sending_sections:
+        descriptor = descriptors_by_mid[section["mid"]]
+        if str(descriptor.get("kind") or "").lower() != section["kind"]:
+            raise MeetingDomainError("Publisher track kind does not match its SDP media section.")
+
+
+def _ensure_media_session_ready(session: MeetingSession) -> None:
+    """Fail with a retryable domain message until Janus provisioning is complete."""
+
+    session.refresh_from_db(fields=["lifecycle_state", "janus_room_id"])
+    if session.lifecycle_state in {
+        MeetingLifecycleState.ENDING,
+        MeetingLifecycleState.ENDED,
+        MeetingLifecycleState.FAILED,
+    }:
+        raise MeetingDomainError("Meeting media is unavailable because the session is no longer live.")
+    if (
+        session.lifecycle_state
+        not in {MeetingLifecycleState.WAITING, MeetingLifecycleState.ACTIVE}
+        or not session.janus_room_id
+    ):
+        raise MeetingDomainError("Meeting media is still provisioning. Please retry shortly.")
+
+
 def _resolve_media_kind(media_type: str | None, description: str | None = None) -> str:
     """Map Janus and client stream labels into the local meeting media taxonomy."""
 
@@ -120,6 +225,7 @@ def _get_or_create_media_handle(
     expected_connection = connection or media_handle.connection or participant.connections.order_by("-connected_at").first()
     updates: list[str] = []
     if expected_connection and media_handle.connection_id != expected_connection.pk:
+        _reset_media_handle_for_connection(media_handle)
         media_handle.connection = expected_connection
         updates.append("connection")
     if media_handle.lifecycle_state == JanusHandleLifecycleState.DETACHED:
@@ -128,6 +234,44 @@ def _get_or_create_media_handle(
     if updates:
         media_handle.save(update_fields=[*updates, "updated_at"])
     return media_handle
+
+
+def _reset_media_handle_for_connection(media_handle: ParticipantMediaHandle) -> None:
+    """Release process-owned state before a replacement browser connection negotiates."""
+
+    handle_id = str(media_handle.janus_handle_id or "")
+    if handle_id:
+        try:
+            janus_session = resolve_janus_session()
+            owns_handle = (
+                str(media_handle.janus_session_id or "")
+                == str(getattr(janus_session, "id", "") or "")
+            )
+            if owns_handle:
+                call_plugin_method(media_handle.handle, "detach")
+        except Exception:
+            logger.exception(
+                "Unable to detach replaced Janus handle '%s'; room cleanup will reclaim it.",
+                handle_id,
+            )
+    media_handle.streams.all().delete()
+    media_handle.janus_handle_id = None
+    media_handle.janus_session_id = ""
+    media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHING
+    media_handle.selected_streams = []
+    media_handle.jsep_offer = {}
+    media_handle.jsep_answer = {}
+    media_handle.save(
+        update_fields=[
+            "janus_handle_id",
+            "janus_session_id",
+            "lifecycle_state",
+            "selected_streams",
+            "jsep_offer",
+            "jsep_answer",
+            "updated_at",
+        ]
+    )
 
 
 def _build_stream_descriptions(tracks: Sequence[dict[str, Any]]) -> list[StreamDescription]:
@@ -177,7 +321,11 @@ def _ensure_publish_permissions(participant: Participant, tracks: Sequence[dict[
 
     wants_audio = any(track.get("kind") == "audio" for track in tracks)
     wants_video = any(track.get("kind") == "video" and _track_source(track) != "screen_share" for track in tracks)
-    wants_screen = any(_track_source(track) == "screen_share" for track in tracks)
+    wants_screen = any(_track_source(track).startswith("screen_share") for track in tracks)
+    if wants_audio and participant.is_muted:
+        raise MeetingDomainError("This participant is muted and cannot publish audio.")
+    if (wants_video or wants_screen) and participant.is_camera_blocked:
+        raise MeetingDomainError("This participant's video publishing is blocked.")
     if wants_audio:
         MeetingPermissionService.require_participant_capability(participant=participant, capability_field="can_publish_audio")
     if wants_video:
@@ -403,10 +551,18 @@ class MeetingMediaSignalService:
     ) -> dict[str, Any]:
         """Join, publish, or reconfigure the participant publisher handle with a browser SDP offer."""
 
-        if not offer.get("sdp"):
+        if (
+            offer.get("type") not in {None, "offer"}
+            or not isinstance(offer.get("sdp"), str)
+            or not offer.get("sdp")
+        ):
             raise MeetingDomainError("A publisher SDP offer is required.")
+        if len(str(offer["sdp"])) > 1_000_000:
+            raise MeetingDomainError("Publisher SDP offer is too large.")
 
         track_descriptors = list(tracks or [])
+        _ensure_media_session_ready(participant.session)
+        _validate_track_descriptors_against_sdp(offer["sdp"], track_descriptors)
         _ensure_publish_permissions(participant, track_descriptors)
         media_handle = _get_or_create_media_handle(
             participant=participant,
@@ -507,6 +663,58 @@ class MeetingMediaSignalService:
         }
 
     @staticmethod
+    def apply_moderation(*, participant: Participant) -> dict[str, bool]:
+        """Apply persisted mute and publishing permissions to active Janus MIDs."""
+
+        if not participant.janus_publisher_id:
+            return {}
+        _ensure_media_session_ready(participant.session)
+        control_handle = ensure_session_control_handle(participant.session)
+        results: dict[str, bool] = {}
+        streams = ParticipantStream.objects.filter(
+            participant=participant,
+            direction=MediaDirection.OUTBOUND,
+            is_active=True,
+        )
+        for stream in streams:
+            source = str((stream.metadata or {}).get("description") or "")
+            normalized_source = source.strip().lower().replace("-", "_")
+            if normalized_source == "screen_share_audio":
+                should_mute = (
+                    participant.is_muted
+                    or not participant.can_publish_audio
+                    or participant.is_camera_blocked
+                    or not participant.can_share_screen
+                )
+            elif stream.media_kind == MediaKind.AUDIO:
+                should_mute = participant.is_muted or not participant.can_publish_audio
+            elif stream.media_kind == MediaKind.SCREEN:
+                should_mute = (
+                    participant.is_camera_blocked
+                    or not participant.can_share_screen
+                )
+            else:
+                should_mute = (
+                    participant.is_camera_blocked
+                    or not participant.can_publish_video
+                )
+            call_plugin_method(
+                control_handle,
+                "moderate",
+                room=participant.session.janus_room_id,
+                id=participant.janus_publisher_id,
+                mid=stream.janus_mid,
+                mute=should_mute,
+                secret=participant.session.janus_room_secret or None,
+            )
+            stream.is_moderated = should_mute
+            stream.save(update_fields=["is_moderated", "updated_at"])
+            results[stream.janus_mid] = should_mute
+        MeetingLifecycleService.refresh_session_metrics(session=participant.session)
+        MeetingSocketEmitter.emit_session_state(session=participant.session)
+        return results
+
+    @staticmethod
     def sync_subscriptions(
         *,
         participant: Participant,
@@ -514,6 +722,7 @@ class MeetingMediaSignalService:
     ) -> dict[str, Any]:
         """Join or update the participant subscriber handle so it mirrors all remote publishers."""
 
+        _ensure_media_session_ready(participant.session)
         media_handle = _get_or_create_media_handle(
             participant=participant,
             handle_type=JanusHandleType.SUBSCRIBER,
@@ -534,6 +743,7 @@ class MeetingMediaSignalService:
         response = None
         jsep_payload = None
         stream_payloads: Sequence[dict[str, Any]] = []
+        has_authoritative_streams = False
 
         if not serialized_targets and not current_targets:
             pass
@@ -578,7 +788,12 @@ class MeetingMediaSignalService:
             media_handle.janus_state = serialized_response
             media_handle.last_event_at = timezone.now()
             plugin_data = getattr(getattr(response, "plugindata", None), "data", None)
-            stream_payloads = list(_serialize_model(plugin_data).get("streams") or []) if plugin_data else []
+            plugin_payload = _serialize_model(plugin_data) if plugin_data else {}
+            has_authoritative_streams = isinstance(
+                plugin_payload.get("streams"),
+                list,
+            )
+            stream_payloads = list(plugin_payload.get("streams") or [])
             jsep_payload = _serialize_jsep(getattr(response, "jsep", None))
             if jsep_payload and jsep_payload.get("type") == "offer":
                 media_handle.jsep_offer = jsep_payload
@@ -597,7 +812,10 @@ class MeetingMediaSignalService:
                 "updated_at",
             ]
         )
-        _reconcile_subscriber_streams(media_handle, stream_payloads)
+        if has_authoritative_streams:
+            _reconcile_subscriber_streams(media_handle, stream_payloads)
+        elif not serialized_targets:
+            media_handle.streams.filter(direction=MediaDirection.INBOUND).delete()
 
         participant.session.janus_state = {**participant.session.janus_state, "participants": serialized_publishers}
         participant.session.last_synced_at = timezone.now()
@@ -624,7 +842,12 @@ class MeetingMediaSignalService:
     ) -> dict[str, Any]:
         """Start media flow on a subscriber handle with the browser's SDP answer."""
 
-        if not answer.get("sdp"):
+        _ensure_media_session_ready(participant.session)
+        if (
+            answer.get("type") not in {None, "answer"}
+            or not isinstance(answer.get("sdp"), str)
+            or not answer.get("sdp")
+        ):
             raise MeetingDomainError("A subscriber SDP answer is required.")
 
         media_handle = _get_or_create_media_handle(
@@ -672,6 +895,7 @@ class MeetingMediaSignalService:
     ) -> dict[str, Any]:
         """Forward browser ICE candidates to the Janus publisher or subscriber handle."""
 
+        _ensure_media_session_ready(participant.session)
         if handle_type not in {JanusHandleType.PUBLISHER, JanusHandleType.SUBSCRIBER}:
             raise MeetingDomainError("Unsupported Janus handle type for ICE trickle.")
 
@@ -698,6 +922,75 @@ class MeetingMediaSignalService:
             "streams": _serialize_handle_streams(media_handle),
             "selected_streams": media_handle.selected_streams,
         }
+
+    @staticmethod
+    def detach_participant_handles(*, participant: Participant) -> dict[str, Any]:
+        """Detach handles owned by the current Janus session and clear persisted media state."""
+
+        try:
+            janus_session = resolve_janus_session()
+            current_session_id = str(getattr(janus_session, "id", "") or "")
+        except Exception:
+            janus_session = None
+            current_session_id = ""
+
+        detached: list[str] = []
+        skipped: list[str] = []
+        for media_handle in participant.media_handles.all():
+            handle_id = str(media_handle.janus_handle_id or "")
+            owns_handle = bool(
+                janus_session is not None
+                and handle_id
+                and str(media_handle.janus_session_id or "") == current_session_id
+            )
+            if owns_handle:
+                try:
+                    call_plugin_method(media_handle.handle, "detach")
+                    detached.append(handle_id)
+                except Exception:
+                    logger.exception(
+                        "Unable to detach Janus handle '%s' for participant '%s'.",
+                        handle_id,
+                        participant.pk,
+                    )
+                    skipped.append(handle_id)
+            elif handle_id:
+                skipped.append(handle_id)
+
+            media_handle.streams.all().delete()
+            media_handle.janus_handle_id = None
+            media_handle.janus_session_id = ""
+            media_handle.lifecycle_state = JanusHandleLifecycleState.DETACHED
+            media_handle.selected_streams = []
+            media_handle.jsep_offer = {}
+            media_handle.jsep_answer = {}
+            media_handle.last_event_at = timezone.now()
+            media_handle.save(
+                update_fields=[
+                    "janus_handle_id",
+                    "janus_session_id",
+                    "lifecycle_state",
+                    "selected_streams",
+                    "jsep_offer",
+                    "jsep_answer",
+                    "last_event_at",
+                    "updated_at",
+                ],
+            )
+
+        participant.janus_publisher_id = ""
+        participant.janus_private_id = ""
+        participant.janus_state = {}
+        participant.save(
+            update_fields=[
+                "janus_publisher_id",
+                "janus_private_id",
+                "janus_state",
+                "updated_at",
+            ],
+        )
+        MeetingLifecycleService.refresh_session_metrics(session=participant.session)
+        return {"detached": detached, "skipped": skipped}
 
     @staticmethod
     def handle_callback_snapshot(instance: Any, normalized_event: dict[str, Any]) -> None:

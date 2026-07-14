@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from decouple import config, Csv
+from django.core.exceptions import ImproperlyConfigured
 
 
 def env_value(*names: str, default: str | None = None) -> str | None:
@@ -16,6 +17,15 @@ def env_value(*names: str, default: str | None = None) -> str | None:
         value = os.getenv(name)
         if value not in (None, ""):
             return value
+    return default
+
+
+def env_optional_value(*names: str, default: str | None = None) -> str | None:
+    """Return an explicitly configured value, treating an empty value as disabled."""
+
+    for name in names:
+        if name in os.environ:
+            return os.environ[name].strip() or None
     return default
 
 
@@ -70,10 +80,10 @@ def _config_list(name: str, default: list[str] | None = None) -> list[str]:
 BASE_DIR = Path(__file__).resolve().parents[2]
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-bootstrap-meet-secret-key")
-DEBUG = env_bool("DJANGO_DEBUG", default=env_bool("DJANGO_DEBUG", default=True))
+DEBUG = env_bool("DJANGO_DEBUG", default=env_bool("DJANDO_DEBUG", default=True))
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", default=["127.0.0.1", "localhost"])
 
-AUTH_USER_MODEL = "users.ClerkUser"
+AUTH_USER_MODEL = config("DJANGO_AUTH_USER_MODEL", default="users.ClerkUser", cast=str)
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -100,11 +110,8 @@ MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
-    "core.middleware.clerk.EnsureApiCsrfCookieMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "core.middleware.clerk.StripClerkSessionCookieMiddleware",
-    "core.middleware.clerk.RejectExpiredClerkAuthorizationMiddleware",
-    "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
+    # "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
     "core.middleware.janus.JanusSessionMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -168,6 +175,14 @@ if REDIS_URL:
             "LOCATION": REDIS_URL,
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
+                # Redis improves performance and cross-process coordination, but
+                # an optional authentication cache must not turn a broker/cache
+                # outage into a 500 response. Socket.IO and Celery still log
+                # their own dependency failures explicitly.
+                "IGNORE_EXCEPTIONS": env_bool(
+                    "REDIS_IGNORE_EXCEPTIONS",
+                    default=True,
+                ),
             },
             "KEY_PREFIX": "meet",
         },
@@ -182,7 +197,7 @@ else:
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "core.api.clerk_authentication.LazyClerkAuthentication",
+        "core.api.authentication.SessionOrClerkAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
@@ -200,17 +215,69 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 60 * 15
+CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", default=False)
+CELERY_TASK_EAGER_PROPAGATES = env_bool("CELERY_TASK_EAGER_PROPAGATES", default=False)
+# Request paths deliberately catch broker outages, so publish retries should
+# fail fast instead of blocking an HTTP/Socket.IO admission for many seconds.
+CELERY_TASK_PUBLISH_RETRY = env_bool("CELERY_TASK_PUBLISH_RETRY", default=False)
+CELERY_BROKER_CONNECTION_TIMEOUT = int(os.getenv("CELERY_BROKER_CONNECTION_TIMEOUT", "2"))
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+CELERY_BEAT_SCHEDULE = {
+    "recover-stale-meeting-provisioning": {
+        "task": "apps.meetings.tasks.recover_stale_provisioning_sessions",
+        "schedule": float(
+            os.getenv("MEETING_PROVISIONING_RECOVERY_SWEEP_SECONDS", "30")
+        ),
+    },
+    "mark-stale-meeting-connections": {
+        "task": "apps.meetings.tasks.mark_stale_connections",
+        "schedule": float(os.getenv("MEETING_STALE_CONNECTION_SWEEP_SECONDS", "30")),
+    },
+    "cleanup-finished-meeting-sessions": {
+        "task": "apps.meetings.tasks.cleanup_finished_sessions",
+        "schedule": float(os.getenv("MEETING_FINISHED_SESSION_CLEANUP_SECONDS", "300")),
+    },
+    "end-scheduled-meeting-sessions": {
+        "task": "apps.meetings.tasks.end_scheduled_sessions",
+        "schedule": float(os.getenv("MEETING_SCHEDULE_END_SWEEP_SECONDS", "30")),
+    },
+    "expire-pending-meeting-join-requests": {
+        "task": "apps.meetings.tasks.expire_pending_join_requests",
+        "schedule": float(os.getenv("MEETING_JOIN_REQUEST_SWEEP_SECONDS", "60")),
+    },
+    "send-due-meeting-invitation-reminders": {
+        "task": "apps.meetings.tasks.queue_due_meeting_invitation_emails",
+        "schedule": float(
+            os.getenv("MEETING_INVITATION_REMINDER_SWEEP_SECONDS", "60")
+        ),
+    },
+}
 
 SOCKET_IO_PATH = env_value("SOCKET_IO_PATH", "SOCKETIO_PATH", default="socket.io")
-SOCKET_IO_REDIS_URL = env_value("SOCKET_IO_REDIS_URL", "SOCKETIO_REDIS_URL", default=REDIS_URL)
+SOCKET_IO_REDIS_URL = env_optional_value(
+    "SOCKET_IO_REDIS_URL",
+    "SOCKETIO_REDIS_URL",
+    default=REDIS_URL,
+)
 SOCKET_IO_CORS_ALLOWED_ORIGINS = env_list_any(
     "SOCKET_IO_CORS_ALLOWED_ORIGINS",
     "SOCKETIO_CORS_ALLOWED_ORIGINS",
     default=["http://localhost:3000", "http://127.0.0.1:3000"],
 )
+SOCKET_IO_LOGGER_ENABLED = env_bool("SOCKET_IO_LOGGER_ENABLED", default=False)
+SOCKET_IO_ENGINEIO_LOGGER_ENABLED = env_bool("SOCKET_IO_ENGINEIO_LOGGER_ENABLED", default=False)
 
-JANUS_SESSION_URL = os.getenv("JANUS_SESSION_URL", "ws://127.0.0.1:8188")
+DEFAULT_JANUS_SESSION_URL = "ws://127.0.0.1:8188/janus"
+JANUS_SESSION_URL = os.getenv("JANUS_SESSION_URL", DEFAULT_JANUS_SESSION_URL)
+JANUS_ENABLED = env_bool("JANUS_ENABLED", default=bool(REDIS_URL))
+JANUS_ENABLE_ADMIN = env_bool("JANUS_ENABLE_ADMIN", default=False)
+JANUS_ENABLE_EVENTS = env_bool("JANUS_ENABLE_EVENTS", default=False)
+JANUS_SESSION_START_TIMEOUT_SECONDS = float(
+    os.getenv("JANUS_SESSION_START_TIMEOUT_SECONDS", "15")
+)
+JANUS_OPERATION_TIMEOUT_SECONDS = float(
+    os.getenv("JANUS_OPERATION_TIMEOUT_SECONDS", "30")
+)
 JANUS_DEFAULT_ROOM_CONFIGURATION = {
     "publishers": int(os.getenv("JANUS_ROOM_PUBLISHERS", "100")),
     "bitrate": int(os.getenv("JANUS_ROOM_BITRATE", "1024000")),
@@ -226,40 +293,53 @@ JANUS_DEFAULT_ROOM_CONFIGURATION = {
 }
 
 MEETING_CONNECTION_STALE_SECONDS = int(os.getenv("MEETING_CONNECTION_STALE_SECONDS", "90"))
+MEETING_PROVISIONING_RECOVERY_SECONDS = int(
+    os.getenv("MEETING_PROVISIONING_RECOVERY_SECONDS", "60")
+)
+MEETING_JOIN_REQUEST_TTL_SECONDS = int(
+    os.getenv("MEETING_JOIN_REQUEST_TTL_SECONDS", "900")
+)
 MEETING_FRONTEND_BASE_URL = os.getenv("MEETING_FRONTEND_BASE_URL", "http://localhost:3000")
 MEETING_FRONTEND_JOIN_PATH = os.getenv("MEETING_FRONTEND_JOIN_PATH", "/meetings/{session_id}")
 MEETING_INVITE_MAX_AGE_SECONDS = int(os.getenv("MEETING_INVITE_MAX_AGE_SECONDS", str(60 * 60 * 24 * 7)))
+MEETING_INVITATION_REMINDER_BATCH_SIZE = int(
+    os.getenv("MEETING_INVITATION_REMINDER_BATCH_SIZE", "500")
+)
 MEET_SERVICE_TOKEN = os.getenv("MEET_SERVICE_TOKEN", "")
 MEET_SERVICE_USERNAME = os.getenv("MEET_SERVICE_USERNAME", "law-workspace-service")
 MEET_SERVICE_EMAIL = os.getenv("MEET_SERVICE_EMAIL", "law-workspace-service@synq.local")
 
 EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend")
+EMAIL_HOST = os.getenv("EMAIL_HOST", "localhost")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", default=True)
+EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", default=False)
+EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "10"))
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "Synq Meet <no-reply@synq.local>")
+SERVER_EMAIL = os.getenv("SERVER_EMAIL", DEFAULT_FROM_EMAIL)
+MEETING_EMAIL_REPLY_TO = env_list("MEETING_EMAIL_REPLY_TO")
+MEETING_EMAIL_PRODUCT_NAME = os.getenv("MEETING_EMAIL_PRODUCT_NAME", "Synq")
+if EMAIL_USE_TLS and EMAIL_USE_SSL:
+    raise ImproperlyConfigured(
+        "EMAIL_USE_TLS and EMAIL_USE_SSL are mutually exclusive."
+    )
 
 # Required in production, but allowed to fall back locally so imports and tooling stay usable.
-CLERK_SECRET_KEY = config("CLERK_SECRET_KEY", cast=str)
+CLERK_SECRET_KEY = config("CLERK_SECRET_KEY", default="clerk-dev-placeholder", cast=str)
 
 # Optional
-CLERK_ACCEPT_BROWSER_SESSION_COOKIES = config(
-    "CLERK_ACCEPT_BROWSER_SESSION_COOKIES",
-    default=False,
-    cast=bool,
+CLERK_AUTH_PARTIES = _config_list(
+    "CLERK_AUTH_PARTIES",
+    default=["http://localhost:3000", "http://127.0.0.1:3000"],
 )
-CLERK_AUTH_PARTIES = tuple(
-    origin.strip()
-    for origin in config(
-        "CLERK_AUTH_PARTIES",
-        default="http://localhost:3000,http://127.0.0.1:3000",
-    ).split(",")
-    if origin.strip()
-)
-# CLERK_AUTH_PARTIES = _config_list("CLERK_AUTH_PARTIES", default=["http://localhost:3000"])
-# CLERK_AUDIENCE = _config_list("CLERK_AUDIENCE") or None
-# CLERK_JWT_KEY = config("CLERK_JWT_KEY", default="", cast=str) or None
+CLERK_AUDIENCE = _config_list("CLERK_AUDIENCE") or None
+# CLERK_JWT_KEY = "..."  # optional Clerk JWT verification key
 # CLERK_API_URL = config("CLERK_API_URL", default="https://api.clerk.com", cast=str)
-# CLERK_TIMEOUT_MS = 5000
-# CLERK_CLOCK_SKEW_IN_MS = 5000
-# CLERK_CACHE_TIMEOUT = 300
+CLERK_TIMEOUT_MS = 5000
+CLERK_CLOCK_SKEW_IN_MS = 5000
+CLERK_CACHE_TIMEOUT = 300
 
 # CORS defaults are intentionally conservative at the shared/base layer.
 # Environment-specific modules can opt into allow-all behavior for local

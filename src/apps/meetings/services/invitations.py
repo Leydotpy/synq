@@ -7,11 +7,10 @@ from urllib.parse import urlencode
 
 from django.conf import settings
 from django.core import signing
-from django.core.mail import send_mail
 from django.utils import timezone
 
 from apps.meetings.exceptions import MeetingDomainError
-from apps.meetings.models import MeetingSession
+from apps.meetings.models import MeetingInvitation, MeetingSession
 
 
 class MeetingInvitationService:
@@ -44,10 +43,7 @@ class MeetingInvitationService:
             payload = signing.loads(
                 token,
                 salt=MeetingInvitationService.token_salt,
-                max_age=settings.MEETING_INVITE_MAX_AGE_SECONDS,
             )
-        except signing.SignatureExpired as exc:
-            raise MeetingDomainError("Meeting invite link has expired.") from exc
         except signing.BadSignature as exc:
             raise MeetingDomainError("Meeting invite link is invalid.") from exc
 
@@ -57,10 +53,16 @@ class MeetingInvitationService:
             raise MeetingDomainError("Meeting invite link does not match this meeting.")
 
         expires_at = payload.get("expires_at")
-        if expires_at:
+        if not isinstance(expires_at, str):
+            raise MeetingDomainError("Meeting invite link is invalid.")
+        try:
             parsed_expires_at = datetime.fromisoformat(expires_at)
-            if parsed_expires_at < timezone.now():
-                raise MeetingDomainError("Meeting invite link has expired.")
+        except ValueError as exc:
+            raise MeetingDomainError("Meeting invite link is invalid.") from exc
+        if timezone.is_naive(parsed_expires_at):
+            parsed_expires_at = timezone.make_aware(parsed_expires_at)
+        if parsed_expires_at < timezone.now():
+            raise MeetingDomainError("Meeting invite link has expired.")
 
         return payload
 
@@ -86,7 +88,7 @@ class MeetingInvitationService:
         message: str = "",
         expires_in_seconds: int | None = None,
     ) -> dict:
-        """Create a join link and send it to the supplied email recipients."""
+        """Create a join link, persist recipients, and queue email delivery."""
 
         invite_token = MeetingInvitationService.create_invite_token(
             session=session,
@@ -98,32 +100,57 @@ class MeetingInvitationService:
             invite_token=invite_token,
         )
 
-        sent_count = 0
-        subject = f"Invitation to join {session.room.title}"
-        body_parts = [
-            f"{issuer_profile.display_name or issuer_profile.handle} invited you to join {session.room.title}.",
+        normalized_emails = list(
+            dict.fromkeys(
+                email.strip().lower()
+                for email in emails
+                if email and email.strip()
+            )
+        )
+        expires_after = expires_in_seconds or settings.MEETING_INVITE_MAX_AGE_SECONDS
+        issuer_name = issuer_profile.display_name or issuer_profile.handle
+        invitations = [
+            MeetingInvitation.objects.update_or_create(
+                session=session,
+                recipient_email=email,
+                defaults={
+                    "issuer_profile": issuer_profile,
+                    "issuer_name": issuer_name,
+                    "message": message,
+                    "expires_in_seconds": expires_after,
+                    "last_delivery_error": "",
+                },
+            )[0]
+            for email in normalized_emails
         ]
-        if message:
-            body_parts.extend(["", message])
-        body_parts.extend(["", f"Join the meeting: {join_url}"])
-        body = "\n".join(body_parts)
 
-        try:
-            for email in emails:
-                sent_count += send_mail(
-                    subject,
-                    body,
-                    settings.DEFAULT_FROM_EMAIL,
-                    [email],
-                    fail_silently=False,
-                )
-        except Exception as exc:
-            raise MeetingDomainError("Unable to send meeting invitation email.") from exc
+        # Import lazily to avoid the tasks -> lifecycle -> invitations import cycle.
+        from apps.meetings.services.lifecycle import dispatch_task
+        from apps.meetings.tasks import send_meeting_invitation_email
+
+        queued_count = sum(
+            dispatch_task(
+                send_meeting_invitation_email,
+                str(invitation.pk),
+                join_url,
+                True,
+            )
+            is not None
+            for invitation in invitations
+        )
+        if queued_count == len(invitations):
+            delivery_status = "queued"
+        elif queued_count:
+            delivery_status = "partially_queued"
+        else:
+            delivery_status = "queue_unavailable"
 
         return {
             "join_url": join_url,
             "invite_token": invite_token,
-            "emails": emails,
-            "sent_count": sent_count,
-            "expires_in_seconds": expires_in_seconds or settings.MEETING_INVITE_MAX_AGE_SECONDS,
+            "emails": normalized_emails,
+            "sent_count": 0,
+            "queued_count": queued_count,
+            "delivery_status": delivery_status,
+            "expires_in_seconds": expires_after,
         }

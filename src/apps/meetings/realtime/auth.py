@@ -10,6 +10,8 @@ from django.contrib.sessions.backends.db import SessionStore
 from django.http import HttpRequest
 from django_clerk_sdk.core.auth.clerk.service import resolve_clerk_auth
 
+from core.api.authentication import forget_clerk_token, token_is_expired
+
 
 def extract_scope_headers(environ: dict) -> dict[str, str]:
     """Return lowercase ASGI request headers from a Socket.IO environment payload."""
@@ -79,6 +81,14 @@ def resolve_socket_user(environ: dict, auth: dict | None = None):
                 return user
 
     clerk_request = _build_clerk_request(environ, auth)
+    clerk_token = (
+        auth.get("token")
+        or auth.get("session_token")
+        or clerk_request.COOKIES.get("__session")
+    )
+    if clerk_token and token_is_expired(str(clerk_token)):
+        forget_clerk_token(str(clerk_token))
+        return None
     clerk_result = resolve_clerk_auth(clerk_request)
     if getattr(clerk_result.user, "is_authenticated", False):
         return clerk_result.user

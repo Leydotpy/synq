@@ -1,89 +1,165 @@
-"""Authentication classes shared by first-party Django REST Framework APIs."""
+from importlib import import_module
+import hashlib
+import time
+from typing import Any
 
-from __future__ import annotations
-
-from django.contrib.auth import get_user as get_session_user
-from django_clerk_sdk.core.auth.clerk.authentication import ClerkAuthentication
-from django_clerk_sdk.core.auth.clerk.service import has_clerk_credentials
+from django.apps import apps
+from django.conf import settings
+from django.core.cache import cache
 from rest_framework.authentication import BaseAuthentication, SessionAuthentication
+
+import jwt
+
+
+AUTHORIZATION_META_KEYS = ("HTTP_AUTHORIZATION", "Authorization")
+CLERK_AUTH_CACHE_PREFIX = "clerk:auth:"
+DEFAULT_TOKEN_EXPIRY_LEEWAY_SECONDS = 0
+
+
+def get_bearer_token(request: Any) -> str | None:
+    django_request = getattr(request, "_request", request)
+    headers = getattr(django_request, "headers", {})
+    authorization = headers.get("Authorization")
+
+    if not authorization:
+        for key in AUTHORIZATION_META_KEYS:
+            authorization = getattr(django_request, "META", {}).get(key)
+            if authorization:
+                break
+
+    if not authorization:
+        return None
+
+    scheme, _, credentials = str(authorization).partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+
+    token = credentials.strip()
+    return token or None
+
+
+def get_clerk_token_cache_key(token: str) -> str:
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"{CLERK_AUTH_CACHE_PREFIX}{token_hash}"
+
+
+def forget_clerk_token(token: str) -> None:
+    cache.delete(get_clerk_token_cache_key(token))
+
+
+def token_is_expired(token: str, *, now: float | None = None) -> bool:
+    try:
+        payload = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+    except jwt.PyJWTError:
+        return False
+
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    if exp is None:
+        return False
+
+    try:
+        expires_at = float(exp)
+    except (TypeError, ValueError):
+        return False
+
+    leeway = getattr(
+        settings,
+        "CLERK_TOKEN_EXPIRY_LEEWAY_SECONDS",
+        DEFAULT_TOKEN_EXPIRY_LEEWAY_SECONDS,
+    )
+    return (now if now is not None else time.time()) >= expires_at + float(leeway)
+
+
+def request_has_expired_clerk_token(request: Any) -> bool:
+    django_request = getattr(request, "_request", request)
+    return bool(getattr(django_request, "_expired_clerk_token", False))
+
+
+def mark_request_anonymous_for_expired_clerk_token(request: Any) -> None:
+    from django.contrib.auth.models import AnonymousUser
+
+    django_request = getattr(request, "_request", request)
+    django_request._expired_clerk_token = True
+    django_request.user = AnonymousUser()
+
+    for key in AUTHORIZATION_META_KEYS:
+        getattr(django_request, "META", {}).pop(key, None)
+
+    getattr(django_request, "__dict__", {}).pop("headers", None)
+
+
+class LazyClerkAuthentication(BaseAuthentication):
+    """
+    Defer django-clerk-sdk imports until request authentication time.
+
+    django-clerk-sdk imports django.contrib.auth.models at module import time,
+    but DRF may import DEFAULT_AUTHENTICATION_CLASSES while Django is still
+    populating apps. Delaying the SDK import avoids AppRegistryNotReady during
+    startup while preserving the SDK's runtime behavior.
+    """
+
+    _backend: Any = None
+
+    @classmethod
+    def _get_backend(cls) -> Any:
+        if cls._backend is None:
+            if not apps.ready:
+                return None
+
+            module = import_module(
+                "django_clerk_sdk.core.auth.clerk.authentication"
+            )
+            cls._backend = module.ClerkAuthentication()
+        return cls._backend
+
+    def authenticate(self, request):
+        if request_has_expired_clerk_token(request):
+            return None
+
+        token = get_bearer_token(request)
+        if token and token_is_expired(token):
+            forget_clerk_token(token)
+            mark_request_anonymous_for_expired_clerk_token(request)
+            return None
+
+        backend = self._get_backend()
+        if backend is None:
+            return None
+
+        return backend.authenticate(request)
+
+    def authenticate_header(self, request):
+        backend = self._get_backend()
+        if backend is None:
+            return "Bearer"
+
+        return backend.authenticate_header(request)
 
 
 class SessionOrClerkAuthentication(BaseAuthentication):
-    """Route API authentication between Django sessions and Clerk credentials.
-
-    Behavior:
-    1. If the request carries a Bearer token, authenticate with Clerk.
-    2. If Clerk credentials are present but CSRF artifacts are absent, use Clerk
-       directly (typical frontend/third-party token-cookie traffic).
-    3. Otherwise, resolve Django session auth for backend/admin usage.
-    4. If no session user is found, fall back to Clerk.
-
-    Why this is hardened for ``ClerkMiddleware``:
-    - ``ClerkMiddleware`` may override ``request.user`` when Clerk credentials
-      are present.
-    - Session authentication here reads the authenticated session user directly
-      from Django's session/auth backend instead of trusting ``request.user``.
-    """
+    """Authenticate first-party API requests with either sessions or Clerk."""
 
     def __init__(self) -> None:
         self._session_auth = SessionAuthentication()
-        self._clerk_auth = ClerkAuthentication()
-
-    @staticmethod
-    def _has_bearer_token(request) -> bool:
-        """Return whether the request includes an Authorization Bearer token."""
-
-        authorization = (request.META.get("HTTP_AUTHORIZATION") or "").strip()
-        return authorization.lower().startswith("bearer ")
-
-    @staticmethod
-    def _has_csrf_artifacts(request) -> bool:
-        """Return whether request carries typical CSRF cookie/header artifacts."""
-
-        csrf_cookie = request.COOKIES.get("csrftoken")
-        csrf_header = (
-            request.META.get("HTTP_X_CSRFTOKEN")
-            or request.META.get("HTTP_X_CSRF_TOKEN")
-        )
-        return bool(csrf_cookie or csrf_header)
-
-    def _authenticate_session(self, request):
-        """Authenticate using Django session state, independent of request.user."""
-
-        django_request = getattr(request, "_request", request)
-        user = get_session_user(django_request)
-        if not user or not user.is_active:
-            return None
-
-        # Keep DRF's CSRF behavior for session-authenticated requests.
-        self._session_auth.enforce_csrf(request)
-        return user, None
+        self._clerk_auth = LazyClerkAuthentication()
 
     def authenticate(self, request):
-        """Authenticate request users according to request context."""
-
-        if self._has_bearer_token(request):
+        if get_bearer_token(request):
             return self._clerk_auth.authenticate(request)
 
-        has_clerk_creds = has_clerk_credentials(request)
-
-        # Frontends/third parties often send Clerk credentials without CSRF
-        # headers. In that case, avoid session auth to prevent CSRF coupling.
-        if has_clerk_creds and not self._has_csrf_artifacts(request):
-            return self._clerk_auth.authenticate(request)
-
-        session_result = self._authenticate_session(request)
+        session_result = self._session_auth.authenticate(request)
         if session_result is not None:
             return session_result
 
-        if has_clerk_creds:
-            return self._clerk_auth.authenticate(request)
-        return None
+        return self._clerk_auth.authenticate(request)
 
     def authenticate_header(self, request):
-        """Return a challenge header compatible with token-based auth clients."""
-
-        clerk_header = self._clerk_auth.authenticate_header(request)
-        if clerk_header:
-            return clerk_header
-        return self._session_auth.authenticate_header(request)
+        return self._clerk_auth.authenticate_header(request)

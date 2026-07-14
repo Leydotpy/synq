@@ -1,0 +1,3 @@
+[mcp_servers.render]
+url = "https://mcp.render.com/mcp"
+http_headers = { Authorization = "Bearer rnd_DLG61OCpMerzMp7aptQ2Ni86TSGZ" }

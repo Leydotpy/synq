@@ -71,6 +71,12 @@ class MeetingAccessPolicy(models.TextChoices):
     INVITE_ONLY = "invite_only", "Invite Only"
 
 
+class ExternalMeetingProvider(models.TextChoices):
+    """Enumerate trusted systems that may bind an external meeting identity."""
+
+    LAW_FIRM_WORKSPACE = "law_firm_workspace", "Law firm workspace"
+
+
 class MeetingRole(models.TextChoices):
     """Enumerate durable and in-session meeting roles."""
 
@@ -302,6 +308,57 @@ class MeetingRoom(UUIDTimestampedModel):
         return check_password(raw_passcode, self.passcode_hash)
 
 
+class ExternalMeetingBinding(UUIDTimestampedModel):
+    """Bind a trusted provider identity to exactly one service-owned room.
+
+    External identities intentionally live outside ``MeetingRoom.metadata`` so
+    browser-writable metadata can never claim or redirect a backend integration.
+    """
+
+    provider = models.CharField(
+        max_length=64,
+        choices=ExternalMeetingProvider.choices,
+        default=ExternalMeetingProvider.LAW_FIRM_WORKSPACE,
+    )
+    external_id = models.CharField(max_length=255)
+    room = models.ForeignKey(
+        MeetingRoom,
+        on_delete=models.CASCADE,
+        related_name="external_bindings",
+    )
+    service_owner_profile = models.ForeignKey(
+        Profile,
+        on_delete=models.PROTECT,
+        related_name="owned_external_meeting_bindings",
+    )
+
+    class Meta:
+        """Make provider identities and provider-to-room mappings unambiguous."""
+
+        ordering = ("provider", "external_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("provider", "external_id"),
+                name="meet_ext_provider_id_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=("provider", "room"),
+                name="meet_ext_provider_room_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("service_owner_profile", "provider"),
+                name="meet_ext_owner_provider_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        """Return a concise provider identity for admin and diagnostics."""
+
+        return f"{self.provider}:{self.external_id}"
+
+
 class MeetingRoomMembership(UUIDTimestampedModel):
     """Durable room membership that grants coordinator permissions outside any one session."""
 
@@ -437,6 +494,54 @@ class MeetingSession(UUIDTimestampedModel):
         """Increment the session state version so clients can detect a new snapshot."""
 
         self.state_version += 1
+
+
+class MeetingInvitation(UUIDTimestampedModel):
+    """Persist an email invitation so scheduled meetings can send a due reminder."""
+
+    session = models.ForeignKey(
+        MeetingSession,
+        on_delete=models.CASCADE,
+        related_name="email_invitations",
+    )
+    issuer_profile = models.ForeignKey(
+        Profile,
+        on_delete=models.SET_NULL,
+        related_name="issued_meeting_invitations",
+        blank=True,
+        null=True,
+    )
+    issuer_name = models.CharField(max_length=255)
+    recipient_email = models.EmailField()
+    message = models.TextField(blank=True)
+    expires_in_seconds = models.PositiveIntegerField()
+    initial_email_sent_at = models.DateTimeField(blank=True, null=True)
+    ready_email_sent_at = models.DateTimeField(blank=True, null=True)
+    last_delivery_attempt_at = models.DateTimeField(blank=True, null=True)
+    delivery_attempts = models.PositiveIntegerField(default=0)
+    last_delivery_error = models.TextField(blank=True)
+
+    class Meta:
+        """Keep one durable reminder state per recipient and meeting occurrence."""
+
+        ordering = ("created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=("session", "recipient_email"),
+                name="meet_invite_session_email_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("ready_email_sent_at", "created_at"),
+                name="meet_invite_ready_created_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        """Return a concise invitation label for logs and admin screens."""
+
+        return f"{self.recipient_email} invited to {self.session}"
 
 
 class MeetingJoinRequest(UUIDTimestampedModel):
@@ -682,7 +787,11 @@ class ParticipantConnection(UUIDTimestampedModel):
 
         self.last_heartbeat_at = timezone.now()
         if self.status == RealtimeConnectionStatus.STALE:
-            self.status = RealtimeConnectionStatus.ACTIVE
+            self.status = (
+                RealtimeConnectionStatus.ACTIVE
+                if self.participant_id
+                else RealtimeConnectionStatus.SUBSCRIBED
+            )
 
     def mark_disconnected(self) -> None:
         """Mark the socket as disconnected while preserving historical metadata."""

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Mapping
 
-from asgiref.sync import async_to_sync
+from asgiref.sync import async_to_sync, sync_to_async
 from django.db import transaction
 from django.utils import timezone
 from janus_api import JanusResponse
@@ -144,7 +145,7 @@ def plugin_callback_factory(
 ):
     """Build a callback that routes Janus events to the most relevant meeting sockets."""
 
-    def _on_rx_event(event: JanusEvent) -> None:
+    def _process_event(event: JanusEvent) -> None:
         normalized_event = _normalize_event_payload(event)
         _persist_latest_event_snapshot(instance, normalized_event)
         try:
@@ -165,6 +166,17 @@ def plugin_callback_factory(
             **_extract_context(instance),
         }
         dispatch_janus_event(payload)
+
+    def _on_rx_event(event: JanusEvent) -> None:
+        """Keep synchronous ORM work off the Janus transport event loop."""
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _process_event(event)
+            return
+
+        loop.create_task(sync_to_async(_process_event, thread_sensitive=True)(event))
 
     return _on_rx_event
 

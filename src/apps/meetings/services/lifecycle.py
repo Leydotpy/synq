@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from apps.meetings.exceptions import MeetingDomainError, MeetingJoinRequestStateError
 from apps.meetings.models import (
     JanusHandleLifecycleState,
     JanusHandleType,
+    MediaDirection,
     MeetingAccessPolicy,
     MeetingEvent,
     MeetingEventType,
@@ -75,16 +78,17 @@ def record_session_event(
     )
 
 
-def dispatch_task(task, *args) -> None:
+def dispatch_task(task, *args) -> Any | None:
     """Attempt to enqueue a Celery task without breaking the request path on broker errors."""
 
     try:
-        task.delay(*args)
+        return task.delay(*args)
     except Exception:
-        logger.warning(
+        logger.exception(
             "Unable to enqueue Celery task '%s'; make sure the broker is running.",
             getattr(task, "name", repr(task)),
         )
+        return None
 
 
 class MeetingLifecycleService:
@@ -134,12 +138,29 @@ class MeetingLifecycleService:
 
     @staticmethod
     def start_session(*, room: MeetingRoom, started_by_profile, metadata: dict[str, Any] | None = None) -> MeetingSession:
-        """Create or reuse the room's live session without admitting anyone."""
+        """Create or reuse the room's live session and seed the host participant."""
 
-        existing_session = room.sessions.live().order_by("-created_at").first()
-        if existing_session:
-            return existing_session
         with transaction.atomic():
+            # Serialize starts for the same room so concurrent requests cannot
+            # create multiple live sessions.
+            room = MeetingRoom.objects.select_for_update().get(pk=room.pk)
+            existing_session = room.sessions.live().order_by("-created_at").first()
+            if existing_session:
+                if (
+                    existing_session.lifecycle_state
+                    == MeetingLifecycleState.PROVISIONING
+                    or not existing_session.janus_room_id
+                ):
+                    from apps.meetings.tasks import provision_janus_room_for_session
+
+                    transaction.on_commit(
+                        lambda: dispatch_task(
+                            provision_janus_room_for_session,
+                            str(existing_session.pk),
+                        )
+                    )
+                return existing_session
+            membership = MeetingPermissionService.get_room_membership(room=room, profile_or_user=started_by_profile)
             session = MeetingSession.objects.create(
                 room=room,
                 started_by_profile=started_by_profile,
@@ -149,10 +170,22 @@ class MeetingLifecycleService:
                 janus_room_pin=generate_short_code(8),
                 metadata=metadata or {},
             )
+            participant = Participant(
+                room=room,
+                session=session,
+                profile=started_by_profile,
+                membership=membership,
+                role=membership.role if membership else MeetingRole.HOST,
+                display_name=started_by_profile.display_name or started_by_profile.handle,
+            )
+            participant.apply_membership_defaults()
+            participant.mark_joined()
+            participant.save()
             record_session_event(
                 session=session,
                 event_type=MeetingEventType.SESSION_CREATED,
                 actor_profile=started_by_profile,
+                actor_participant=participant,
                 payload={"room_id": str(room.pk)},
             )
             MeetingLifecycleService.refresh_session_metrics(session=session)
@@ -160,9 +193,10 @@ class MeetingLifecycleService:
         def enqueue_follow_up_tasks() -> None:
             """Queue asynchronous Janus work once the transaction commits successfully."""
 
-            from apps.meetings.tasks import provision_janus_room_for_session
+            from apps.meetings.tasks import attach_participant_media_handles, provision_janus_room_for_session
 
             dispatch_task(provision_janus_room_for_session, str(session.pk))
+            dispatch_task(attach_participant_media_handles, str(participant.pk))
 
         transaction.on_commit(enqueue_follow_up_tasks)
         return session
@@ -177,12 +211,18 @@ class MeetingLifecycleService:
         note: str = "",
         client_state: dict[str, Any] | None = None,
         connection: ParticipantConnection | None = None,
+        client_session_key: str = "",
         passcode: str | None = None,
         invite_token: str | None = None,
     ) -> MeetingJoinRequest:
         """Create or reuse a pending waiting-room request for a profile that needs review."""
 
         MeetingLifecycleService._validate_session_joinable(session=session)
+        MeetingLifecycleService._validate_profile_not_removed(
+            session=session,
+            profile=profile,
+        )
+        MeetingLifecycleService._validate_requested_role(requested_role)
         membership = MeetingPermissionService.get_room_membership(room=session.room, profile_or_user=profile)
         if (
             MeetingLifecycleService._get_present_participant(session=session, profile=profile) is not None
@@ -194,6 +234,7 @@ class MeetingLifecycleService:
             session=session,
             profile=profile,
             connection=connection,
+            client_session_key=client_session_key,
         )
         join_request = session.join_requests.filter(profile=profile, status=MeetingJoinRequestStatus.PENDING).first()
         if join_request:
@@ -205,7 +246,11 @@ class MeetingLifecycleService:
             if bound_connection:
                 bound_connection.session = session
                 bound_connection.status = RealtimeConnectionStatus.SUBSCRIBED
-                bound_connection.save(update_fields=["session", "status", "updated_at"])
+                if client_session_key and not bound_connection.client_session_key:
+                    bound_connection.client_session_key = client_session_key
+                    bound_connection.save(update_fields=["session", "status", "client_session_key", "updated_at"])
+                else:
+                    bound_connection.save(update_fields=["session", "status", "updated_at"])
             join_request = MeetingJoinRequest.objects.create(
                 room=session.room,
                 session=session,
@@ -245,17 +290,24 @@ class MeetingLifecycleService:
         note: str = "",
         client_state: dict[str, Any] | None = None,
         connection: ParticipantConnection | None = None,
+        client_session_key: str = "",
         passcode: str | None = None,
         invite_token: str | None = None,
     ) -> MeetingAdmissionResult:
         """Admit direct-entry profiles or create a waiting-room request when review is required."""
 
         MeetingLifecycleService._validate_session_joinable(session=session)
+        MeetingLifecycleService._validate_profile_not_removed(
+            session=session,
+            profile=profile,
+        )
+        MeetingLifecycleService._validate_requested_role(requested_role)
         membership = MeetingPermissionService.get_room_membership(room=session.room, profile_or_user=profile)
         bound_connection = MeetingLifecycleService._resolve_active_connection(
             session=session,
             profile=profile,
             connection=connection,
+            client_session_key=client_session_key,
         )
         existing_participant = MeetingLifecycleService._get_present_participant(session=session, profile=profile)
         durable_direct_entry = MeetingLifecycleService._has_durable_direct_entry(
@@ -276,6 +328,7 @@ class MeetingLifecycleService:
                 requested_display_name=requested_display_name,
                 requested_role=requested_role,
                 connection=bound_connection,
+                client_session_key=client_session_key,
             )
             return MeetingAdmissionResult(status="admitted", participant=participant, direct_entry=True)
 
@@ -287,6 +340,7 @@ class MeetingLifecycleService:
             note=note,
             client_state=client_state or {},
             connection=bound_connection,
+            client_session_key=client_session_key,
             passcode=passcode,
             invite_token=invite_token,
         )
@@ -300,13 +354,50 @@ class MeetingLifecycleService:
             raise MeetingDomainError("Cannot join a session that is ending, ended, or failed.")
 
     @staticmethod
+    def _validate_profile_not_removed(*, session: MeetingSession, profile) -> None:
+        """Keep a moderator removal in force for the lifetime of the session."""
+
+        if session.participants.filter(
+            profile=profile,
+            status=ParticipantStatus.REMOVED,
+        ).exists():
+            raise MeetingDomainError(
+                "This participant was removed from the session and cannot rejoin."
+            )
+
+    @staticmethod
+    def _validate_requested_role(requested_role: str) -> None:
+        """Only coordinators may derive elevated roles from durable membership."""
+
+        if requested_role != MeetingRole.PARTICIPANT:
+            raise MeetingDomainError("Unsupported requested participant role.")
+
+    @staticmethod
     def _validate_join_gate(*, session: MeetingSession, passcode: str | None = None, invite_token: str | None = None) -> None:
         """Validate passcode or invite-token requirements before a non-member can proceed."""
 
         if invite_token:
             MeetingInvitationService.validate_invite_token(session=session, token=invite_token)
-        elif not session.room.check_passcode(passcode):
+            return
+        if session.room.access_policy == MeetingAccessPolicy.INVITE_ONLY:
+            raise MeetingDomainError("A valid meeting invitation is required for this room.")
+        if not session.room.check_passcode(passcode):
             raise MeetingDomainError("Invalid room passcode.")
+
+    @staticmethod
+    def _validate_session_capacity(*, session: MeetingSession) -> None:
+        """Reject creation of another present participant once the room is full.
+
+        Callers hold a ``select_for_update`` lock on the session row so capacity
+        checks and participant creation remain serialized on databases that
+        support row-level locks.
+        """
+
+        present_count = session.participants.exclude(
+            status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED],
+        ).count()
+        if present_count >= session.room.max_participants:
+            raise MeetingDomainError("Meeting has reached its maximum participant capacity.")
 
     @staticmethod
     def _get_present_participant(*, session: MeetingSession, profile) -> Participant | None:
@@ -354,24 +445,53 @@ class MeetingLifecycleService:
         session: MeetingSession,
         profile,
         connection: ParticipantConnection | None = None,
+        client_session_key: str = "",
     ) -> ParticipantConnection | None:
-        """Find the current subscribed lobby connection for a profile, when one exists."""
+        """Find the current subscribed socket connection for a profile, when one exists."""
 
+        normalized_key = (client_session_key or "").strip()
         if (
             connection is not None
             and str(connection.session_id) == str(session.pk)
             and str(connection.profile_id) == str(profile.pk)
-            and connection.status in {RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE}
+            and connection.status in ACTIVE_CONNECTION_STATUSES
+            and (not normalized_key or connection.client_session_key == normalized_key)
         ):
             return connection
-        return (
-            ParticipantConnection.objects.filter(
-                session=session,
-                profile=profile,
-                status__in=[RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
-            )
-            .order_by("-last_heartbeat_at")
-            .first()
+
+        queryset = ParticipantConnection.objects.filter(
+            session=session,
+            profile=profile,
+            status__in=ACTIVE_CONNECTION_STATUSES,
+        )
+        if normalized_key:
+            keyed_connection = queryset.filter(client_session_key=normalized_key).order_by("-last_heartbeat_at", "-connected_at").first()
+            if keyed_connection is not None:
+                return keyed_connection
+        return queryset.order_by("-last_heartbeat_at", "-connected_at").first()
+
+    @staticmethod
+    def _disconnect_duplicate_connections(
+        *,
+        session: MeetingSession,
+        profile,
+        active_connection: ParticipantConnection | None,
+        client_session_key: str = "",
+        now=None,
+    ) -> None:
+        """Disconnect older rows that represent the same browser meeting attempt."""
+
+        if active_connection is None:
+            return
+        timestamp = now or timezone.now()
+        ParticipantConnection.objects.filter(
+            session=session,
+            profile=profile,
+            status__in=ACTIVE_CONNECTION_STATUSES,
+        ).exclude(pk=active_connection.pk).update(
+            status=RealtimeConnectionStatus.DISCONNECTED,
+            disconnected_at=timestamp,
+            updated_at=timestamp,
         )
 
     @staticmethod
@@ -384,6 +504,7 @@ class MeetingLifecycleService:
         requested_display_name: str,
         requested_role: str,
         connection: ParticipantConnection | None,
+        client_session_key: str = "",
     ) -> Participant:
         """Create or activate one participant for a profile that does not require review."""
 
@@ -391,10 +512,20 @@ class MeetingLifecycleService:
         participant = existing_participant
         should_attach_media_handles = False
         with transaction.atomic():
+            locked_session = MeetingSession.objects.select_for_update().select_related("room").get(pk=session.pk)
+            if participant is None:
+                participant = (
+                    locked_session.participants.filter(profile=profile)
+                    .exclude(status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED])
+                    .first()
+                )
+            if participant is None:
+                MeetingLifecycleService._validate_session_capacity(session=locked_session)
             bound_connection = MeetingLifecycleService._resolve_active_connection(
                 session=session,
                 profile=profile,
                 connection=connection,
+                client_session_key=client_session_key,
             )
             session.join_requests.filter(profile=profile, status=MeetingJoinRequestStatus.PENDING).update(
                 status=MeetingJoinRequestStatus.CANCELLED,
@@ -415,28 +546,53 @@ class MeetingLifecycleService:
                         "display_name": requested_display_name or profile.display_name or profile.handle,
                     },
                 )
+            if participant.status == ParticipantStatus.REMOVED:
+                raise MeetingDomainError(
+                    "This participant was removed from the session and cannot rejoin."
+                )
             participant.membership = membership or participant.membership
             participant.role = membership.role if membership else participant.role
             participant.display_name = requested_display_name or participant.display_name or profile.display_name or profile.handle
             participant.apply_membership_defaults()
             participant.left_at = None
+            participant_was_active = participant.status == ParticipantStatus.ACTIVE and participant.joined_at is not None
             if bound_connection:
-                was_active = participant.status == ParticipantStatus.ACTIVE and participant.joined_at is not None
                 participant.mark_joined()
                 should_attach_media_handles = True
             else:
-                if participant.status in {ParticipantStatus.ACTIVE, ParticipantStatus.DISCONNECTED}:
-                    participant.status = ParticipantStatus.ADMITTED
+                participant.status = ParticipantStatus.ADMITTED
                 participant.last_seen_at = now
             participant.save()
 
             if bound_connection:
                 bound_connection.session = session
+                bound_connection.profile = profile
                 bound_connection.participant = participant
                 bound_connection.status = RealtimeConnectionStatus.ACTIVE
                 bound_connection.disconnected_at = None
-                bound_connection.save(update_fields=["session", "participant", "status", "disconnected_at", "updated_at"])
-                if not was_active:
+                if client_session_key and not bound_connection.client_session_key:
+                    bound_connection.client_session_key = client_session_key
+                bound_connection.last_heartbeat_at = now
+                bound_connection.save(
+                    update_fields=[
+                        "session",
+                        "profile",
+                        "participant",
+                        "status",
+                        "disconnected_at",
+                        "client_session_key",
+                        "last_heartbeat_at",
+                        "updated_at",
+                    ]
+                )
+                MeetingLifecycleService._disconnect_duplicate_connections(
+                    session=session,
+                    profile=profile,
+                    active_connection=bound_connection,
+                    client_session_key=bound_connection.client_session_key,
+                    now=now,
+                )
+                if not participant_was_active:
                     record_session_event(
                         session=session,
                         event_type=MeetingEventType.PARTICIPANT_JOINED,
@@ -476,42 +632,65 @@ class MeetingLifecycleService:
             profile_or_user=reviewer_profile,
             permission_field="can_manage_waiting_room",
         )
-        if join_request.status != MeetingJoinRequestStatus.PENDING:
-            raise MeetingJoinRequestStateError("Only pending join requests can be reviewed.")
+        original_join_request = join_request
         participant = None
-        active_request_connection = None
-        if join_request.connection_id:
-            active_request_connection = ParticipantConnection.objects.filter(
-                pk=join_request.connection_id,
-                session=join_request.session,
-                status__in=[RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
-            ).first()
-        if active_request_connection is None:
-            active_request_connection = MeetingLifecycleService._resolve_active_connection(
-                session=join_request.session,
-                profile=join_request.profile,
-            )
         participant_became_active = False
         should_attach_media_handles = False
         with transaction.atomic():
+            join_request = (
+                MeetingJoinRequest.objects.select_for_update()
+                .select_related("session", "session__room", "room", "profile", "connection")
+                .get(pk=join_request.pk)
+            )
+            if join_request.status != MeetingJoinRequestStatus.PENDING:
+                raise MeetingJoinRequestStateError("Only pending join requests can be reviewed.")
+            locked_session = (
+                MeetingSession.objects.select_for_update()
+                .select_related("room")
+                .get(pk=join_request.session_id)
+            )
+            active_request_connection = MeetingLifecycleService._resolve_active_connection(
+                session=join_request.session,
+                profile=join_request.profile,
+                connection=join_request.connection,
+                client_session_key=join_request.connection.client_session_key if join_request.connection_id else "",
+            )
             if approve:
                 membership = MeetingPermissionService.get_room_membership(room=join_request.room, profile_or_user=join_request.profile)
-                participant, created = Participant.objects.get_or_create(
-                    room=join_request.room,
+                participant = Participant.objects.filter(
                     session=join_request.session,
                     profile=join_request.profile,
-                    defaults={
-                        "membership": membership,
-                        "join_request": join_request,
-                        "role": membership.role if membership else join_request.requested_role,
-                        "display_name": join_request.requested_display_name or join_request.profile.display_name or join_request.profile.handle,
-                    },
+                ).first()
+                if participant and participant.status == ParticipantStatus.REMOVED:
+                    raise MeetingDomainError(
+                        "This participant was removed from the session and cannot rejoin."
+                    )
+                MeetingLifecycleService._validate_requested_role(
+                    join_request.requested_role
                 )
+                participant_was_present = bool(
+                    participant
+                    and participant.status not in {ParticipantStatus.LEFT, ParticipantStatus.REMOVED}
+                )
+                if not participant_was_present:
+                    MeetingLifecycleService._validate_session_capacity(session=locked_session)
+                created = participant is None
+                if participant is None:
+                    participant = Participant.objects.create(
+                        room=join_request.room,
+                        session=join_request.session,
+                        profile=join_request.profile,
+                        membership=membership,
+                        join_request=join_request,
+                        role=membership.role if membership else join_request.requested_role,
+                        display_name=join_request.requested_display_name or join_request.profile.display_name or join_request.profile.handle,
+                    )
                 participant.membership = membership
                 participant.join_request = join_request
                 participant.role = membership.role if membership else participant.role
                 participant.display_name = participant.display_name or join_request.profile.display_name or join_request.profile.handle
                 participant.apply_membership_defaults()
+                participant.left_at = None
                 if active_request_connection:
                     was_active = participant.status == ParticipantStatus.ACTIVE and participant.joined_at is not None
                     participant.mark_joined()
@@ -523,10 +702,28 @@ class MeetingLifecycleService:
                 participant.save()
                 if active_request_connection:
                     active_request_connection.session = join_request.session
+                    active_request_connection.profile = join_request.profile
                     active_request_connection.participant = participant
                     active_request_connection.status = RealtimeConnectionStatus.ACTIVE
                     active_request_connection.disconnected_at = None
-                    active_request_connection.save(update_fields=["session", "participant", "status", "disconnected_at", "updated_at"])
+                    active_request_connection.last_heartbeat_at = timezone.now()
+                    active_request_connection.save(
+                        update_fields=[
+                            "session",
+                            "profile",
+                            "participant",
+                            "status",
+                            "disconnected_at",
+                            "last_heartbeat_at",
+                            "updated_at",
+                        ]
+                    )
+                    MeetingLifecycleService._disconnect_duplicate_connections(
+                        session=join_request.session,
+                        profile=join_request.profile,
+                        active_connection=active_request_connection,
+                        client_session_key=active_request_connection.client_session_key,
+                    )
                     join_request.connection = active_request_connection
                 join_request.mark_reviewed(
                     reviewer=reviewer_profile,
@@ -564,6 +761,9 @@ class MeetingLifecycleService:
                 )
             MeetingLifecycleService.refresh_session_metrics(session=join_request.session)
 
+        if original_join_request is not join_request:
+            original_join_request.refresh_from_db()
+
         def emit_updates() -> None:
             """Broadcast post-review state changes and queue Janus work after commit."""
 
@@ -591,28 +791,75 @@ class MeetingLifecycleService:
 
         permission_sensitive_fields = {"can_publish_audio", "can_publish_video", "can_share_screen", "can_chat", "can_react"}
         media_sensitive_fields = {"is_muted", "is_camera_blocked"}
+        allowed_fields = permission_sensitive_fields | media_sensitive_fields | {"raised_hand_at"}
         requested_fields = set(updates)
+        unknown_fields = sorted(requested_fields - allowed_fields)
+        if unknown_fields:
+            raise MeetingDomainError(
+                f"Unsupported participant update field(s): {', '.join(unknown_fields)}."
+            )
+        normalized_updates = dict(updates)
+        for field_name in (permission_sensitive_fields | media_sensitive_fields) & requested_fields:
+            if not isinstance(normalized_updates[field_name], bool):
+                raise MeetingDomainError(f"Participant update '{field_name}' must be a boolean.")
+        if "raised_hand_at" in normalized_updates:
+            raised_hand_at = normalized_updates["raised_hand_at"]
+            if isinstance(raised_hand_at, str):
+                parsed_raised_hand_at = parse_datetime(raised_hand_at)
+                if parsed_raised_hand_at is None:
+                    raise MeetingDomainError("Participant update 'raised_hand_at' must be an ISO datetime or null.")
+                raised_hand_at = parsed_raised_hand_at
+            if raised_hand_at is not None and not isinstance(raised_hand_at, datetime):
+                raise MeetingDomainError("Participant update 'raised_hand_at' must be an ISO datetime or null.")
+            if raised_hand_at is not None and timezone.is_naive(raised_hand_at):
+                raised_hand_at = timezone.make_aware(raised_hand_at)
+            normalized_updates["raised_hand_at"] = raised_hand_at
         if requested_fields & permission_sensitive_fields:
             MeetingPermissionService.require_session_permission(session=session, profile_or_user=actor_profile, permission_field="can_manage_permissions")
         if requested_fields & media_sensitive_fields:
             MeetingPermissionService.require_session_permission(session=session, profile_or_user=actor_profile, permission_field="can_manage_media")
-        allowed_fields = permission_sensitive_fields | media_sensitive_fields | {"raised_hand_at"}
+        if "raised_hand_at" in requested_fields and str(participant.profile_id) != str(actor_profile.pk):
+            MeetingPermissionService.require_session_permission(
+                session=session,
+                profile_or_user=actor_profile,
+                permission_field="can_manage_participants",
+            )
         with transaction.atomic():
-            for field_name, value in updates.items():
-                if field_name in allowed_fields:
-                    setattr(participant, field_name, value)
+            for field_name, value in normalized_updates.items():
+                setattr(participant, field_name, value)
             participant.last_seen_at = timezone.now()
             participant.save()
+            event_updates = {
+                field_name: value.isoformat() if isinstance(value, datetime) else value
+                for field_name, value in normalized_updates.items()
+            }
             record_session_event(
                 session=session,
                 event_type=MeetingEventType.PARTICIPANT_UPDATED,
                 actor_profile=actor_profile,
                 actor_participant=participant,
-                payload={"participant_id": str(participant.pk), "updates": updates},
+                payload={"participant_id": str(participant.pk), "updates": event_updates},
             )
             MeetingLifecycleService.refresh_session_metrics(session=session)
 
-        transaction.on_commit(lambda: __import__("apps.meetings.realtime.emitter", fromlist=["MeetingSocketEmitter"]).MeetingSocketEmitter.emit_session_state(session=session))
+        def emit_updates() -> None:
+            from apps.meetings.realtime.emitter import MeetingSocketEmitter
+
+            if requested_fields & (permission_sensitive_fields | media_sensitive_fields):
+                from apps.meetings.services.signaling import MeetingMediaSignalService
+
+                try:
+                    MeetingMediaSignalService.apply_moderation(
+                        participant=participant,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to apply Janus moderation for participant '%s'.",
+                        participant.pk,
+                    )
+            MeetingSocketEmitter.emit_session_state(session=session)
+
+        transaction.on_commit(emit_updates)
         return participant
 
     @staticmethod
@@ -639,8 +886,18 @@ class MeetingLifecycleService:
             """Broadcast participant removal and queue Janus detach work after commit."""
 
             from apps.meetings.realtime.emitter import MeetingSocketEmitter
+            from apps.meetings.services.signaling import MeetingMediaSignalService
             from apps.meetings.tasks import detach_participant_media_handles
 
+            try:
+                MeetingMediaSignalService.detach_participant_handles(
+                    participant=participant,
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to detach media while removing participant '%s'.",
+                    participant.pk,
+                )
             dispatch_task(detach_participant_media_handles, str(participant.pk))
             MeetingSocketEmitter.emit_participant_removed(session=session, participant=participant, reason=reason)
             MeetingSocketEmitter.emit_session_state(session=session)
@@ -698,8 +955,18 @@ class MeetingLifecycleService:
             from apps.meetings.realtime.emitter import MeetingSocketEmitter
 
             if participant is not None:
+                from apps.meetings.services.signaling import MeetingMediaSignalService
                 from apps.meetings.tasks import detach_participant_media_handles
 
+                try:
+                    MeetingMediaSignalService.detach_participant_handles(
+                        participant=participant,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to detach media while participant '%s' leaves.",
+                        participant.pk,
+                    )
                 dispatch_task(detach_participant_media_handles, str(participant.pk))
             MeetingSocketEmitter.emit_session_state(session=session)
 
@@ -710,9 +977,20 @@ class MeetingLifecycleService:
     def record_chat_message(*, session: MeetingSession, participant: Participant, body: str, metadata: dict[str, Any] | None = None) -> MeetingMessage:
         """Persist a meeting chat message after enforcing participant capabilities."""
 
+        MeetingLifecycleService._validate_session_joinable(session=session)
         MeetingPermissionService.require_participant_capability(participant=participant, capability_field="can_chat")
+        normalized_body = str(body).strip()
+        if not normalized_body:
+            raise MeetingDomainError("A chat message cannot be empty.")
+        if len(normalized_body) > 4_000:
+            raise MeetingDomainError("A chat message cannot exceed 4000 characters.")
         with transaction.atomic():
-            message = MeetingMessage.objects.create(session=session, participant=participant, body=body, metadata=metadata or {})
+            message = MeetingMessage.objects.create(
+                session=session,
+                participant=participant,
+                body=normalized_body,
+                metadata=metadata or {},
+            )
             record_session_event(
                 session=session,
                 event_type=MeetingEventType.CHAT_MESSAGE_SENT,
@@ -734,13 +1012,21 @@ class MeetingLifecycleService:
     ) -> MeetingReaction:
         """Persist a participant reaction after enforcing participant capabilities."""
 
+        MeetingLifecycleService._validate_session_joinable(session=session)
         MeetingPermissionService.require_participant_capability(participant=participant, capability_field="can_react")
+        normalized_reaction = str(reaction).strip()
+        if not normalized_reaction:
+            raise MeetingDomainError("A reaction cannot be empty.")
+        if len(normalized_reaction) > 64:
+            raise MeetingDomainError("A reaction cannot exceed 64 characters.")
+        if expires_in_seconds is not None and not 1 <= expires_in_seconds <= 60:
+            raise MeetingDomainError("Reaction expiry must be between 1 and 60 seconds.")
         expires_at = timezone.now() + timedelta(seconds=expires_in_seconds) if expires_in_seconds else None
         with transaction.atomic():
             reaction_record = MeetingReaction.objects.create(
                 session=session,
                 participant=participant,
-                reaction=reaction,
+                reaction=normalized_reaction,
                 expires_at=expires_at,
                 metadata=metadata or {},
             )
@@ -749,7 +1035,7 @@ class MeetingLifecycleService:
                 event_type=MeetingEventType.REACTION_SENT,
                 actor_profile=participant.profile,
                 actor_participant=participant,
-                payload={"reaction_id": str(reaction_record.pk), "reaction": reaction},
+                payload={"reaction_id": str(reaction_record.pk), "reaction": normalized_reaction},
             )
         transaction.on_commit(lambda: __import__("apps.meetings.realtime.emitter", fromlist=["MeetingSocketEmitter"]).MeetingSocketEmitter.emit_reaction(reaction=reaction_record))
         return reaction_record
@@ -768,7 +1054,14 @@ class MeetingLifecycleService:
     ) -> ParticipantConnection:
         """Associate a Socket.IO connection with a live session and current participant, if any."""
 
-        participant = session.participants.filter(profile=profile).exclude(status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED]).first()
+        participant = session.participants.filter(
+            profile=profile,
+            status__in=[
+                ParticipantStatus.ADMITTED,
+                ParticipantStatus.ACTIVE,
+                ParticipantStatus.DISCONNECTED,
+            ],
+        ).first()
         now = timezone.now()
         should_attach_media_handles = False
         with transaction.atomic():
@@ -788,17 +1081,13 @@ class MeetingLifecycleService:
                     "metadata": metadata or {},
                 },
             )
-            if client_session_key:
-                ParticipantConnection.objects.filter(
-                    session=session,
-                    profile=profile,
-                    client_session_key=client_session_key,
-                    status__in=ACTIVE_CONNECTION_STATUSES,
-                ).exclude(socket_id=socket_id).update(
-                    status=RealtimeConnectionStatus.DISCONNECTED,
-                    disconnected_at=now,
-                    updated_at=now,
-                )
+            MeetingLifecycleService._disconnect_duplicate_connections(
+                session=session,
+                profile=profile,
+                active_connection=connection,
+                client_session_key=client_session_key,
+                now=now,
+            )
             if participant:
                 participant.last_seen_at = now
                 if participant.status in {ParticipantStatus.ADMITTED, ParticipantStatus.DISCONNECTED}:
@@ -812,6 +1101,10 @@ class MeetingLifecycleService:
                         payload={"participant_id": str(participant.pk)},
                     )
                 participant.save()
+                MeetingLifecycleService._activate_session_for_live_connection(
+                    session=session,
+                    now=now,
+                )
             MeetingLifecycleService.refresh_session_metrics(session=session)
 
         def emit_updates() -> None:
@@ -823,10 +1116,30 @@ class MeetingLifecycleService:
                 from apps.meetings.tasks import attach_participant_media_handles
 
                 dispatch_task(attach_participant_media_handles, str(participant.pk))
-            MeetingSocketEmitter.emit_session_state(session=session)
+            MeetingSocketEmitter.emit_session_state(
+                session=session,
+                exclude_socket_ids={socket_id},
+            )
 
         transaction.on_commit(emit_updates)
         return connection
+
+    @staticmethod
+    def _activate_session_for_live_connection(*, session: MeetingSession, now=None) -> None:
+        """Move a provisioned session to active once a participant socket is live."""
+
+        if session.lifecycle_state != MeetingLifecycleState.WAITING:
+            return
+        timestamp = now or timezone.now()
+        updated = MeetingSession.objects.filter(
+            pk=session.pk,
+            lifecycle_state=MeetingLifecycleState.WAITING,
+        ).update(
+            lifecycle_state=MeetingLifecycleState.ACTIVE,
+            updated_at=timestamp,
+        )
+        if updated:
+            session.lifecycle_state = MeetingLifecycleState.ACTIVE
 
     @staticmethod
     def mark_connection_heartbeat(*, socket_id: str) -> ParticipantConnection | None:
@@ -838,8 +1151,22 @@ class MeetingLifecycleService:
         connection.mark_heartbeat()
         connection.save()
         if connection.participant:
-            connection.participant.last_seen_at = timezone.now()
-            connection.participant.save(update_fields=["last_seen_at", "updated_at"])
+            if (
+                connection.status == RealtimeConnectionStatus.ACTIVE
+                and connection.participant.status == ParticipantStatus.DISCONNECTED
+            ):
+                connection.participant.mark_joined()
+                connection.participant.save(
+                    update_fields=[
+                        "status",
+                        "joined_at",
+                        "last_seen_at",
+                        "updated_at",
+                    ]
+                )
+            else:
+                connection.participant.last_seen_at = timezone.now()
+                connection.participant.save(update_fields=["last_seen_at", "updated_at"])
         return connection
 
     @staticmethod
@@ -853,43 +1180,53 @@ class MeetingLifecycleService:
             connection.mark_disconnected()
             connection.save()
             if connection.participant:
-                still_active = connection.participant.connections.exclude(socket_id=socket_id).filter(status__in=ACTIVE_CONNECTION_STATUSES).exists()
+                still_active = connection.participant.connections.exclude(socket_id=socket_id).filter(
+                    status__in=ACTIVE_CONNECTION_STATUSES,
+                ).exists()
                 if not still_active and connection.participant.status not in {ParticipantStatus.LEFT, ParticipantStatus.REMOVED}:
                     connection.participant.status = ParticipantStatus.DISCONNECTED
                     connection.participant.last_seen_at = timezone.now()
                     connection.participant.save(update_fields=["status", "last_seen_at", "updated_at"])
             if connection.session:
                 MeetingLifecycleService.refresh_session_metrics(session=connection.session)
+        if connection.session:
+            transaction.on_commit(
+                lambda: __import__(
+                    "apps.meetings.realtime.emitter",
+                    fromlist=["MeetingSocketEmitter"],
+                ).MeetingSocketEmitter.emit_session_state(session=connection.session)
+            )
         return connection
 
     @staticmethod
     def refresh_session_metrics(*, session: MeetingSession) -> MeetingSession:
         """Recompute cached session counters and advance the state version."""
 
-        present_participants = (
-            session.participants.filter(
-                status=ParticipantStatus.ACTIVE,
-                connections__status__in=ACTIVE_PARTICIPANT_CONNECTION_STATUSES,
-            )
-            .distinct()
-            .count()
-        )
+        active_participants = session.participants.filter(status=ParticipantStatus.ACTIVE).count()
         active_publishers = ParticipantMediaHandle.objects.filter(
             participant__session=session,
-            participant__status=ParticipantStatus.ACTIVE,
-            participant__connections__status__in=ACTIVE_PARTICIPANT_CONNECTION_STATUSES,
             handle_type=JanusHandleType.PUBLISHER,
-            lifecycle_state__in=[
-                JanusHandleLifecycleState.ATTACHED,
-                JanusHandleLifecycleState.JOINING,
-                JanusHandleLifecycleState.READY,
-            ],
+            lifecycle_state=JanusHandleLifecycleState.READY,
+            streams__direction=MediaDirection.OUTBOUND,
+            streams__is_active=True,
         ).distinct().count()
-        session.participant_count = present_participants
-        session.active_publisher_count = active_publishers
-        session.last_synced_at = timezone.now()
-        session.bump_state_version()
-        session.save(update_fields=["participant_count", "active_publisher_count", "last_synced_at", "state_version", "updated_at"])
+        now = timezone.now()
+        MeetingSession.objects.filter(pk=session.pk).update(
+            participant_count=active_participants,
+            active_publisher_count=active_publishers,
+            last_synced_at=now,
+            state_version=F("state_version") + 1,
+            updated_at=now,
+        )
+        session.refresh_from_db(
+            fields=[
+                "participant_count",
+                "active_publisher_count",
+                "last_synced_at",
+                "state_version",
+                "updated_at",
+            ]
+        )
         return session
 
     @staticmethod
@@ -899,9 +1236,24 @@ class MeetingLifecycleService:
         if actor_profile is not None:
             MeetingPermissionService.require_session_permission(session=session, profile_or_user=actor_profile, permission_field="can_manage_participants")
         with transaction.atomic():
+            session = MeetingSession.objects.select_for_update().select_related("room").get(pk=session.pk)
+            if session.lifecycle_state == MeetingLifecycleState.ENDED:
+                return session
+            now = timezone.now()
             session.lifecycle_state = MeetingLifecycleState.ENDED
-            session.ended_at = timezone.now()
+            session.ended_at = now
             session.save(update_fields=["lifecycle_state", "ended_at", "updated_at"])
+            session.participants.exclude(
+                status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED]
+            ).update(status=ParticipantStatus.LEFT, left_at=now, updated_at=now)
+            session.join_requests.filter(
+                status=MeetingJoinRequestStatus.PENDING
+            ).update(
+                status=MeetingJoinRequestStatus.CANCELLED,
+                reviewed_at=now,
+                resolution_reason=reason or "The meeting ended.",
+                updated_at=now,
+            )
             record_session_event(
                 session=session,
                 event_type=MeetingEventType.SESSION_ENDED,
@@ -917,6 +1269,7 @@ class MeetingLifecycleService:
             from apps.meetings.tasks import destroy_janus_room_for_session
 
             dispatch_task(destroy_janus_room_for_session, str(session.pk))
+            MeetingSocketEmitter.emit_session_ended(session=session, reason=reason)
             MeetingSocketEmitter.emit_session_state(session=session)
 
         transaction.on_commit(emit_updates)

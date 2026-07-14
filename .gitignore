@@ -302,6 +302,12 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Project helper scripts
+!/scripts/
+!/scripts/*.ps1
+!/src/scripts/
+!/src/scripts/*.ps1
+
 # Cython debug symbols
 cython_debug/
 
@@ -311,4 +317,9 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
-
+.codex/
+.codex-tmp/
+.codex-tmp/*.log
+.codex-tmp/*.png
+.codex-tmp/*.py
+.codex/*.toml

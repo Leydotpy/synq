@@ -28,8 +28,8 @@ def get_socket_server() -> socketio.AsyncServer:
             async_mode="asgi",
             client_manager=build_client_manager(),
             cors_allowed_origins=settings.SOCKET_IO_CORS_ALLOWED_ORIGINS,
-            logger=settings.DEBUG,
-            engineio_logger=settings.DEBUG,
+            logger=getattr(settings, "SOCKET_IO_LOGGER_ENABLED", False),
+            engineio_logger=getattr(settings, "SOCKET_IO_ENGINEIO_LOGGER_ENABLED", False),
         )
         _socket_server.register_namespace(MeetingNamespace("/meetings"))
     return _socket_server

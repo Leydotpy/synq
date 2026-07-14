@@ -1,0 +1,22 @@
+{{ headline }}
+
+{{ issuer_name }} invited you to {{ meeting_title }}.
+
+Date: {{ date_label }}
+Time: {{ time_label }}{% if timezone_label %} ({{ timezone_label }}){% endif %}
+{% if meeting_description %}
+About: {{ meeting_description }}
+{% endif %}{% if custom_message %}
+Message from {{ issuer_name }}:
+{{ custom_message }}
+{% endif %}{% if show_join_button %}
+The meeting is open and ready for you.
+
+Join the meeting:
+{{ join_url }}
+{% else %}
+No action is needed yet. We’ll send another email with your join link when the meeting starts.
+{% endif %}
+— {{ product_name }}
+
+If you weren’t expecting this invitation, you can safely ignore this email.
