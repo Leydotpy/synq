@@ -373,7 +373,8 @@ class MeetingSession(UUIDTimestampedModel):
     room = models.ForeignKey(MeetingRoom, on_delete=models.CASCADE, related_name="sessions")
     # Profile that explicitly started this live session instance.
     started_by_profile = models.ForeignKey(Profile, on_delete=models.PROTECT, related_name="started_meeting_sessions")
-    # Reusable Janus control handle used for room lifecycle, moderation, and listing operations.
+    # Legacy control-handle slot retained for schema compatibility. Core v3
+    # room management uses short-lived process-owned VideoRoom handles.
     control_handle_id = JanusPluginField(
         identifier=JanusHandleType.PUBLISHER,
         plugin_attr="control_handle",
@@ -703,7 +704,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
     handle_type = models.CharField(max_length=32, choices=JanusHandleType.choices)
     # Lifecycle phase of the Janus handle attachment and readiness flow.
     lifecycle_state = models.CharField(max_length=32, choices=JanusHandleLifecycleState.choices, default=JanusHandleLifecycleState.ATTACHING)
-    # Janus session identifier used to coordinate plugin handles and cleanup.
+    # Diagnostic owner-session identifier; it is never portable across processes.
     janus_session_id = models.CharField(max_length=128, blank=True)
     # Janus plugin handle identifier persisted in the database and exposed as ``handle`` in Python.
     janus_handle_id = JanusPluginField(

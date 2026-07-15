@@ -235,14 +235,32 @@ class MeetingNamespace(AsyncNamespace):
         return Participant.objects.select_related("session", "room", "profile").get(pk=participant_id)
 
     def _get_participant_for_session_socket(self, session_id: str, sid: str) -> Participant:
-        """Load the current participant for a socket inside the specified session."""
+        """Load an admitted, currently connected participant for this socket."""
 
-        from apps.meetings.models import ParticipantConnection
+        from apps.meetings.models import (
+            ParticipantConnection,
+            ParticipantStatus,
+            RealtimeConnectionStatus,
+        )
 
         connection = ParticipantConnection.objects.select_related("participant", "participant__session").get(socket_id=sid)
-        if connection.participant and str(connection.participant.session_id) == str(session_id):
+        active_connection_states = {
+            RealtimeConnectionStatus.CONNECTED,
+            RealtimeConnectionStatus.SUBSCRIBED,
+            RealtimeConnectionStatus.ACTIVE,
+        }
+        admitted_participant_states = {
+            ParticipantStatus.ADMITTED,
+            ParticipantStatus.ACTIVE,
+        }
+        if (
+            connection.status in active_connection_states
+            and connection.participant
+            and connection.participant.status in admitted_participant_states
+            and str(connection.participant.session_id) == str(session_id)
+        ):
             return connection.participant
-        raise ValueError("Socket is not bound to an admitted participant in this session.")
+        raise ValueError("Socket is not bound to an active admitted participant in this session.")
 
     def _get_connection_by_socket(self, sid: str):
         """Load the backing realtime connection for a socket, when present."""

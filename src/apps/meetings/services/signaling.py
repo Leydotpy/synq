@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable, Sequence
 
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+from janus_api.models.base import Jsep
 from janus_api.models.request import TrickleCandidate
-from janus_api.models.videoroom import ParticipantSubscribeJoinRequest, StreamDescription, SubscriberStreams
+from janus_videoroom_plugin import (
+    PublisherConfigureRequest,
+    PublisherJoinAndConfigureRequest,
+    PublisherPublishRequest,
+    StreamDescription,
+    SubscribeTarget,
+    SubscriberJoinRequest,
+    SubscriberUpdateRequest,
+    UnsubscribeTarget,
+)
 
-from apps.meetings.exceptions import MeetingDomainError
+from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
 from apps.meetings.models import (
     JanusHandleLifecycleState,
     JanusHandleType,
@@ -24,12 +36,15 @@ from apps.meetings.models import (
 from apps.meetings.realtime.emitter import MeetingSocketEmitter
 from apps.meetings.services.janus import (
     call_plugin_method,
+    call_video_room_management_method,
     ensure_participant_media_plugin,
-    ensure_session_control_handle,
     serialize_janus_response,
+    video_room_reply_data,
 )
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.services.permissions import MeetingPermissionService
+
+logger = logging.getLogger(__name__)
 
 
 def _serialize_model(value: Any) -> dict[str, Any]:
@@ -55,8 +70,151 @@ def _serialize_jsep(value: Any) -> dict[str, Any] | None:
 
     if value is None:
         return None
-    serialized = _serialize_model(value)
+    if hasattr(value, "model_dump"):
+        serialized = value.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+    else:
+        serialized = _serialize_model(value)
     return serialized or None
+
+
+def _with_subscriber_joined_state(
+    payload: dict[str, Any],
+    *,
+    joined: bool,
+) -> dict[str, Any]:
+    """Persist app-owned subscriber role state beside the raw Janus envelope."""
+
+    app_state = payload.get("_synq") if isinstance(payload.get("_synq"), dict) else {}
+    return {
+        **payload,
+        "_synq": {
+            **app_state,
+            "subscriber_joined": joined,
+        },
+    }
+
+
+def _subscriber_is_joined(
+    media_handle: ParticipantMediaHandle,
+    current_targets: set[tuple[str, str]],
+) -> bool:
+    """Distinguish an attached plugin from one already joined as subscriber."""
+
+    janus_state = media_handle.janus_state if isinstance(media_handle.janus_state, dict) else {}
+    app_state = janus_state.get("_synq") if isinstance(janus_state.get("_synq"), dict) else {}
+    marker = app_state.get("subscriber_joined")
+    if isinstance(marker, bool):
+        return marker
+    plugin_data = ((janus_state.get("plugindata") or {}).get("data") or {})
+    return (
+        bool(current_targets)
+        or media_handle.lifecycle_state
+        in {
+            JanusHandleLifecycleState.JOINING,
+            JanusHandleLifecycleState.READY,
+        }
+        or plugin_data.get("videoroom") in {"attached", "updated", "started"}
+    )
+
+
+def _build_jsep(payload: dict[str, Any], *, jsep_type: str) -> Jsep:
+    """Validate a browser session description with the Janus Core model."""
+
+    return Jsep.model_validate({**payload, "type": jsep_type})
+
+
+def _janus_room_id(session: MeetingSession) -> str:
+    """Return the configured Janus room identifier with the historic UUID fallback."""
+
+    return session.janus_room_id or str(session.pk)
+
+
+def _reply_items(reply_data: Any, field_name: str) -> list[Any]:
+    """Read a repeated field from typed VideoRoom data or a compatibility mapping."""
+
+    if reply_data is None:
+        return []
+    if isinstance(reply_data, dict):
+        value = reply_data.get(field_name)
+    else:
+        value = getattr(reply_data, field_name, None)
+    return list(value or [])
+
+
+def _field_was_provided(value: Any, field_name: str) -> bool:
+    """Distinguish wire fields from defaults synthesized by response models."""
+
+    if isinstance(value, dict):
+        return field_name in value
+    fields_set = getattr(value, "model_fields_set", None)
+    if fields_set is not None:
+        return field_name in fields_set
+    return hasattr(value, field_name)
+
+
+def _merge_publisher_payloads(
+    session: MeetingSession,
+    publisher_payloads: Sequence[Any],
+    *,
+    authoritative: bool,
+) -> list[dict[str, Any]]:
+    """Merge publisher presence with any cached stream-rich publisher details.
+
+    ``listparticipants`` reports whether a participant is publishing but does
+    not include the publisher's stream list.  Retaining a previously observed
+    ``streams`` field keeps multistream subscriptions and local projections
+    stable while still allowing an authoritative presence snapshot to remove
+    publishers that have left or stopped publishing.
+    """
+
+    session_state = session.janus_state if isinstance(session.janus_state, dict) else {}
+    cached_payloads = session_state.get("participants") or []
+    cached_by_id: dict[str, dict[str, Any]] = {}
+    cached_order: list[str] = []
+    for cached_publisher in cached_payloads:
+        cached_payload = _serialize_model(cached_publisher)
+        publisher_id = str(cached_payload.get("id") or "")
+        if not publisher_id:
+            continue
+        cached_by_id[publisher_id] = cached_payload
+        cached_order.append(publisher_id)
+
+    merged_payloads: list[dict[str, Any]] = []
+    observed_ids: set[str] = set()
+    for publisher in publisher_payloads:
+        has_stream_topology = _field_was_provided(publisher, "streams")
+        payload = _serialize_model(publisher)
+        publisher_id = str(payload.get("id") or "")
+        if not publisher_id:
+            continue
+        observed_ids.add(publisher_id)
+
+        # The management response includes joined non-publishers as well. They
+        # are not valid subscription targets and supersede any stale cache row.
+        if payload.get("publisher") is False:
+            continue
+
+        cached_payload = cached_by_id.get(publisher_id, {})
+        merged_payload = {**cached_payload, **payload}
+        if not has_stream_topology or payload.get("streams") is None:
+            if "streams" in cached_payload:
+                merged_payload["streams"] = cached_payload["streams"]
+            else:
+                merged_payload.pop("streams", None)
+        merged_payloads.append(merged_payload)
+
+    if not authoritative:
+        merged_payloads.extend(
+            cached_by_id[publisher_id]
+            for publisher_id in cached_order
+            if publisher_id not in observed_ids
+        )
+
+    return merged_payloads
 
 
 def _serialize_handle_streams(media_handle: ParticipantMediaHandle) -> list[dict[str, Any]]:
@@ -161,14 +319,35 @@ def _match_participant_for_publisher(
     session: MeetingSession,
     publisher_id: str,
     display_name: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> Participant | None:
-    """Resolve a local participant from a Janus publisher identifier or display name."""
+    """Resolve a present participant from trusted Janus correlation data."""
 
-    participant = session.participants.filter(janus_publisher_id=publisher_id).first()
+    present_participants = session.participants.present()
+    participant = present_participants.filter(janus_publisher_id=publisher_id).first()
     if participant is not None:
         return participant
+
+    if isinstance(metadata, dict) and metadata.get("participant_id"):
+        expected_metadata = {
+            "session_id": session.pk,
+            "room_id": session.room_id,
+        }
+        if any(
+            metadata.get(key) is not None
+            and str(metadata[key]) != str(expected_value)
+            for key, expected_value in expected_metadata.items()
+        ):
+            return None
+        try:
+            return present_participants.filter(pk=metadata["participant_id"]).first()
+        except (TypeError, ValueError, ValidationError):
+            return None
+
     if display_name:
-        return session.participants.filter(display_name=display_name).first()
+        matches = list(present_participants.filter(display_name=display_name)[:2])
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
@@ -186,21 +365,32 @@ def _ensure_publish_permissions(participant: Participant, tracks: Sequence[dict[
         MeetingPermissionService.require_participant_capability(participant=participant, capability_field="can_share_screen")
 
 
-def _serialize_selected_streams(streams: Iterable[SubscriberStreams]) -> list[dict[str, Any]]:
+def _serialize_selected_streams(
+    streams: Iterable[SubscribeTarget | UnsubscribeTarget],
+) -> list[dict[str, Any]]:
     """Serialize Janus subscriber stream selections for persistence and acknowledgements."""
 
-    return [
-        {
-            "feed": str(stream.feed),
-            "mid": stream.mid,
-            "crossrefid": stream.crossrefid,
-            "sub_mid": stream.sub_mid,
-        }
-        for stream in streams
-    ]
+    serialized_streams: list[dict[str, Any]] = []
+    for stream in streams:
+        payload = _serialize_model(stream)
+        feed = payload.get("feed")
+        serialized_streams.append(
+            {
+                "feed": str(feed) if feed is not None else None,
+                "mid": payload.get("mid"),
+                "crossrefid": payload.get("crossrefid"),
+                "sub_mid": payload.get("sub_mid"),
+            }
+        )
+    return serialized_streams
 
 
-def _reconcile_publisher_payloads(session: MeetingSession, publisher_payloads: Sequence[Any]) -> list[dict[str, Any]]:
+def _reconcile_publisher_payloads(
+    session: MeetingSession,
+    publisher_payloads: Sequence[Any],
+    *,
+    prune_missing: bool = True,
+) -> list[dict[str, Any]]:
     """Project Janus publisher state into participants and outbound stream rows."""
 
     now = timezone.now()
@@ -209,6 +399,8 @@ def _reconcile_publisher_payloads(session: MeetingSession, publisher_payloads: S
 
     for publisher in publisher_payloads:
         payload = _serialize_model(publisher)
+        if payload.get("publisher") is False:
+            continue
         serialized_publishers.append(payload)
         publisher_id = str(payload.get("id") or "")
         if not publisher_id:
@@ -217,6 +409,7 @@ def _reconcile_publisher_payloads(session: MeetingSession, publisher_payloads: S
             session=session,
             publisher_id=publisher_id,
             display_name=payload.get("display"),
+            metadata=payload.get("metadata"),
         )
         if participant is None:
             continue
@@ -232,10 +425,13 @@ def _reconcile_publisher_payloads(session: MeetingSession, publisher_payloads: S
             continue
 
         stream_rows = payload.get("streams") or []
+        has_complete_stream_topology = "streams" in payload and payload.get("streams") is not None
         seen_mids: set[str] = set()
         for stream_payload in stream_rows:
+            stream_payload = _serialize_model(stream_payload)
             mid = str(stream_payload.get("mid") or "")
             if not mid:
+                has_complete_stream_topology = False
                 continue
             seen_mids.add(mid)
             ParticipantStream.objects.update_or_create(
@@ -260,39 +456,50 @@ def _reconcile_publisher_payloads(session: MeetingSession, publisher_payloads: S
                 },
             )
 
-        publisher_handle.streams.filter(direction=MediaDirection.OUTBOUND).exclude(janus_mid__in=seen_mids).delete()
+        if has_complete_stream_topology:
+            publisher_handle.streams.filter(direction=MediaDirection.OUTBOUND).exclude(janus_mid__in=seen_mids).delete()
         if publisher_handle.lifecycle_state in {JanusHandleLifecycleState.JOINING, JanusHandleLifecycleState.ATTACHED} and seen_mids:
             publisher_handle.lifecycle_state = JanusHandleLifecycleState.READY
             publisher_handle.janus_state = payload
             publisher_handle.last_event_at = now
             publisher_handle.save(update_fields=["lifecycle_state", "janus_state", "last_event_at", "updated_at"])
 
-    publisher_handles = ParticipantMediaHandle.objects.filter(
-        participant__session=session,
-        handle_type=JanusHandleType.PUBLISHER,
-    ).select_related("participant")
-    for media_handle in publisher_handles:
-        if media_handle.participant.janus_publisher_id and media_handle.participant.janus_publisher_id not in active_publisher_ids:
-            media_handle.streams.filter(direction=MediaDirection.OUTBOUND).delete()
-            if media_handle.lifecycle_state == JanusHandleLifecycleState.READY:
-                media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHED
-                media_handle.last_event_at = now
-                media_handle.save(update_fields=["lifecycle_state", "last_event_at", "updated_at"])
+    if prune_missing:
+        publisher_handles = ParticipantMediaHandle.objects.filter(
+            participant__session=session,
+            handle_type=JanusHandleType.PUBLISHER,
+        ).select_related("participant")
+        for media_handle in publisher_handles:
+            if media_handle.participant.janus_publisher_id and media_handle.participant.janus_publisher_id not in active_publisher_ids:
+                media_handle.streams.filter(direction=MediaDirection.OUTBOUND).delete()
+                if media_handle.lifecycle_state == JanusHandleLifecycleState.READY:
+                    media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHED
+                    media_handle.last_event_at = now
+                    media_handle.save(update_fields=["lifecycle_state", "last_event_at", "updated_at"])
 
     return serialized_publishers
 
 
-def _reconcile_subscriber_streams(media_handle: ParticipantMediaHandle, stream_payloads: Sequence[dict[str, Any]]) -> None:
+def _reconcile_subscriber_streams(
+    media_handle: ParticipantMediaHandle,
+    stream_payloads: Sequence[dict[str, Any]] | None,
+) -> None:
     """Project Janus subscriber state into inbound stream rows."""
+
+    if stream_payloads is None:
+        return
 
     participant = media_handle.participant
     session = participant.session
     now = timezone.now()
     seen_mids: set[str] = set()
+    has_complete_stream_topology = True
 
     for payload in stream_payloads:
+        payload = _serialize_model(payload)
         janus_mid = str(payload.get("mid") or "")
         if not janus_mid:
+            has_complete_stream_topology = False
             continue
         seen_mids.add(janus_mid)
         janus_feed_id = str(payload.get("feed_id") or "")
@@ -329,32 +536,70 @@ def _reconcile_subscriber_streams(media_handle: ParticipantMediaHandle, stream_p
             },
         )
 
-    media_handle.streams.filter(direction=MediaDirection.INBOUND).exclude(janus_mid__in=seen_mids).delete()
+    if has_complete_stream_topology:
+        media_handle.streams.filter(direction=MediaDirection.INBOUND).exclude(janus_mid__in=seen_mids).delete()
 
 
-def _build_subscriber_targets(*, participant: Participant, publisher_payloads: Sequence[Any]) -> list[SubscriberStreams]:
+def _build_subscriber_targets(*, participant: Participant, publisher_payloads: Sequence[Any]) -> list[SubscribeTarget]:
     """Build the target publisher streams for the participant's multistream subscriber handle."""
 
-    targets: list[SubscriberStreams] = []
+    targets: list[SubscribeTarget] = []
     local_feed_id = str(participant.janus_publisher_id or "")
     for publisher in publisher_payloads:
         payload = _serialize_model(publisher)
         publisher_id = str(payload.get("id") or "")
-        if not publisher_id or publisher_id == local_feed_id:
+        if not publisher_id or publisher_id == local_feed_id or payload.get("publisher") is False:
+            continue
+        if "streams" not in payload or payload.get("streams") is None:
+            targets.append(SubscribeTarget(feed=publisher_id))
             continue
         for stream_payload in payload.get("streams") or []:
+            stream_payload = _serialize_model(stream_payload)
             media_type = str(stream_payload.get("type") or "")
             mid = str(stream_payload.get("mid") or "")
             if media_type not in {"audio", "video"} or not mid or bool(stream_payload.get("disabled", False)):
                 continue
             targets.append(
-                SubscriberStreams(
+                SubscribeTarget(
                     feed=publisher_id,
                     mid=mid,
                     crossrefid=f"{publisher_id}:{mid}",
                 )
             )
     return targets
+
+
+def _preserve_feed_wide_targets(
+    targets: Sequence[SubscribeTarget],
+    selected_streams: Sequence[dict[str, Any]],
+) -> list[SubscribeTarget]:
+    """Keep an existing feed-wide subscription when richer topology appears.
+
+    Replacing ``feed`` with per-MID targets in one update would ask Janus to
+    subscribe individual streams and unsubscribe the whole feed at once.  A
+    retained feed-wide target already covers those streams (and future ones),
+    so no renegotiation is necessary until the publisher itself disappears.
+    """
+
+    feed_wide_ids = {
+        str(item.get("feed") or "")
+        for item in selected_streams
+        if item.get("feed") and not item.get("mid")
+    }
+    if not feed_wide_ids:
+        return list(targets)
+
+    normalized_targets: list[SubscribeTarget] = []
+    emitted_feed_wide_ids: set[str] = set()
+    for target in targets:
+        feed_id = str(target.feed)
+        if feed_id not in feed_wide_ids:
+            normalized_targets.append(target)
+            continue
+        if feed_id not in emitted_feed_wide_ids:
+            normalized_targets.append(SubscribeTarget(feed=feed_id))
+            emitted_feed_wide_ids.add(feed_id)
+    return normalized_targets
 
 
 def _serialize_trickle_candidates(candidates: Sequence[dict[str, Any]]) -> list[TrickleCandidate]:
@@ -382,9 +627,21 @@ class MeetingMediaSignalService:
     def sync_publishers(*, session: MeetingSession, emit_state: bool = True) -> dict[str, Any]:
         """Synchronize Janus publisher state into participants and outbound stream rows."""
 
-        control_handle = ensure_session_control_handle(session)
-        publisher_payloads = call_plugin_method(control_handle, "participants")
-        serialized_publishers = _reconcile_publisher_payloads(session, publisher_payloads)
+        response = call_video_room_management_method(
+            session,
+            "list_participants",
+            _janus_room_id(session),
+        )
+        publisher_payloads = _reply_items(video_room_reply_data(response), "participants")
+        merged_publishers = _merge_publisher_payloads(
+            session,
+            publisher_payloads,
+            authoritative=True,
+        )
+        serialized_publishers = _reconcile_publisher_payloads(
+            session,
+            merged_publishers,
+        )
         session.janus_state = {**session.janus_state, "participants": serialized_publishers}
         session.last_synced_at = timezone.now()
         session.save(update_fields=["janus_state", "last_synced_at", "updated_at"])
@@ -414,23 +671,45 @@ class MeetingMediaSignalService:
             connection=connection,
         )
         bound_handle = ensure_participant_media_plugin(media_handle)
+        participant.refresh_from_db(
+            fields=["janus_publisher_id", "janus_private_id"],
+        )
         descriptions = _build_stream_descriptions(track_descriptors)
+        offer_jsep = _build_jsep(offer, jsep_type="offer")
 
         method_name = "configure"
-        method_kwargs: dict[str, Any] = {
-            "sdp": offer["sdp"],
-            "sdp_type": "offer",
-            "descriptions": descriptions,
-        }
         if not participant.janus_publisher_id:
             method_name = "join_and_configure"
-            method_kwargs["pin"] = participant.session.janus_room_pin or None
-            method_kwargs["metadata"] = _build_metadata(participant)
+            response = call_plugin_method(
+                bound_handle,
+                "join_and_configure",
+                PublisherJoinAndConfigureRequest(
+                    room=_janus_room_id(participant.session),
+                    display=participant.display_name or None,
+                    pin=participant.session.janus_room_pin or None,
+                    metadata=_build_metadata(participant),
+                    descriptions=descriptions,
+                ),
+                offer_jsep,
+            )
         elif media_handle.lifecycle_state == JanusHandleLifecycleState.ATTACHED:
             method_name = "publish"
-        response = call_plugin_method(bound_handle, method_name, **method_kwargs)
+            response = call_plugin_method(
+                bound_handle,
+                "publish",
+                offer_jsep,
+                body=PublisherPublishRequest(descriptions=descriptions),
+            )
+        else:
+            response = call_plugin_method(
+                bound_handle,
+                "configure_publisher",
+                PublisherConfigureRequest(descriptions=descriptions),
+                offer=offer_jsep,
+            )
 
-        plugin_data = getattr(getattr(response, "plugindata", None), "data", None)
+        plugin_data = video_room_reply_data(response)
+        reply_publishers = _reply_items(plugin_data, "publishers")
         serialized_response = serialize_janus_response(response)
         serialized_answer = _serialize_jsep(getattr(response, "jsep", None))
         now = timezone.now()
@@ -463,7 +742,40 @@ class MeetingMediaSignalService:
             participant.last_seen_at = now
             participant.save(update_fields=["janus_publisher_id", "janus_private_id", "janus_state", "last_seen_at", "updated_at"])
 
-        MeetingMediaSignalService.sync_publishers(session=participant.session, emit_state=False)
+            if reply_publishers:
+                merged_publishers = _merge_publisher_payloads(
+                    participant.session,
+                    reply_publishers,
+                    authoritative=False,
+                )
+                serialized_publishers = _reconcile_publisher_payloads(
+                    participant.session,
+                    merged_publishers,
+                    prune_missing=False,
+                )
+                participant.session.janus_state = {
+                    **participant.session.janus_state,
+                    "participants": serialized_publishers,
+                }
+                participant.session.last_synced_at = now
+                participant.session.save(
+                    update_fields=["janus_state", "last_synced_at", "updated_at"],
+                )
+
+        try:
+            MeetingMediaSignalService.sync_publishers(
+                session=participant.session,
+                emit_state=False,
+            )
+        except JanusGatewayError:
+            # The publisher command and SDP answer already succeeded. A
+            # secondary participant-list refresh must not make the browser
+            # repeat the state-changing publish request.
+            logger.warning(
+                "Publisher %s negotiated successfully but the follow-up Janus state sync failed",
+                participant.pk,
+                exc_info=True,
+            )
         MeetingSocketEmitter.emit_session_state(session=participant.session)
         media_handle.refresh_from_db()
         return {
@@ -520,31 +832,59 @@ class MeetingMediaSignalService:
             connection=connection,
         )
         bound_handle = ensure_participant_media_plugin(media_handle)
-        publishers = call_plugin_method(ensure_session_control_handle(participant.session), "participants")
-        serialized_publishers = _reconcile_publisher_payloads(participant.session, publishers)
-        targets = _build_subscriber_targets(participant=participant, publisher_payloads=publishers)
+        participant.refresh_from_db(
+            fields=["janus_publisher_id", "janus_private_id"],
+        )
+        publisher_response = call_video_room_management_method(
+            participant.session,
+            "list_participants",
+            _janus_room_id(participant.session),
+        )
+        publisher_payloads = _reply_items(
+            video_room_reply_data(publisher_response),
+            "participants",
+        )
+        merged_publishers = _merge_publisher_payloads(
+            participant.session,
+            publisher_payloads,
+            authoritative=True,
+        )
+        serialized_publishers = _reconcile_publisher_payloads(
+            participant.session,
+            merged_publishers,
+        )
+        targets = _build_subscriber_targets(
+            participant=participant,
+            publisher_payloads=merged_publishers,
+        )
+        targets = _preserve_feed_wide_targets(
+            targets,
+            media_handle.selected_streams,
+        )
         serialized_targets = _serialize_selected_streams(targets)
         current_targets = {
             (str(item.get("feed") or ""), str(item.get("mid") or ""))
             for item in media_handle.selected_streams
         }
-        next_targets = {(str(item["feed"]), str(item["mid"])) for item in serialized_targets}
+        next_targets = {
+            (str(item.get("feed") or ""), str(item.get("mid") or ""))
+            for item in serialized_targets
+        }
+        subscriber_joined = _subscriber_is_joined(media_handle, current_targets)
 
         action = "noop"
         response = None
         jsep_payload = None
-        stream_payloads: Sequence[dict[str, Any]] = []
+        stream_payloads: Sequence[dict[str, Any]] | None = None
 
         if not serialized_targets and not current_targets:
             pass
-        elif not current_targets:
+        elif not subscriber_joined:
             response = call_plugin_method(
                 bound_handle,
-                "send",
-                ParticipantSubscribeJoinRequest(
-                    request="join",
-                    ptype="subscriber",
-                    room=participant.session.janus_room_id or str(participant.session.pk),
+                "join_subscriber",
+                SubscriberJoinRequest(
+                    room=_janus_room_id(participant.session),
                     pin=participant.session.janus_room_pin or None,
                     private_id=participant.janus_private_id or None,
                     streams=targets,
@@ -554,35 +894,60 @@ class MeetingMediaSignalService:
             )
             action = "join"
         elif current_targets != next_targets:
-            add = [item for item in targets if (str(item.feed), item.mid) not in current_targets]
-            drop = [
-                SubscriberStreams(
-                    feed=str(item.get("feed")),
-                    mid=str(item.get("mid")),
-                    crossrefid=str(item.get("crossrefid") or f"{item.get('feed')}:{item.get('mid')}"),
-                    sub_mid=item.get("sub_mid"),
-                )
-                for item in media_handle.selected_streams
-                if (str(item.get("feed") or ""), str(item.get("mid") or "")) not in next_targets
+            subscribe_targets = [
+                item
+                for item in targets
+                if (str(item.feed), str(item.mid or "")) not in current_targets
             ]
-            response = call_plugin_method(
-                bound_handle,
-                "update",
-                add=add or None,
-                drop=drop or None,
-            )
-            action = "update"
+            unsubscribe_targets: list[UnsubscribeTarget] = []
+            for item in media_handle.selected_streams:
+                target_key = (
+                    str(item.get("feed") or ""),
+                    str(item.get("mid") or ""),
+                )
+                if target_key in next_targets:
+                    continue
+                feed = str(item.get("feed") or "") or None
+                mid = str(item.get("mid") or "") or None
+                sub_mid = str(item.get("sub_mid") or "") or None
+                if feed is None and sub_mid is None:
+                    continue
+                unsubscribe_targets.append(
+                    UnsubscribeTarget(
+                        feed=feed,
+                        mid=mid if feed is not None else None,
+                        sub_mid=sub_mid,
+                    )
+                )
+            if subscribe_targets or unsubscribe_targets:
+                response = call_plugin_method(
+                    bound_handle,
+                    "update_subscription",
+                    SubscriberUpdateRequest(
+                        subscribe=subscribe_targets or None,
+                        unsubscribe=unsubscribe_targets or None,
+                    ),
+                )
+                action = "update"
 
         if response is not None:
-            serialized_response = serialize_janus_response(response)
+            serialized_response = _with_subscriber_joined_state(
+                serialize_janus_response(response),
+                joined=True,
+            )
             media_handle.janus_state = serialized_response
             media_handle.last_event_at = timezone.now()
-            plugin_data = getattr(getattr(response, "plugindata", None), "data", None)
-            stream_payloads = list(_serialize_model(plugin_data).get("streams") or []) if plugin_data else []
+            plugin_data = video_room_reply_data(response)
+            plugin_payload = _serialize_model(plugin_data)
+            if plugin_data is not None and plugin_payload.get("streams") is not None:
+                stream_payloads = list(plugin_payload["streams"])
             jsep_payload = _serialize_jsep(getattr(response, "jsep", None))
             if jsep_payload and jsep_payload.get("type") == "offer":
                 media_handle.jsep_offer = jsep_payload
-            media_handle.lifecycle_state = JanusHandleLifecycleState.JOINING if serialized_targets else JanusHandleLifecycleState.ATTACHED
+            if jsep_payload:
+                media_handle.lifecycle_state = JanusHandleLifecycleState.JOINING
+            elif action == "join":
+                media_handle.lifecycle_state = JanusHandleLifecycleState.JOINING
 
         media_handle.connection = connection or media_handle.connection
         media_handle.selected_streams = serialized_targets
@@ -633,11 +998,18 @@ class MeetingMediaSignalService:
             connection=connection,
         )
         bound_handle = ensure_participant_media_plugin(media_handle)
-        response = call_plugin_method(bound_handle, "watch", sdp=answer["sdp"], sdp_type="answer")
+        response = call_plugin_method(
+            bound_handle,
+            "start",
+            answer=_build_jsep(answer, jsep_type="answer"),
+        )
 
         media_handle.connection = connection or media_handle.connection
         media_handle.jsep_answer = answer
-        media_handle.janus_state = serialize_janus_response(response)
+        media_handle.janus_state = _with_subscriber_joined_state(
+            serialize_janus_response(response),
+            joined=True,
+        )
         media_handle.lifecycle_state = JanusHandleLifecycleState.READY
         media_handle.last_event_at = timezone.now()
         media_handle.save(
@@ -685,7 +1057,7 @@ class MeetingMediaSignalService:
         if completed or not serialized_candidates:
             call_plugin_method(bound_handle, "complete_trickle")
         else:
-            call_plugin_method(bound_handle, "trickle", candidates=serialized_candidates)
+            call_plugin_method(bound_handle, "trickle", serialized_candidates)
         media_handle.connection = connection or media_handle.connection
         media_handle.last_event_at = timezone.now()
         media_handle.save(update_fields=["connection", "last_event_at", "updated_at"])
@@ -724,10 +1096,58 @@ class MeetingMediaSignalService:
             update_fields["lifecycle_state"] = JanusHandleLifecycleState.ATTACHED
         elif janus_type == "timeout":
             update_fields["lifecycle_state"] = JanusHandleLifecycleState.FAILED
+        elif janus_type == "detached":
+            update_fields["lifecycle_state"] = JanusHandleLifecycleState.DETACHED
+            update_fields["janus_handle_id"] = None
+            update_fields["janus_session_id"] = ""
+            update_fields["selected_streams"] = []
+            update_fields["janus_state"] = _with_subscriber_joined_state(
+                normalized_event,
+                joined=False,
+            )
+            instance.streams.all().delete()
+            if instance.handle_type == JanusHandleType.PUBLISHER:
+                instance.participant.__class__.objects.filter(
+                    pk=instance.participant_id,
+                ).update(
+                    janus_publisher_id="",
+                    janus_private_id="",
+                    updated_at=timezone.now(),
+                )
 
         plugin_payload = ((normalized_event.get("plugindata") or {}).get("data") or {})
         if plugin_payload.get("videoroom") in {"joined", "attached"}:
             update_fields.setdefault("lifecycle_state", JanusHandleLifecycleState.JOINING)
+        if (
+            instance.handle_type == JanusHandleType.SUBSCRIBER
+            and plugin_payload.get("videoroom") in {"attached", "updated", "started"}
+        ):
+            update_fields["janus_state"] = _with_subscriber_joined_state(
+                normalized_event,
+                joined=True,
+            )
+
+        publisher_payloads = plugin_payload.get("publishers") or []
+        if publisher_payloads:
+            session = instance.participant.session
+            merged_publishers = _merge_publisher_payloads(
+                session,
+                publisher_payloads,
+                authoritative=False,
+            )
+            serialized_publishers = _reconcile_publisher_payloads(
+                session,
+                merged_publishers,
+                prune_missing=False,
+            )
+            session.janus_state = {
+                **session.janus_state,
+                "participants": serialized_publishers,
+            }
+            session.last_synced_at = timezone.now()
+            session.save(
+                update_fields=["janus_state", "last_synced_at", "updated_at"],
+            )
 
         if len(update_fields) > 2:
             instance.__class__.objects.filter(pk=instance.pk).update(**update_fields)

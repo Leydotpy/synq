@@ -17,10 +17,11 @@ dependencies = [
     "djangorestframework>=3.17.1",
     "fastapi>=0.135.3",
     "gunicorn>=25.3.0",
-    "janus-api>=2.0.5",
+    "janus-api-core[asgi]==3.0.0",
+    "janus-videoroom-plugin==3.0.0",
+    "python-decouple>=3.8",
     "python-socketio>=5.16.1",
     "redis>=7.4.0",
     "starlette>=1.0.0",
-    "streaming-utils>=1.1.0",
     "uvicorn>=0.44.0",
 ]

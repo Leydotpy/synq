@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from janus_api import Janus
+from janus_api.conf import Janus
 
 
 class JanusSessionMiddleware:

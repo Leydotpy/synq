@@ -207,7 +207,22 @@ SOCKET_IO_CORS_ALLOWED_ORIGINS = env_list_any(
     default=["http://localhost:3000", "http://127.0.0.1:3000"],
 )
 
-JANUS_SESSION_URL = os.getenv("JANUS_SESSION_URL", "ws://127.0.0.1:8188")
+JANUS_SESSION_URL = os.getenv("JANUS_SESSION_URL", "ws://127.0.0.1:8188/janus")
+JANUS_REQUEST_TIMEOUT = float(os.getenv("JANUS_REQUEST_TIMEOUT", "15"))
+JANUS_SESSION_POOL_SIZE = int(os.getenv("JANUS_SESSION_POOL_SIZE", "1"))
+JANUS_STARTUP_FAIL_FAST = env_bool("JANUS_STARTUP_FAIL_FAST", default=False)
+JANUS_KEEPALIVE_INTERVAL = float(os.getenv("JANUS_KEEPALIVE_INTERVAL", "25"))
+JANUS_KEEPALIVE_FAILURES = int(os.getenv("JANUS_KEEPALIVE_FAILURES", "3"))
+JANUS_SHUTDOWN_TIMEOUT = float(os.getenv("JANUS_SHUTDOWN_TIMEOUT", "10"))
+JANUS_DETACH_CONCURRENCY = int(os.getenv("JANUS_DETACH_CONCURRENCY", "16"))
+JANUS_TOKEN = os.getenv("JANUS_TOKEN") or None
+JANUS_API_SECRET = os.getenv("JANUS_API_SECRET") or None
+# The bridge timeout includes the Janus request timeout plus scheduling and
+# cleanup headroom for synchronous Django/Celery callers.
+JANUS_SYNC_CALL_TIMEOUT = float(
+    os.getenv("JANUS_SYNC_CALL_TIMEOUT", str((JANUS_REQUEST_TIMEOUT * 3) + 5)),
+)
+JANUS_RUNTIME_STARTUP_TIMEOUT = float(os.getenv("JANUS_RUNTIME_STARTUP_TIMEOUT", "20"))
 JANUS_DEFAULT_ROOM_CONFIGURATION = {
     "publishers": int(os.getenv("JANUS_ROOM_PUBLISHERS", "100")),
     "bitrate": int(os.getenv("JANUS_ROOM_BITRATE", "1024000")),

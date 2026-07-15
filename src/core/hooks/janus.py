@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from asgiref.sync import async_to_sync
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.utils import timezone
 from janus_api import JanusResponse
@@ -127,7 +127,12 @@ def _persist_latest_event_snapshot(instance, normalized_event: dict[str, Any]) -
     update_payload: dict[str, Any] = {}
 
     if hasattr(instance, "janus_state"):
-        update_payload["janus_state"] = normalized_event
+        existing_state = instance.janus_state if isinstance(instance.janus_state, dict) else {}
+        app_state = existing_state.get("_synq")
+        update_payload["janus_state"] = {
+            **normalized_event,
+            **({"_synq": app_state} if isinstance(app_state, dict) else {}),
+        }
     if hasattr(instance, "last_event_at"):
         update_payload["last_event_at"] = timezone.now()
     if hasattr(instance, "updated_at"):
@@ -145,24 +150,46 @@ def plugin_callback_factory(
     """Build a callback that routes Janus events to the most relevant meeting sockets."""
 
     def _on_rx_event(event: JanusEvent) -> None:
+        current_instance = instance
+        if getattr(instance, "pk", None) is not None:
+            try:
+                current_instance = instance.__class__._default_manager.get(pk=instance.pk)
+            except ObjectDoesNotExist:
+                # A late Janus event for a deleted domain object has no valid
+                # persistence or fan-out target.
+                return
+
         normalized_event = _normalize_event_payload(event)
-        _persist_latest_event_snapshot(instance, normalized_event)
+        _persist_latest_event_snapshot(current_instance, normalized_event)
         try:
-            MeetingMediaSignalService.handle_callback_snapshot(instance, normalized_event)
+            MeetingMediaSignalService.handle_callback_snapshot(
+                current_instance,
+                normalized_event,
+            )
         except Exception:
             # Best-effort lifecycle syncing should not block realtime fan-out.
             pass
 
+        if normalized_event.get("transaction") and isinstance(
+            normalized_event.get("jsep"),
+            dict,
+        ):
+            # Core v3 deliberately routes transactional handle responses to
+            # callbacks as well as to the awaiting request. The Socket.IO ACK
+            # is authoritative for those JSEP exchanges; broadcasting the
+            # same offer/answer would negotiate it twice in the browser.
+            return
+
         payload = {
-            "model": instance._meta.label_lower,
-            "pk": str(instance.pk) if getattr(instance, "pk", None) else None,
+            "model": current_instance._meta.label_lower,
+            "pk": str(current_instance.pk) if getattr(current_instance, "pk", None) else None,
             "plugin_field": field.name,
             "plugin_attr": field.plugin_attr,
-            "plugin_identifier": field.resolve_identifier(instance),
-            "plugin_id": field.get_stored_value(instance) or raw_id,
+            "plugin_identifier": field.resolve_identifier(current_instance),
+            "plugin_id": field.get_stored_value(current_instance) or raw_id,
             "event": normalized_event,
-            "socket_ids": _collect_socket_ids(instance),
-            **_extract_context(instance),
+            "socket_ids": _collect_socket_ids(current_instance),
+            **_extract_context(current_instance),
         }
         dispatch_janus_event(payload)
 
@@ -175,11 +202,11 @@ def dispatch_janus_event(payload: dict[str, Any]) -> None:
     socket_ids = [str(socket_id) for socket_id in payload.get("socket_ids", []) if socket_id]
     session_id = payload.get("session_id")
 
-    def _emit() -> None:
+    async def _broadcast() -> None:
         server = get_socket_server()
 
         for socket_id in socket_ids:
-            async_to_sync(server.emit)(
+            await server.emit(
                 MeetingSocketEvents.JANUS_EVENT,
                 payload,
                 to=socket_id,
@@ -187,11 +214,20 @@ def dispatch_janus_event(payload: dict[str, Any]) -> None:
             )
 
         if not socket_ids and session_id:
-            async_to_sync(server.emit)(
+            await server.emit(
                 MeetingSocketEvents.JANUS_EVENT,
                 payload,
                 room=MeetingSocketEmitter.session_room_name(session_id),
                 namespace=MeetingSocketEmitter.namespace,
             )
+
+    def _emit() -> None:
+        # Core v3 invokes synchronous plugin callbacks in a worker thread.
+        # Socket.IO is owned by the ASGI/Janus loop, so submit the complete
+        # fan-out back to that loop instead of creating an unrelated loop with
+        # async_to_sync.
+        from apps.meetings.services.janus import janus_runtime
+
+        janus_runtime.run(_broadcast())
 
     transaction.on_commit(_emit)

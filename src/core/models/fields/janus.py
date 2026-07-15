@@ -8,15 +8,20 @@ from enum import Enum
 from functools import cached_property
 from typing import Any, Awaitable, Callable, Generic, Mapping, Protocol, Sequence, Type, TypeVar, cast
 
+from asgiref.sync import sync_to_async
 from django.core import checks
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.query_utils import DeferredAttribute
 from django.utils.module_loading import import_string
-from janus_api import Janus
+from janus_api.conf import Janus
 from janus_api.session.base import AbstractBaseSession
 
 DEFAULT_PLUGIN_CLASS = "janus_api.Plugin"
+LEGACY_PLUGIN_IDENTIFIERS = {
+    "publisher": "videoroom",
+    "subscriber": "videoroom",
+}
 
 JanusEvent = Mapping[str, Any]
 RxEventCallback = Callable[[JanusEvent], None]
@@ -45,7 +50,7 @@ class SupportsPlugin(Protocol):
     identifier: str
     id: str | None
 
-    def attach(self) -> Any:
+    def attach(self, *, opaque_id: str | None = None) -> Any:
         """Attach the plugin to Janus."""
 
     def detach(self) -> Any:
@@ -138,7 +143,14 @@ class BoundPluginHandle(Generic[PluginT]):
     def is_attached(self) -> bool:
         """Return whether the current plugin has already been attached in Janus."""
 
-        return self.id not in (None, "")
+        plugin_id = self.id
+        session = self.session
+        return bool(
+            plugin_id
+            and session is not None
+            and session.ready
+            and session.plugins.get(plugin_id) is self.plugin
+        )
 
     def unwrap(self) -> PluginT:
         """Return the underlying plugin instance."""
@@ -178,23 +190,33 @@ class BoundPluginHandle(Generic[PluginT]):
     def attach(
         self,
         *,
+        opaque_id: str | None = None,
         persist: bool = False,
         using: str | None = None,
         update_fields: Sequence[str] | None = None,
     ) -> Any:
         """Attach the plugin and sync the resulting Janus handle id back to the model."""
 
-        result = self.plugin.attach()
+        result = self.plugin.attach(opaque_id=opaque_id)
 
         if inspect.isawaitable(result):
 
             async def _await_and_sync() -> Any:
                 resolved = await cast(Awaitable[Any], result)
-                self.sync_from_plugin(
-                    persist=persist,
-                    using=using,
-                    update_fields=update_fields,
-                )
+                if persist:
+                    await sync_to_async(
+                        self.sync_from_plugin,
+                        # A caller may already be inside Django's single
+                        # thread-sensitive executor and blocking on the Janus
+                        # owner loop. Reusing that executor would deadlock.
+                        thread_sensitive=False,
+                    )(
+                        persist=True,
+                        using=using,
+                        update_fields=update_fields,
+                    )
+                else:
+                    self.sync_from_plugin(persist=False)
                 return resolved
 
             return _await_and_sync()
@@ -206,9 +228,56 @@ class BoundPluginHandle(Generic[PluginT]):
         )
         return result
 
+    def detach(
+        self,
+        *,
+        persist: bool = False,
+        using: str | None = None,
+        update_fields: Sequence[str] | None = None,
+    ) -> Any:
+        """Detach the plugin and clear its persisted Janus handle id."""
+
+        plugin = self.plugin
+        result = plugin.detach()
+
+        def _clear_handle() -> None:
+            self.raw_id = None
+            self._plugin = None
+            self.field.set_stored_value(
+                self.instance,
+                None,
+                clear_plugin_cache=True,
+            )
+
+            if persist:
+                if self.instance.pk is None:
+                    raise ValueError("Cannot persist plugin_id for an unsaved model instance.")
+
+                fields_to_update = list(update_fields or [])
+                if self.field.attname not in fields_to_update:
+                    fields_to_update.append(self.field.attname)
+
+                self.instance.save(update_fields=fields_to_update, using=using)
+
+        if inspect.isawaitable(result):
+
+            async def _await_and_clear() -> Any:
+                resolved = await cast(Awaitable[Any], result)
+                if persist:
+                    await sync_to_async(_clear_handle, thread_sensitive=False)()
+                else:
+                    _clear_handle()
+                return resolved
+
+            return _await_and_clear()
+
+        _clear_handle()
+        return result
+
     def ensure_attached(
         self,
         *,
+        opaque_id: str | None = None,
         persist: bool = False,
         using: str | None = None,
         update_fields: Sequence[str] | None = None,
@@ -219,6 +288,7 @@ class BoundPluginHandle(Generic[PluginT]):
             return self
 
         result = self.attach(
+            opaque_id=opaque_id,
             persist=persist,
             using=using,
             update_fields=update_fields,
@@ -551,8 +621,8 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
         if self.identifier_getter is not None:
             identifier = self.identifier_getter(instance, self)
             if identifier:
-                return str(identifier)
-        return self.identifier
+                return LEGACY_PLUGIN_IDENTIFIERS.get(str(identifier), str(identifier))
+        return LEGACY_PLUGIN_IDENTIFIERS.get(self.identifier, self.identifier)
 
     def resolve_janus(self, instance: models.Model) -> AbstractBaseSession | None:
         """Return the Janus session associated with the supplied model instance."""
@@ -608,6 +678,11 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
                 "No Janus session is available for this process. "
                 "Ensure the ASGI lifespan has started or configure janus_getter for worker processes.",
             )
+
+        if raw_id is not None:
+            registered_plugin = session.plugins.get(raw_id)
+            if registered_plugin is not None:
+                return cast(PluginT, registered_plugin)
 
         plugin = self.plugin_class(
             identifier=self.resolve_identifier(instance),
