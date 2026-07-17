@@ -1,0 +1,3 @@
+web: DJANGO_SETTINGS_MODULE=conf.settings.production uv run python -m uvicorn conf.asgi:application --host 0.0.0.0 --port ${PORT:-8000}
+worker: DJANGO_SETTINGS_MODULE=conf.settings.production uv run python -m celery -A conf worker -l INFO -E -Q celery,meeting_email --concurrency=${CELERY_WORKER_CONCURRENCY:-4} --prefetch-multiplier=1
+beat: DJANGO_SETTINGS_MODULE=conf.settings.production sh -c 'uv run python manage.py reconcile_celery_schedule && exec uv run python -m celery -A conf.celery beat -l INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler'

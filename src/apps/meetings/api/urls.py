@@ -3,6 +3,7 @@
 from django.urls import path
 
 from apps.meetings.api.views import (
+    MeetingAdmissionView,
     MeetingJoinRequestCreateView,
     MeetingJoinRequestReviewView,
     MeetingParticipantDetailView,
@@ -10,6 +11,7 @@ from apps.meetings.api.views import (
     MeetingServiceSessionCreateView,
     MeetingRoomListCreateView,
     MeetingSessionCreateView,
+    MeetingSessionEndView,
     MeetingSessionShareView,
     MeetingSessionStartView,
     MeetingSessionStateView,
@@ -24,6 +26,8 @@ urlpatterns = [
     path("rooms/<slug:slug>/sessions/", MeetingSessionStartView.as_view(), name="session-start"),
     path("sessions/", MeetingSessionCreateView.as_view(), name="session-create"),
     path("sessions/<uuid:session_id>/state/", MeetingSessionStateView.as_view(), name="session-state"),
+    path("sessions/<uuid:session_id>/end/", MeetingSessionEndView.as_view(), name="session-end"),
+    path("sessions/<uuid:session_id>/admission/", MeetingAdmissionView.as_view(), name="session-admission"),
     path("sessions/<uuid:session_id>/share/", MeetingSessionShareView.as_view(), name="session-share"),
     path("sessions/<uuid:session_id>/join-requests/", MeetingJoinRequestCreateView.as_view(), name="join-request-create"),
     path(

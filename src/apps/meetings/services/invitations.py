@@ -11,7 +11,7 @@ from django.core.mail import send_mail
 from django.utils import timezone
 
 from apps.meetings.exceptions import MeetingDomainError
-from apps.meetings.models import MeetingSession
+from apps.meetings.models import MeetingInvitation, MeetingLifecycleState, MeetingSession
 
 
 class MeetingInvitationService:
@@ -44,10 +44,7 @@ class MeetingInvitationService:
             payload = signing.loads(
                 token,
                 salt=MeetingInvitationService.token_salt,
-                max_age=settings.MEETING_INVITE_MAX_AGE_SECONDS,
             )
-        except signing.SignatureExpired as exc:
-            raise MeetingDomainError("Meeting invite link has expired.") from exc
         except signing.BadSignature as exc:
             raise MeetingDomainError("Meeting invite link is invalid.") from exc
 
@@ -57,10 +54,16 @@ class MeetingInvitationService:
             raise MeetingDomainError("Meeting invite link does not match this meeting.")
 
         expires_at = payload.get("expires_at")
-        if expires_at:
+        if not isinstance(expires_at, str):
+            raise MeetingDomainError("Meeting invite link is invalid.")
+        try:
             parsed_expires_at = datetime.fromisoformat(expires_at)
-            if parsed_expires_at < timezone.now():
-                raise MeetingDomainError("Meeting invite link has expired.")
+        except ValueError as exc:
+            raise MeetingDomainError("Meeting invite link is invalid.") from exc
+        if timezone.is_naive(parsed_expires_at):
+            parsed_expires_at = timezone.make_aware(parsed_expires_at)
+        if parsed_expires_at < timezone.now():
+            raise MeetingDomainError("Meeting invite link has expired.")
 
         return payload
 
@@ -86,7 +89,14 @@ class MeetingInvitationService:
         message: str = "",
         expires_in_seconds: int | None = None,
     ) -> dict:
-        """Create a join link and send it to the supplied email recipients."""
+        """Persist recipients and deliver or durably queue their initial invite."""
+
+        if session.lifecycle_state in {
+            MeetingLifecycleState.ENDING,
+            MeetingLifecycleState.ENDED,
+            MeetingLifecycleState.FAILED,
+        }:
+            raise MeetingDomainError("Invitations cannot be sent for a meeting that has ended.")
 
         invite_token = MeetingInvitationService.create_invite_token(
             session=session,
@@ -98,32 +108,182 @@ class MeetingInvitationService:
             invite_token=invite_token,
         )
 
+        normalized_emails = list(
+            dict.fromkeys(
+                email.strip().lower()
+                for email in emails
+                if email and email.strip()
+            ),
+        )
+        expires_after = expires_in_seconds or settings.MEETING_INVITE_MAX_AGE_SECONDS
+        issuer_name = issuer_profile.display_name or issuer_profile.handle
+        ready_now = (
+            session.room.scheduled_start_at is None
+            or session.room.scheduled_start_at <= timezone.now()
+        )
+        backend = settings.EMAIL_BACKEND
+        inline_backend = backend in {
+            "django.core.mail.backends.console.EmailBackend",
+            "django.core.mail.backends.locmem.EmailBackend",
+        }
+        console_backend = backend == "django.core.mail.backends.console.EmailBackend"
         sent_count = 0
-        subject = f"Invitation to join {session.room.title}"
-        body_parts = [
-            f"{issuer_profile.display_name or issuer_profile.handle} invited you to join {session.room.title}.",
-        ]
-        if message:
-            body_parts.extend(["", message])
-        body_parts.extend(["", f"Join the meeting: {join_url}"])
-        body = "\n".join(body_parts)
+        queued_count = 0
+        pending_count = 0
+        failed_count = 0
+        for email in normalized_emails:
+            invitation, created = MeetingInvitation.objects.update_or_create(
+                session=session,
+                recipient_email=email,
+                defaults={
+                    "issuer_profile": issuer_profile,
+                    "issuer_name": issuer_name,
+                    "message": message,
+                    "expires_in_seconds": expires_after,
+                    "last_delivery_error": "",
+                },
+            )
+            # Retrying the surrounding create/share request must not duplicate
+            # email that was already accepted by the backend.
+            if not created and invitation.initial_email_sent_at is not None:
+                continue
 
-        try:
-            for email in emails:
-                sent_count += send_mail(
-                    subject,
-                    body,
-                    settings.DEFAULT_FROM_EMAIL,
-                    [email],
-                    fail_silently=False,
+            attempted_at = timezone.now()
+            if not inline_backend:
+                # External email is performed by Celery so an SMTP stall or a
+                # partial recipient failure cannot hold or invalidate the HTTP
+                # operation that created the meeting.  Claim a short enqueue
+                # lease so client retries do not publish duplicate tasks.
+                lease_cutoff = attempted_at - timedelta(minutes=5)
+                claim = MeetingInvitation.objects.filter(
+                    pk=invitation.pk,
+                    initial_email_sent_at__isnull=True,
+                ).filter(
+                    last_delivery_attempt_at__isnull=True
                 )
-        except Exception as exc:
-            raise MeetingDomainError("Unable to send meeting invitation email.") from exc
+                if invitation.last_delivery_attempt_at is not None:
+                    if invitation.last_delivery_attempt_at >= lease_cutoff:
+                        pending_count += 1
+                        continue
+                    claim = MeetingInvitation.objects.filter(
+                        pk=invitation.pk,
+                        initial_email_sent_at__isnull=True,
+                        last_delivery_attempt_at=invitation.last_delivery_attempt_at,
+                    )
+                previous_attempt_at = invitation.last_delivery_attempt_at
+                if not claim.update(last_delivery_attempt_at=attempted_at):
+                    pending_count += 1
+                    continue
+
+                from apps.meetings.services.lifecycle import dispatch_task
+                from apps.meetings.tasks import send_meeting_invitation_email
+
+                if dispatch_task(
+                    send_meeting_invitation_email,
+                    str(invitation.pk),
+                    join_url,
+                    True,
+                ) is None:
+                    MeetingInvitation.objects.filter(
+                        pk=invitation.pk,
+                        initial_email_sent_at__isnull=True,
+                        last_delivery_attempt_at=attempted_at,
+                    ).update(last_delivery_attempt_at=previous_attempt_at)
+                    pending_count += 1
+                else:
+                    queued_count += 1
+                continue
+
+            try:
+                sent_count += MeetingInvitationService.send_invitation_email(
+                    invitation=invitation,
+                    join_url=join_url,
+                    ready=ready_now,
+                )
+            except Exception as exc:
+                invitation.delivery_attempts += 1
+                invitation.last_delivery_attempt_at = attempted_at
+                invitation.last_delivery_error = str(exc)[:2000]
+                invitation.save(
+                    update_fields=[
+                        "delivery_attempts",
+                        "last_delivery_attempt_at",
+                        "last_delivery_error",
+                        "updated_at",
+                    ],
+                )
+                failed_count += 1
+                continue
+            invitation.delivery_attempts += 1
+            invitation.initial_email_sent_at = attempted_at
+            invitation.last_delivery_attempt_at = attempted_at
+            invitation.last_delivery_error = ""
+            update_fields = [
+                "delivery_attempts",
+                "initial_email_sent_at",
+                "last_delivery_attempt_at",
+                "last_delivery_error",
+                "updated_at",
+            ]
+            if ready_now:
+                invitation.ready_email_sent_at = attempted_at
+                update_fields.append("ready_email_sent_at")
+            invitation.save(update_fields=update_fields)
+
+        if inline_backend:
+            if failed_count and sent_count:
+                delivery_status = "partial"
+            elif failed_count:
+                delivery_status = "failed"
+            elif console_backend and sent_count:
+                delivery_status = "previewed"
+            else:
+                delivery_status = "delivered"
+        elif queued_count and pending_count:
+            delivery_status = "partial"
+        elif queued_count:
+            delivery_status = "queued"
+        else:
+            delivery_status = "pending"
 
         return {
             "join_url": join_url,
             "invite_token": invite_token,
-            "emails": emails,
+            "emails": normalized_emails,
             "sent_count": sent_count,
-            "expires_in_seconds": expires_in_seconds or settings.MEETING_INVITE_MAX_AGE_SECONDS,
+            "queued_count": queued_count,
+            "pending_count": pending_count,
+            "failed_count": failed_count,
+            "delivery_status": delivery_status,
+            "expires_in_seconds": expires_after,
         }
+
+    @staticmethod
+    def send_invitation_email(
+        *,
+        invitation: MeetingInvitation,
+        join_url: str,
+        ready: bool,
+    ) -> int:
+        """Send one plain-text invitation or due reminder through Django email."""
+
+        subject = (
+            f"Your meeting is ready: {invitation.session.room.title}"
+            if ready
+            else f"Invitation to join {invitation.session.room.title}"
+        )
+        body_parts = [
+            f"{invitation.issuer_name} invited you to join {invitation.session.room.title}.",
+        ]
+        if invitation.message:
+            body_parts.extend(["", invitation.message])
+        if ready:
+            body_parts.extend(["", "The meeting is ready now."])
+        body_parts.extend(["", f"Join the meeting: {join_url}"])
+        return send_mail(
+            subject,
+            "\n".join(body_parts),
+            settings.DEFAULT_FROM_EMAIL,
+            [invitation.recipient_email],
+            fail_silently=False,
+        )

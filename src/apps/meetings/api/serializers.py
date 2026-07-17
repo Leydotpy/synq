@@ -8,10 +8,47 @@ from apps.meetings.models import MeetingAccessPolicy, MeetingRole, MeetingRoom
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 
 
+class ObjectJSONField(serializers.JSONField):
+    """Accept JSON objects while rejecting array/scalar payloads early."""
+
+    default_error_messages = {"not_object": "Expected a JSON object."}
+
+    def to_internal_value(self, data):
+        """Decode JSON, then enforce the mapping contract used by services."""
+
+        value = super().to_internal_value(data)
+        if not isinstance(value, dict):
+            self.fail("not_object")
+        return value
+
+
+def validate_scheduled_range(attrs: dict) -> dict:
+    """Reject inverted meeting schedules consistently across API surfaces."""
+
+    scheduled_start_at = attrs.get("scheduled_start_at")
+    scheduled_end_at = attrs.get("scheduled_end_at")
+    if (
+        scheduled_start_at
+        and scheduled_end_at
+        and scheduled_end_at < scheduled_start_at
+    ):
+        raise serializers.ValidationError(
+            {
+                "scheduled_end_at": (
+                    "Must be greater than or equal to scheduled_start_at."
+                ),
+            },
+        )
+    return attrs
+
+
 class MeetingRoomSerializer(serializers.ModelSerializer):
     """Serialize room details and delegate creation to the lifecycle service."""
 
     passcode = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    janus_room_configuration = ObjectJSONField(required=False)
+    feature_flags = ObjectJSONField(required=False)
+    metadata = ObjectJSONField(required=False)
 
     class Meta:
         """Expose room fields relevant to room setup and administration workflows."""
@@ -36,6 +73,11 @@ class MeetingRoomSerializer(serializers.ModelSerializer):
         )
         read_only_fields = ("id", "slug", "created_at", "updated_at")
 
+    def validate(self, attrs: dict) -> dict:
+        """Validate the room's optional scheduled time range."""
+
+        return validate_scheduled_range(attrs)
+
     def create(self, validated_data: dict) -> MeetingRoom:
         """Create a room using the meeting lifecycle service."""
 
@@ -51,7 +93,13 @@ class MeetingRoomSerializer(serializers.ModelSerializer):
 class MeetingSessionStartSerializer(serializers.Serializer):
     """Validate session startup requests."""
 
-    metadata = serializers.JSONField(required=False)
+    metadata = ObjectJSONField(required=False)
+
+
+class MeetingSessionEndSerializer(serializers.Serializer):
+    """Validate an explicit coordinator request to end a meeting."""
+
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=1000)
 
 
 class MeetingSessionCreateSerializer(serializers.Serializer):
@@ -76,7 +124,7 @@ class MeetingSessionCreateSerializer(serializers.Serializer):
         max_length=50,
     )
     message = serializers.CharField(required=False, allow_blank=True, max_length=2000)
-    metadata = serializers.JSONField(required=False)
+    metadata = ObjectJSONField(required=False)
     expires_in_seconds = serializers.IntegerField(required=False, min_value=300, max_value=60 * 60 * 24 * 30)
 
     def validate_participant_emails(self, value: list[str]) -> list[str]:
@@ -94,11 +142,7 @@ class MeetingSessionCreateSerializer(serializers.Serializer):
     def validate(self, attrs: dict) -> dict:
         """Ensure scheduled ranges remain chronologically valid."""
 
-        scheduled_start_at = attrs.get("scheduled_start_at")
-        scheduled_end_at = attrs.get("scheduled_end_at")
-        if scheduled_start_at and scheduled_end_at and scheduled_end_at < scheduled_start_at:
-            raise serializers.ValidationError("scheduled_end_at must be greater than or equal to scheduled_start_at.")
-        return attrs
+        return validate_scheduled_range(attrs)
 
 
 class MeetingJoinRequestCreateSerializer(serializers.Serializer):
@@ -111,7 +155,7 @@ class MeetingJoinRequestCreateSerializer(serializers.Serializer):
         default=MeetingRole.PARTICIPANT,
     )
     note = serializers.CharField(required=False, allow_blank=True)
-    client_state = serializers.JSONField(required=False)
+    client_state = ObjectJSONField(required=False)
     passcode = serializers.CharField(required=False, allow_blank=True)
     invite_token = serializers.CharField(required=False, allow_blank=True)
 
@@ -121,6 +165,16 @@ class MeetingJoinRequestCreateSerializer(serializers.Serializer):
         if value != MeetingRole.PARTICIPANT:
             raise serializers.ValidationError("Unsupported requested role.")
         return value
+
+
+class MeetingAdmissionSerializer(MeetingJoinRequestCreateSerializer):
+    """Validate the client's single Join-button admission request."""
+
+    client_session_key = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=255,
+    )
 
 
 class MeetingJoinRequestReviewSerializer(serializers.Serializer):
@@ -155,14 +209,19 @@ class MeetingServiceSessionCreateSerializer(serializers.Serializer):
         required=False,
         max_length=50,
     )
-    metadata = serializers.JSONField(required=False)
+    metadata = ObjectJSONField(required=False)
+
+    def validate(self, attrs: dict) -> dict:
+        """Validate the service-created room's scheduled time range."""
+
+        return validate_scheduled_range(attrs)
     expires_in_seconds = serializers.IntegerField(required=False, min_value=300, max_value=60 * 60 * 24 * 30)
 
 
 class ParticipantUpdateSerializer(serializers.Serializer):
     """Validate participant capability and moderation updates."""
 
-    updates = serializers.JSONField()
+    updates = ObjectJSONField()
 
 
 class ParticipantRemovalSerializer(serializers.Serializer):

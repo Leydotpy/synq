@@ -5,8 +5,18 @@ from __future__ import annotations
 import logging
 
 from asgiref.sync import async_to_sync
+from django.db.models import Q
 
-from apps.meetings.models import MeetingJoinRequest, MeetingMessage, MeetingReaction, MeetingSession, Participant
+from apps.meetings.models import (
+    MeetingJoinRequest,
+    MeetingMessage,
+    MeetingReaction,
+    MeetingSession,
+    Participant,
+    ParticipantConnection,
+    ParticipantStatus,
+    RealtimeConnectionStatus,
+)
 from apps.meetings.realtime.events import MeetingSocketEvents
 from apps.meetings.services.state import MeetingStateBuilder
 
@@ -20,13 +30,65 @@ class MeetingSocketEmitter:
 
     @staticmethod
     def emit_session_state(*, session: MeetingSession) -> None:
-        """Broadcast a fresh session snapshot to all sockets subscribed to the session room."""
+        """Send a permission-aware session snapshot to each live socket."""
 
-        MeetingSocketEmitter._emit(
-            event=MeetingSocketEvents.SESSION_STATE,
-            payload=MeetingStateBuilder.build(session=session),
-            room=MeetingSocketEmitter.session_room_name(session.pk),
+        connections = ParticipantConnection.objects.filter(
+            session=session,
+            status__in=[
+                RealtimeConnectionStatus.CONNECTED,
+                RealtimeConnectionStatus.SUBSCRIBED,
+                RealtimeConnectionStatus.ACTIVE,
+            ],
+        ).select_related("profile")
+        snapshots: dict[str, dict] = {}
+        for connection in connections:
+            profile_key = str(connection.profile_id)
+            if profile_key not in snapshots:
+                snapshots[profile_key] = MeetingStateBuilder.build(
+                    session=session,
+                    authenticated_profile=connection.profile,
+                )
+            MeetingSocketEmitter._emit(
+                event=MeetingSocketEvents.SESSION_STATE,
+                payload=snapshots[profile_key],
+                room=connection.socket_id,
+            )
+
+    @staticmethod
+    def emit_session_ended(*, session: MeetingSession, reason: str = "") -> None:
+        """Notify every subscribed attendee that the meeting is terminal."""
+
+        payload = {
+            "session_id": str(session.pk),
+            "reason": reason,
+            "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+        }
+        just_closed = Q(
+            status=RealtimeConnectionStatus.DISCONNECTED,
+            disconnected_at=session.ended_at,
         )
+        socket_ids = (
+            ParticipantConnection.objects.filter(session=session)
+            .filter(
+                Q(
+                    status__in=[
+                        RealtimeConnectionStatus.CONNECTED,
+                        RealtimeConnectionStatus.SUBSCRIBED,
+                        RealtimeConnectionStatus.ACTIVE,
+                    ],
+                )
+                | just_closed,
+            )
+            .exclude(socket_id="")
+            .values_list("socket_id", flat=True)
+            .distinct()
+        )
+        for socket_id in socket_ids:
+            MeetingSocketEmitter._emit(
+                event=MeetingSocketEvents.SESSION_ENDED,
+                payload=payload,
+                room=socket_id,
+            )
 
     @staticmethod
     def emit_join_request_created(*, join_request: MeetingJoinRequest) -> None:
@@ -64,14 +126,17 @@ class MeetingSocketEmitter:
 
     @staticmethod
     def emit_participant_removed(*, session: MeetingSession, participant: Participant, reason: str = "") -> None:
-        """Broadcast participant removal to the room and the affected profile room."""
+        """Notify active participants and every socket owned by the removed profile."""
 
         payload = {"participant_id": str(participant.pk), "reason": reason}
-        MeetingSocketEmitter._emit(
-            event=MeetingSocketEvents.PARTICIPANT_REMOVED,
-            payload=payload,
-            room=MeetingSocketEmitter.session_room_name(session.pk),
-        )
+        for socket_id in MeetingSocketEmitter.active_participant_socket_ids(
+            session.pk,
+        ):
+            MeetingSocketEmitter._emit(
+                event=MeetingSocketEvents.PARTICIPANT_REMOVED,
+                payload=payload,
+                room=socket_id,
+            )
         MeetingSocketEmitter._emit(
             event=MeetingSocketEvents.PARTICIPANT_REMOVED,
             payload=payload,
@@ -80,23 +145,31 @@ class MeetingSocketEmitter:
 
     @staticmethod
     def emit_chat_message(*, message: MeetingMessage) -> None:
-        """Broadcast a new chat message to all sockets subscribed to the session room."""
+        """Broadcast a new chat message only to DB-active participants."""
 
-        MeetingSocketEmitter._emit(
-            event=MeetingSocketEvents.CHAT_MESSAGE_CREATED,
-            payload=MeetingStateBuilder.serialize_message(message),
-            room=MeetingSocketEmitter.session_room_name(message.session_id),
-        )
+        payload = MeetingStateBuilder.serialize_message(message)
+        for socket_id in MeetingSocketEmitter.active_participant_socket_ids(
+            message.session_id,
+        ):
+            MeetingSocketEmitter._emit(
+                event=MeetingSocketEvents.CHAT_MESSAGE_CREATED,
+                payload=payload,
+                room=socket_id,
+            )
 
     @staticmethod
     def emit_reaction(*, reaction: MeetingReaction) -> None:
-        """Broadcast a new reaction to all sockets subscribed to the session room."""
+        """Broadcast a new reaction only to DB-active participants."""
 
-        MeetingSocketEmitter._emit(
-            event=MeetingSocketEvents.REACTION_CREATED,
-            payload=MeetingStateBuilder.serialize_reaction(reaction),
-            room=MeetingSocketEmitter.session_room_name(reaction.session_id),
-        )
+        payload = MeetingStateBuilder.serialize_reaction(reaction)
+        for socket_id in MeetingSocketEmitter.active_participant_socket_ids(
+            reaction.session_id,
+        ):
+            MeetingSocketEmitter._emit(
+                event=MeetingSocketEvents.REACTION_CREATED,
+                payload=payload,
+                room=socket_id,
+            )
 
     @staticmethod
     def emit_error(*, room: str, message: str, details: dict | None = None) -> None:
@@ -125,6 +198,21 @@ class MeetingSocketEmitter:
         """Return the Socket.IO room name used for per-profile fan-out."""
 
         return f"profile:{profile_id}"
+
+    @staticmethod
+    def active_participant_socket_ids(session_id) -> list[str]:
+        """Return DB-authorized sockets for participant-only content fan-out."""
+
+        return list(
+            ParticipantConnection.objects.filter(
+                session_id=session_id,
+                status=RealtimeConnectionStatus.ACTIVE,
+                participant__status=ParticipantStatus.ACTIVE,
+            )
+            .exclude(socket_id="")
+            .values_list("socket_id", flat=True)
+            .distinct(),
+        )
 
     @staticmethod
     def _emit(*, event: str, payload: dict, room: str) -> None:

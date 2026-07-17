@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
@@ -10,10 +11,12 @@ from rest_framework import generics, permissions, response, status, views
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.meetings.api.serializers import (
+    MeetingAdmissionSerializer,
     MeetingJoinRequestCreateSerializer,
     MeetingJoinRequestReviewSerializer,
     MeetingRoomSerializer,
     MeetingSessionCreateSerializer,
+    MeetingSessionEndSerializer,
     MeetingServiceSessionCreateSerializer,
     MeetingSessionStartSerializer,
     MeetingSessionShareSerializer,
@@ -21,13 +24,108 @@ from apps.meetings.api.serializers import (
     ParticipantUpdateSerializer,
 )
 from apps.meetings.exceptions import MeetingDomainError
-from apps.meetings.models import MeetingJoinRequest, MeetingRoom, MeetingSession, Participant
+from apps.meetings.models import (
+    ExternalMeetingBinding,
+    ExternalMeetingProvider,
+    MeetingJoinRequest,
+    MeetingRole,
+    MeetingRoom,
+    MeetingSession,
+    Participant,
+)
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.services.invitations import MeetingInvitationService
 from apps.meetings.services.permissions import MeetingPermissionService
 from apps.meetings.services.state import MeetingStateBuilder
 from core.api.api import CurrentProfileMixin
 from core.api.service_auth import ServiceTokenAuthentication
+
+SERVICE_MEETING_PROVIDER = ExternalMeetingProvider.LAW_FIRM_WORKSPACE
+
+
+def _validate_service_binding_owner(*, binding: ExternalMeetingBinding, profile) -> None:
+    """Prevent one service identity from taking over another identity's binding."""
+
+    if binding.service_owner_profile_id != profile.pk:
+        raise MeetingDomainError(
+            "External meeting identity is owned by a different service profile.",
+        )
+
+
+def _create_or_reuse_service_room_and_session(*, profile, payload: dict, metadata: dict):
+    """Resolve one service room/session through a durable unique binding."""
+
+    external_id = payload["external_id"]
+
+    def resolve_in_transaction():
+        with transaction.atomic():
+            binding = (
+                ExternalMeetingBinding.objects.select_for_update()
+                .select_related("room")
+                .filter(
+                    provider=SERVICE_MEETING_PROVIDER,
+                    external_id=external_id,
+                )
+                .first()
+            )
+            if binding is None:
+                legacy_rooms = list(
+                    MeetingRoom.objects.select_for_update().filter(
+                        metadata__source="law_firm_workspace",
+                        metadata__external_id=external_id,
+                    )[:2],
+                )
+                if len(legacy_rooms) > 1:
+                    raise MeetingDomainError(
+                        "Multiple legacy rooms use this external meeting identity.",
+                    )
+                if legacy_rooms:
+                    room = legacy_rooms[0]
+                    if room.created_by_profile_id != profile.pk:
+                        raise MeetingDomainError(
+                            "External meeting identity is owned by a different service profile.",
+                        )
+                else:
+                    room = MeetingLifecycleService.create_room(
+                        creator_profile=profile,
+                        title=payload["title"],
+                        description=payload.get("description", ""),
+                        scheduled_start_at=payload.get("scheduled_start_at"),
+                        scheduled_end_at=payload.get("scheduled_end_at"),
+                        metadata=metadata,
+                    )
+                ExternalMeetingBinding.objects.create(
+                    provider=SERVICE_MEETING_PROVIDER,
+                    external_id=external_id,
+                    room=room,
+                    service_owner_profile=profile,
+                )
+            else:
+                _validate_service_binding_owner(binding=binding, profile=profile)
+                room = binding.room
+            session = MeetingLifecycleService.start_session(
+                room=room,
+                started_by_profile=profile,
+                metadata=metadata,
+            )
+            return room, session
+
+    try:
+        return resolve_in_transaction()
+    except IntegrityError:
+        binding = (
+            ExternalMeetingBinding.objects.select_related("room")
+            .filter(provider=SERVICE_MEETING_PROVIDER, external_id=external_id)
+            .first()
+        )
+        if binding is None:
+            raise
+        _validate_service_binding_owner(binding=binding, profile=profile)
+        return binding.room, MeetingLifecycleService.start_session(
+            room=binding.room,
+            started_by_profile=profile,
+            metadata=metadata,
+        )
 
 
 class MeetingRoomListCreateView(CurrentProfileMixin, generics.ListCreateAPIView):
@@ -198,6 +296,39 @@ class MeetingSessionStateView(CurrentProfileMixin, views.APIView):
         return response.Response(MeetingStateBuilder.build(session=session, authenticated_profile=self.get_profile()))
 
 
+class MeetingSessionEndView(CurrentProfileMixin, views.APIView):
+    """End a session idempotently after a coordinator permission check."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, session_id: str):
+        """Close participant and waiting-room state and return the terminal snapshot."""
+
+        serializer = MeetingSessionEndSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        session = get_object_or_404(
+            MeetingSession.objects.select_related("room", "started_by_profile"),
+            pk=session_id,
+        )
+        try:
+            session = MeetingLifecycleService.end_session(
+                session=session,
+                actor_profile=self.get_profile(),
+                reason=serializer.validated_data.get("reason", ""),
+            )
+        except DjangoPermissionDenied as exc:
+            raise PermissionDenied(str(exc)) from exc
+        except MeetingDomainError as exc:
+            raise ValidationError(str(exc)) from exc
+        return response.Response(
+            MeetingStateBuilder.build(
+                session=session,
+                authenticated_profile=self.get_profile(),
+            ),
+            status=status.HTTP_200_OK,
+        )
+
+
 class MeetingJoinRequestCreateView(CurrentProfileMixin, views.APIView):
     """Create a waiting-room join request for the authenticated profile."""
 
@@ -223,6 +354,41 @@ class MeetingJoinRequestCreateView(CurrentProfileMixin, views.APIView):
         except MeetingDomainError as exc:
             raise ValidationError(str(exc)) from exc
         return response.Response(MeetingStateBuilder.serialize_join_request(join_request), status=status.HTTP_201_CREATED)
+
+
+class MeetingAdmissionView(CurrentProfileMixin, views.APIView):
+    """Apply room policy and return a direct-entry or waiting-room decision."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, session_id: str):
+        """Back the web client's single admission request contract."""
+
+        serializer = MeetingAdmissionSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        session = get_object_or_404(
+            MeetingSession.objects.select_related("room"),
+            pk=session_id,
+        )
+        try:
+            admission = MeetingLifecycleService.request_admission(
+                session=session,
+                profile=self.get_profile(),
+                requested_display_name=serializer.validated_data.get("display_name", ""),
+                requested_role=serializer.validated_data.get("requested_role", MeetingRole.PARTICIPANT),
+                note=serializer.validated_data.get("note", ""),
+                client_state=serializer.validated_data.get("client_state", {}),
+                client_session_key=serializer.validated_data.get("client_session_key", ""),
+                passcode=serializer.validated_data.get("passcode"),
+                invite_token=serializer.validated_data.get("invite_token"),
+            )
+        except MeetingDomainError as exc:
+            raise ValidationError(str(exc)) from exc
+        response_status = status.HTTP_200_OK if admission.direct_entry else status.HTTP_201_CREATED
+        return response.Response(
+            MeetingStateBuilder.serialize_admission_result(admission),
+            status=response_status,
+        )
 
 
 class MeetingSessionShareView(CurrentProfileMixin, views.APIView):
@@ -353,19 +519,9 @@ class MeetingServiceSessionCreateView(CurrentProfileMixin, views.APIView):
             "source": "law_firm_workspace",
         }
         try:
-            room = MeetingRoom.objects.filter(metadata__external_id=payload["external_id"]).first()
-            if room is None:
-                room = MeetingLifecycleService.create_room(
-                    creator_profile=profile,
-                    title=payload["title"],
-                    description=payload.get("description", ""),
-                    scheduled_start_at=payload.get("scheduled_start_at"),
-                    scheduled_end_at=payload.get("scheduled_end_at"),
-                    metadata=metadata,
-                )
-            session = MeetingLifecycleService.start_session(
-                room=room,
-                started_by_profile=profile,
+            room, session = _create_or_reuse_service_room_and_session(
+                profile=profile,
+                payload=payload,
                 metadata=metadata,
             )
             invite_token = MeetingInvitationService.create_invite_token(

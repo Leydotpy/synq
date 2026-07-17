@@ -38,6 +38,7 @@ from apps.meetings.services.janus import (
     call_plugin_method,
     call_video_room_management_method,
     ensure_participant_media_plugin,
+    janus_room_id_for_session,
     serialize_janus_response,
     video_room_reply_data,
 )
@@ -127,10 +128,10 @@ def _build_jsep(payload: dict[str, Any], *, jsep_type: str) -> Jsep:
     return Jsep.model_validate({**payload, "type": jsep_type})
 
 
-def _janus_room_id(session: MeetingSession) -> str:
-    """Return the configured Janus room identifier with the historic UUID fallback."""
+def _janus_room_id(session: MeetingSession) -> int | str:
+    """Return a Janus-compatible persisted or stable fallback room ID."""
 
-    return session.janus_room_id or str(session.pk)
+    return janus_room_id_for_session(session)
 
 
 def _reply_items(reply_data: Any, field_name: str) -> list[Any]:
@@ -642,7 +643,8 @@ class MeetingMediaSignalService:
             session,
             merged_publishers,
         )
-        session.janus_state = {**session.janus_state, "participants": serialized_publishers}
+        session_state = session.janus_state if isinstance(session.janus_state, dict) else {}
+        session.janus_state = {**session_state, "participants": serialized_publishers}
         session.last_synced_at = timezone.now()
         session.save(update_fields=["janus_state", "last_synced_at", "updated_at"])
         MeetingLifecycleService.refresh_session_metrics(session=session)
@@ -754,7 +756,11 @@ class MeetingMediaSignalService:
                     prune_missing=False,
                 )
                 participant.session.janus_state = {
-                    **participant.session.janus_state,
+                    **(
+                        participant.session.janus_state
+                        if isinstance(participant.session.janus_state, dict)
+                        else {}
+                    ),
                     "participants": serialized_publishers,
                 }
                 participant.session.last_synced_at = now
@@ -964,7 +970,15 @@ class MeetingMediaSignalService:
         )
         _reconcile_subscriber_streams(media_handle, stream_payloads)
 
-        participant.session.janus_state = {**participant.session.janus_state, "participants": serialized_publishers}
+        session_state = (
+            participant.session.janus_state
+            if isinstance(participant.session.janus_state, dict)
+            else {}
+        )
+        participant.session.janus_state = {
+            **session_state,
+            "participants": serialized_publishers,
+        }
         participant.session.last_synced_at = timezone.now()
         participant.session.save(update_fields=["janus_state", "last_synced_at", "updated_at"])
         MeetingLifecycleService.refresh_session_metrics(session=participant.session)
@@ -1141,7 +1155,7 @@ class MeetingMediaSignalService:
                 prune_missing=False,
             )
             session.janus_state = {
-                **session.janus_state,
+                **(session.janus_state if isinstance(session.janus_state, dict) else {}),
                 "participants": serialized_publishers,
             }
             session.last_synced_at = timezone.now()

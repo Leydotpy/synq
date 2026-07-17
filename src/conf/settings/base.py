@@ -101,7 +101,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    # "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
+    "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
     "core.middleware.janus.JanusSessionMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -255,7 +255,7 @@ CLERK_SECRET_KEY = config("CLERK_SECRET_KEY", default="clerk-dev-placeholder", c
 CLERK_AUTH_PARTIES = _config_list("CLERK_AUTH_PARTIES", default=["http://localhost:3000"])
 CLERK_AUDIENCE = _config_list("CLERK_AUDIENCE") or None
 # CLERK_JWT_KEY = "..."  # optional Clerk JWT verification key
-CLERK_API_URL = config("CLERK_API_URL", default="https://api.clerk.com", cast=str)
+# CLERK_API_URL = config("CLERK_API_URL", default="https://api.clerk.com", cast=str)
 CLERK_TIMEOUT_MS = 5000
 CLERK_CLOCK_SKEW_IN_MS = 5000
 CLERK_CACHE_TIMEOUT = 300

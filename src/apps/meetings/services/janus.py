@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import inspect
 import logging
 import os
@@ -30,6 +31,26 @@ from apps.meetings.exceptions import JanusGatewayError
 _configuration_lock = threading.Lock()
 _configuration_ready = False
 logger = logging.getLogger(__name__)
+
+
+class NativeJanusIdVideoRoomPlugin(VideoRoomPlugin):
+    """Preserve numeric Janus handle IDs on protocol envelopes.
+
+    janus-api-core 3.0.0 exposes ``Plugin.id`` as ``str(self._plugin_id)``.
+    Stock Janus generates numeric handles and does not accept their decimal
+    representation as a JSON string, returning error 459 (Handle not found).
+    Keep the package's registry untouched while adapting every VideoRoom handle
+    constructed by this application.  This shim can be removed after the
+    dependency preserves the native ``int | str`` identifier itself.
+    """
+
+    @property
+    def id(self) -> int | str:
+        """Return the server-issued handle ID without changing its JSON type."""
+
+        if self._plugin_id is None:
+            raise RuntimeError("plugin has not been attached")
+        return self._plugin_id
 
 
 def configure_janus_core() -> None:
@@ -535,8 +556,15 @@ def build_room_payload(session) -> dict[str, Any]:
     """Build the Janus VideoRoom creation payload for a meeting session."""
 
     room_defaults = dict(getattr(settings, "JANUS_DEFAULT_ROOM_CONFIGURATION", {}))
-    room_defaults.update(session.room.janus_room_configuration or {})
-    room_defaults.setdefault("room", session.janus_room_id or str(session.pk))
+    raw_room_configuration = session.room.janus_room_configuration
+    room_configuration = {} if raw_room_configuration is None else raw_room_configuration
+    if not isinstance(room_configuration, dict):
+        raise JanusGatewayError("Janus room configuration must be a JSON object.")
+    room_defaults.update(room_configuration)
+    if "room" in room_defaults:
+        room_defaults["room"] = coerce_janus_room_id(room_defaults["room"])
+    else:
+        room_defaults["room"] = janus_room_id_for_session(session)
     room_defaults.setdefault("description", session.room.title)
     room_defaults.setdefault("publishers", session.room.max_participants)
     room_defaults.setdefault("bitrate", 1_024_000)
@@ -548,6 +576,46 @@ def build_room_payload(session) -> dict[str, Any]:
     if session.janus_room_pin:
         room_defaults.setdefault("pin", session.janus_room_pin)
     return room_defaults
+
+
+def coerce_janus_id(value: Any, *, kind: str = "Janus ID") -> int | str:
+    """Preserve named string IDs while restoring decimal IDs to JSON integers."""
+
+    if isinstance(value, bool):
+        raise JanusGatewayError(f"A {kind} cannot be a boolean.")
+    if isinstance(value, int):
+        if value <= 0:
+            raise JanusGatewayError(f"A {kind} must be positive.")
+        return value
+    text = str(value).strip()
+    if not text:
+        raise JanusGatewayError(f"A {kind} cannot be empty.")
+    if text.isdecimal():
+        numeric_value = int(text)
+        if numeric_value <= 0:
+            raise JanusGatewayError(f"A {kind} must be positive.")
+        return numeric_value
+    return text
+
+
+def coerce_janus_room_id(value: Any) -> int | str:
+    """Return a room ID with the native JSON type expected by Janus."""
+
+    return coerce_janus_id(value, kind="Janus room ID")
+
+
+def janus_room_id_for_session(session) -> int | str:
+    """Return the persisted room ID or a stable numeric ID for a new session."""
+
+    if session.janus_room_id:
+        return coerce_janus_room_id(session.janus_room_id)
+
+    # The default Janus configuration uses numeric room IDs.  UUID primary
+    # keys cannot be sent directly, so derive one stable positive signed-64-bit
+    # value.  Explicit non-numeric room IDs in room configuration remain
+    # untouched for deployments that enable Janus string IDs.
+    digest = hashlib.blake2b(str(session.pk).encode("utf-8"), digest_size=8).digest()
+    return (int.from_bytes(digest, byteorder="big") % ((1 << 63) - 1)) or 1
 
 
 def meeting_session_control_plugin_kwargs(instance, field, raw_id: str | None) -> Mapping[str, Any]:
@@ -705,7 +773,7 @@ def call_video_room_management_method(
     session = resolve_janus_session(instance)
 
     async def _invoke() -> Any:
-        plugin = VideoRoomPlugin(session=session)
+        plugin = NativeJanusIdVideoRoomPlugin(session=session)
         await plugin.attach()
         try:
             method = getattr(plugin, method_name)

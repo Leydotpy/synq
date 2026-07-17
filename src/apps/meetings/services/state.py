@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from django.db.models import Prefetch, Q
+from django.utils import timezone
+
 from apps.meetings.models import (
     MeetingJoinRequest,
     MeetingJoinRequestStatus,
@@ -10,7 +13,27 @@ from apps.meetings.models import (
     MeetingRoomMembership,
     MeetingSession,
     Participant,
+    ParticipantConnection,
+    ParticipantMediaHandle,
+    ParticipantStatus,
+    RealtimeConnectionStatus,
 )
+
+VISIBLE_CONNECTION_STATUSES = {
+    RealtimeConnectionStatus.CONNECTED,
+    RealtimeConnectionStatus.SUBSCRIBED,
+    RealtimeConnectionStatus.ACTIVE,
+}
+PRIVATE_SESSION_METADATA_KEYS = {
+    "external_id",
+    "external_provider",
+    "integration_provider",
+    "provider",
+    "service_owner_id",
+    "service_owner_profile_id",
+    "source",
+    "tenant_id",
+}
 
 
 class MeetingStateBuilder:
@@ -20,23 +43,24 @@ class MeetingStateBuilder:
     def build(session: MeetingSession, authenticated_profile=None, message_limit: int = 50, reaction_limit: int = 25) -> dict:
         """Return a serialized state snapshot for a meeting session."""
 
-        hydrated_session = (
-            MeetingSession.objects.select_related("room", "started_by_profile")
-            .prefetch_related(
-                "participants__profile",
-                "participants__membership",
-                "participants__connections",
-                "participants__media_handles__streams",
-                "participants__streams",
-                "join_requests__profile",
-                "join_requests__reviewed_by_profile",
-                "join_requests__connection",
-                "messages__participant__profile",
-                "reactions__participant__profile",
-            )
-            .get(pk=session.pk)
+        hydrated_session = MeetingSession.objects.select_related(
+            "room",
+            "room__created_by_profile",
+            "started_by_profile",
+        ).get(pk=session.pk)
+        visible_connections = ParticipantConnection.objects.filter(
+            status__in=VISIBLE_CONNECTION_STATUSES,
         )
-        participants = list(hydrated_session.participants.all())
+        media_handles = ParticipantMediaHandle.objects.prefetch_related("streams")
+        participants = list(
+            Participant.objects.filter(session=hydrated_session)
+            .exclude(status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED])
+            .select_related("profile", "membership")
+            .prefetch_related(
+                Prefetch("connections", queryset=visible_connections),
+                Prefetch("media_handles", queryset=media_handles),
+            )
+        )
         local_participant = next(
             (
                 participant
@@ -45,7 +69,11 @@ class MeetingStateBuilder:
             ),
             None,
         )
-        remote_participants = [participant for participant in participants if local_participant is None or participant.pk != local_participant.pk]
+        visible_participants = [
+            participant
+            for participant in participants
+            if participant.status == ParticipantStatus.ACTIVE
+        ]
         membership = None
         if authenticated_profile is not None:
             membership = (
@@ -54,26 +82,76 @@ class MeetingStateBuilder:
                 .first()
             )
         can_manage_waiting_room = bool(membership and membership.can_manage_waiting_room)
-        pending_requests = hydrated_session.join_requests.filter(status=MeetingJoinRequestStatus.PENDING)
-        visible_pending_requests = pending_requests if can_manage_waiting_room else []
-        messages = list(hydrated_session.messages.all().order_by("-created_at")[:message_limit])
-        reactions = list(hydrated_session.reactions.all().order_by("-created_at")[:reaction_limit])
+        can_view_meeting_content = bool(local_participant or membership)
+        remote_participants = (
+            [
+                participant
+                for participant in visible_participants
+                if local_participant is None or participant.pk != local_participant.pk
+            ]
+            if can_view_meeting_content
+            else []
+        )
+        pending_requests = MeetingJoinRequest.objects.filter(
+            session=hydrated_session,
+            status=MeetingJoinRequestStatus.PENDING,
+        ).select_related("profile", "reviewed_by_profile")
+        visible_pending_requests = list(pending_requests) if can_manage_waiting_room else []
+        own_join_request = None
+        if authenticated_profile is not None:
+            own_join_request = (
+                MeetingJoinRequest.objects.filter(
+                    session=hydrated_session,
+                    profile=authenticated_profile,
+                )
+                .select_related("profile", "reviewed_by_profile")
+                .order_by("-created_at")
+                .first()
+            )
+        messages = (
+            list(
+                MeetingMessage.objects.filter(session=hydrated_session)
+                .order_by("-created_at")[:message_limit]
+            )
+            if can_view_meeting_content
+            else []
+        )
+        reactions = (
+            list(
+                MeetingReaction.objects.filter(session=hydrated_session)
+                .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
+                .order_by("-created_at")[:reaction_limit]
+            )
+            if can_view_meeting_content
+            else []
+        )
         messages.reverse()
+        reactions.reverse()
         return {
             "room": MeetingStateBuilder.serialize_room(hydrated_session),
             "session": MeetingStateBuilder.serialize_session(hydrated_session),
             "counts": {
-                "participants": hydrated_session.participant_count or len(participants),
+                "participants": hydrated_session.participant_count,
                 "publishers": hydrated_session.active_publisher_count,
                 "pending_join_requests": pending_requests.count() if can_manage_waiting_room else 0,
             },
+            "current_profile": MeetingStateBuilder.serialize_profile_summary(authenticated_profile),
             "coordinator_permissions": MeetingStateBuilder.serialize_membership(membership),
             "local_participant": MeetingStateBuilder.serialize_participant(local_participant),
             "remote_participants": [MeetingStateBuilder.serialize_participant(item) for item in remote_participants],
             "pending_join_requests": [MeetingStateBuilder.serialize_join_request(item) for item in visible_pending_requests],
+            "own_join_request": (
+                MeetingStateBuilder.serialize_join_request(own_join_request)
+                if own_join_request
+                else None
+            ),
             "messages": [MeetingStateBuilder.serialize_message(item) for item in messages],
             "recent_reactions": [MeetingStateBuilder.serialize_reaction(item) for item in reactions],
-            "janus": hydrated_session.janus_state,
+            "janus": (
+                MeetingStateBuilder.serialize_janus_topology(hydrated_session)
+                if can_view_meeting_content
+                else {}
+            ),
         }
 
     @staticmethod
@@ -117,12 +195,26 @@ class MeetingStateBuilder:
             "started_by_profile": MeetingStateBuilder.serialize_profile_summary(session.started_by_profile),
             "lifecycle_state": session.lifecycle_state,
             "janus_room_id": session.janus_room_id,
-            "control_handle_id": session.control_handle_id,
             "state_version": session.state_version,
             "started_at": session.started_at.isoformat() if session.started_at else None,
             "ended_at": session.ended_at.isoformat() if session.ended_at else None,
             "last_synced_at": session.last_synced_at.isoformat() if session.last_synced_at else None,
-            "metadata": session.metadata,
+            "metadata": MeetingStateBuilder.serialize_public_session_metadata(
+                session.metadata,
+            ),
+        }
+
+    @staticmethod
+    def serialize_public_session_metadata(metadata: dict | None) -> dict:
+        """Remove service integration identities from client snapshots."""
+
+        if not isinstance(metadata, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in (metadata or {}).items()
+            if str(key) not in PRIVATE_SESSION_METADATA_KEYS
+            and not str(key).startswith("_")
         }
 
     @staticmethod
@@ -164,23 +256,17 @@ class MeetingStateBuilder:
             "is_camera_blocked": participant.is_camera_blocked,
             "raised_hand_at": participant.raised_hand_at.isoformat() if participant.raised_hand_at else None,
             "janus_publisher_id": participant.janus_publisher_id,
-            "janus_private_id": participant.janus_private_id,
-            "janus_state": participant.janus_state,
             "joined_at": participant.joined_at.isoformat() if participant.joined_at else None,
             "left_at": participant.left_at.isoformat() if participant.left_at else None,
             "last_seen_at": participant.last_seen_at.isoformat() if participant.last_seen_at else None,
             "metadata": participant.metadata,
             "connections": [
                 {
-                    "id": str(connection.pk),
-                    "socket_id": connection.socket_id,
                     "transport": connection.transport,
                     "status": connection.status,
-                    "client_session_key": connection.client_session_key,
                     "connected_at": connection.connected_at.isoformat() if connection.connected_at else None,
                     "disconnected_at": connection.disconnected_at.isoformat() if connection.disconnected_at else None,
                     "last_heartbeat_at": connection.last_heartbeat_at.isoformat() if connection.last_heartbeat_at else None,
-                    "metadata": connection.metadata,
                 }
                 for connection in participant.connections.all()
             ],
@@ -189,11 +275,7 @@ class MeetingStateBuilder:
                     "id": str(handle.pk),
                     "handle_type": handle.handle_type,
                     "lifecycle_state": handle.lifecycle_state,
-                    "janus_session_id": handle.janus_session_id,
-                    "janus_handle_id": handle.janus_handle_id,
-                    "opaque_id": handle.opaque_id,
                     "selected_streams": handle.selected_streams,
-                    "janus_state": handle.janus_state,
                     "last_event_at": handle.last_event_at.isoformat() if handle.last_event_at else None,
                     "streams": [
                         {
@@ -224,16 +306,89 @@ class MeetingStateBuilder:
         return {
             "id": str(join_request.pk),
             "profile": MeetingStateBuilder.serialize_profile_summary(join_request.profile),
-            "connection_id": str(join_request.connection_id) if join_request.connection_id else None,
             "status": join_request.status,
             "requested_display_name": join_request.requested_display_name,
             "requested_role": join_request.requested_role,
             "note": join_request.note,
-            "client_state": join_request.client_state,
             "reviewed_by_profile": MeetingStateBuilder.serialize_profile_summary(join_request.reviewed_by_profile),
             "reviewed_at": join_request.reviewed_at.isoformat() if join_request.reviewed_at else None,
             "resolution_reason": join_request.resolution_reason,
             "created_at": join_request.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def serialize_janus_topology(session: MeetingSession) -> dict:
+        """Expose only publisher topology fields required for client resubscription."""
+
+        janus_state = session.janus_state if isinstance(session.janus_state, dict) else {}
+        raw_participants = janus_state.get("participants") or []
+        if not isinstance(raw_participants, list):
+            return {"participants": []}
+        participants = []
+        for raw_participant in raw_participants:
+            if not isinstance(raw_participant, dict):
+                continue
+            raw_streams = raw_participant.get("streams") or []
+            streams = []
+            if isinstance(raw_streams, list):
+                for raw_stream in raw_streams:
+                    if not isinstance(raw_stream, dict):
+                        continue
+                    streams.append(
+                        {
+                            key: raw_stream.get(key)
+                            for key in (
+                                "mid",
+                                "type",
+                                "codec",
+                                "description",
+                                "disabled",
+                                "moderated",
+                            )
+                            if key in raw_stream
+                        },
+                    )
+            participants.append(
+                {
+                    key: raw_participant.get(key)
+                    for key in ("id", "display", "publisher", "talking")
+                    if key in raw_participant
+                }
+                | {"streams": streams},
+            )
+        return {"participants": participants}
+
+    @staticmethod
+    def serialize_admission_result(result) -> dict:
+        """Serialize the direct-entry or waiting-room decision expected by the client."""
+
+        session = None
+        if result.participant is not None:
+            session = result.participant.session
+        elif result.join_request is not None:
+            session = result.join_request.session
+        action = "enter" if result.participant is not None else "wait"
+        return {
+            "status": result.status,
+            "action": action,
+            "requires_approval": action == "wait",
+            "participant_status": (
+                result.participant.status
+                if result.participant is not None
+                else result.status
+            ),
+            "direct_entry": result.direct_entry,
+            "session": MeetingStateBuilder.serialize_session(session) if session else None,
+            "token": None,
+            "participant": MeetingStateBuilder.serialize_participant(result.participant),
+            "join_request": (
+                MeetingStateBuilder.serialize_join_request(result.join_request)
+                if result.join_request
+                else None
+            ),
+            "join_request_id": (
+                str(result.join_request.pk) if result.join_request else None
+            ),
         }
 
     @staticmethod

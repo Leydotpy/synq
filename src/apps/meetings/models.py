@@ -71,6 +71,12 @@ class MeetingAccessPolicy(models.TextChoices):
     INVITE_ONLY = "invite_only", "Invite Only"
 
 
+class ExternalMeetingProvider(models.TextChoices):
+    """Enumerate trusted systems that bind an external meeting identity."""
+
+    LAW_FIRM_WORKSPACE = "law_firm_workspace", "Law firm workspace"
+
+
 class MeetingRole(models.TextChoices):
     """Enumerate durable and in-session meeting roles."""
 
@@ -257,6 +263,7 @@ class MeetingRoom(UUIDTimestampedModel):
             models.Index(fields=("slug",), name="meeting_room_slug_idx"),
             models.Index(fields=("created_by_profile",), name="meeting_room_creator_idx"),
             models.Index(fields=("access_policy",), name="meeting_room_policy_idx"),
+            models.Index(fields=("scheduled_end_at",), name="meet_room_sched_end_idx"),
         ]
 
     def __str__(self) -> str:
@@ -300,6 +307,53 @@ class MeetingRoom(UUIDTimestampedModel):
         if not raw_passcode:
             return False
         return check_password(raw_passcode, self.passcode_hash)
+
+
+class ExternalMeetingBinding(UUIDTimestampedModel):
+    """Bind a trusted provider identity to one service-owned room."""
+
+    provider = models.CharField(
+        max_length=64,
+        choices=ExternalMeetingProvider.choices,
+        default=ExternalMeetingProvider.LAW_FIRM_WORKSPACE,
+    )
+    external_id = models.CharField(max_length=255)
+    room = models.ForeignKey(
+        MeetingRoom,
+        on_delete=models.CASCADE,
+        related_name="external_bindings",
+    )
+    service_owner_profile = models.ForeignKey(
+        Profile,
+        on_delete=models.PROTECT,
+        related_name="owned_external_meeting_bindings",
+    )
+
+    class Meta:
+        """Make provider identities and provider-to-room mappings unambiguous."""
+
+        ordering = ("provider", "external_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("provider", "external_id"),
+                name="meet_ext_provider_id_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=("provider", "room"),
+                name="meet_ext_provider_room_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("service_owner_profile", "provider"),
+                name="meet_ext_owner_provider_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        """Return a concise provider identity for diagnostics."""
+
+        return f"{self.provider}:{self.external_id}"
 
 
 class MeetingRoomMembership(UUIDTimestampedModel):
@@ -377,6 +431,7 @@ class MeetingSession(UUIDTimestampedModel):
     # room management uses short-lived process-owned VideoRoom handles.
     control_handle_id = JanusPluginField(
         identifier=JanusHandleType.PUBLISHER,
+        plugin_class="apps.meetings.services.janus.NativeJanusIdVideoRoomPlugin",
         plugin_attr="control_handle",
         janus_getter="apps.meetings.services.janus.resolve_janus_session",
         plugin_kwargs_factory="apps.meetings.services.janus.meeting_session_control_plugin_kwargs",
@@ -408,6 +463,10 @@ class MeetingSession(UUIDTimestampedModel):
     ended_at = models.DateTimeField(blank=True, null=True)
     # Timestamp recording when cleanup completed successfully.
     cleanup_completed_at = models.DateTimeField(blank=True, null=True)
+    # Lease metadata used to prevent overlapping Beat sweeps from queueing the
+    # same remote Janus teardown more than once.
+    cleanup_requested_at = models.DateTimeField(blank=True, null=True)
+    cleanup_request_id = models.UUIDField(blank=True, editable=False, null=True)
     # Timestamp recording when application state was last synchronized from Janus or the database.
     last_synced_at = models.DateTimeField(blank=True, null=True)
     # Unstructured metadata reserved for workflow state and deployment-specific attributes.
@@ -421,6 +480,22 @@ class MeetingSession(UUIDTimestampedModel):
             models.Index(fields=("room", "lifecycle_state"), name="meeting_session_room_state_idx"),
             models.Index(fields=("janus_room_id",), name="meeting_session_janus_room_idx"),
             models.Index(fields=("started_by_profile",), name="meeting_session_starter_idx"),
+            models.Index(
+                fields=("lifecycle_state", "updated_at"),
+                name="meet_sess_state_updated_idx",
+            ),
+            models.Index(
+                fields=("lifecycle_state", "cleanup_completed_at"),
+                name="meet_sess_state_cleanup_idx",
+            ),
+            models.Index(
+                fields=(
+                    "lifecycle_state",
+                    "cleanup_completed_at",
+                    "cleanup_requested_at",
+                ),
+                name="meet_sess_cleanup_lease_idx",
+            ),
         ]
 
     def __str__(self) -> str:
@@ -438,6 +513,54 @@ class MeetingSession(UUIDTimestampedModel):
         """Increment the session state version so clients can detect a new snapshot."""
 
         self.state_version += 1
+
+
+class MeetingInvitation(UUIDTimestampedModel):
+    """Persist recipient delivery state for scheduled meeting reminders."""
+
+    session = models.ForeignKey(
+        MeetingSession,
+        on_delete=models.CASCADE,
+        related_name="email_invitations",
+    )
+    issuer_profile = models.ForeignKey(
+        Profile,
+        on_delete=models.SET_NULL,
+        related_name="issued_meeting_invitations",
+        blank=True,
+        null=True,
+    )
+    issuer_name = models.CharField(max_length=255)
+    recipient_email = models.EmailField()
+    message = models.TextField(blank=True)
+    expires_in_seconds = models.PositiveIntegerField()
+    initial_email_sent_at = models.DateTimeField(blank=True, null=True)
+    ready_email_sent_at = models.DateTimeField(blank=True, null=True)
+    last_delivery_attempt_at = models.DateTimeField(blank=True, null=True)
+    delivery_attempts = models.PositiveIntegerField(default=0)
+    last_delivery_error = models.TextField(blank=True)
+
+    class Meta:
+        """Keep one reminder state per recipient and meeting occurrence."""
+
+        ordering = ("created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=("session", "recipient_email"),
+                name="meet_invite_session_email_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("ready_email_sent_at", "created_at"),
+                name="meet_invite_ready_created_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        """Return a concise invitation label for diagnostics."""
+
+        return f"{self.recipient_email} invited to {self.session}"
 
 
 class MeetingJoinRequest(UUIDTimestampedModel):
@@ -482,6 +605,10 @@ class MeetingJoinRequest(UUIDTimestampedModel):
         indexes = [
             models.Index(fields=("session", "status"), name="meet_join_sess_status_idx"),
             models.Index(fields=("profile", "status"), name="meet_join_profile_status_idx"),
+            models.Index(
+                fields=("status", "created_at"),
+                name="meet_join_status_created_idx",
+            ),
         ]
 
     def __str__(self) -> str:
@@ -578,6 +705,7 @@ class Participant(UUIDTimestampedModel):
         timestamp = timezone.now()
         self.status = ParticipantStatus.ACTIVE
         self.joined_at = self.joined_at or timestamp
+        self.left_at = None
         self.last_seen_at = timestamp
 
     def mark_left(self, status: str = ParticipantStatus.LEFT) -> None:
@@ -671,6 +799,10 @@ class ParticipantConnection(UUIDTimestampedModel):
             models.Index(fields=("session", "status"), name="meet_conn_sess_status_idx"),
             models.Index(fields=("participant", "status"), name="meet_conn_part_status_idx"),
             models.Index(fields=("profile", "status"), name="meet_conn_profile_status_idx"),
+            models.Index(
+                fields=("status", "last_heartbeat_at"),
+                name="meet_conn_status_heartbeat_idx",
+            ),
         ]
 
     def __str__(self) -> str:
@@ -709,6 +841,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
     # Janus plugin handle identifier persisted in the database and exposed as ``handle`` in Python.
     janus_handle_id = JanusPluginField(
         identifier=JanusHandleType.PUBLISHER,
+        plugin_class="apps.meetings.services.janus.NativeJanusIdVideoRoomPlugin",
         identifier_getter="apps.meetings.services.janus.participant_media_handle_identifier",
         plugin_attr="handle",
         callback_factory="core.hooks.janus.plugin_callback_factory",

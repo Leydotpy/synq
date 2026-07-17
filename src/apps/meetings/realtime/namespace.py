@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+
 from asgiref.sync import sync_to_async
 from socketio import AsyncNamespace
 
-from apps.meetings.models import MeetingJoinRequest, MeetingSession, Participant
+from apps.meetings.models import (
+    MeetingJoinRequest,
+    MeetingSession,
+    Participant,
+    RealtimeConnectionStatus,
+)
 from apps.meetings.realtime.auth import extract_ip_address, extract_scope_headers, resolve_socket_user
 from apps.meetings.realtime.emitter import MeetingSocketEmitter
 from apps.meetings.realtime.events import MeetingSocketEvents
@@ -14,6 +21,9 @@ from apps.meetings.services.permissions import MeetingPermissionService
 from apps.meetings.services.signaling import MeetingMediaSignalService
 from apps.meetings.services.state import MeetingStateBuilder
 from core.api.api import _get_or_create_profile_for_user
+
+
+logger = logging.getLogger(__name__)
 
 
 class MeetingNamespace(AsyncNamespace):
@@ -25,14 +35,18 @@ class MeetingNamespace(AsyncNamespace):
         try:
             return await super().trigger_event(event, *args)
         except Exception as exc:
+            if event == "connect":
+                raise
+
+            logger.exception("Socket.IO meeting command '%s' failed.", event)
             sid = args[0] if args else None
+            error_payload = {"message": str(exc), "event": event}
             if sid is not None:
-                await self.emit(MeetingSocketEvents.ERROR, {"message": str(exc), "event": event}, to=sid)
-            return None
+                await self.emit(MeetingSocketEvents.ERROR, error_payload, to=sid)
+            return {"ok": False, "error": error_payload}
 
     async def on_connect(self, sid: str, environ: dict, auth: dict | None) -> None:
         """Authenticate the connecting socket and place it in a profile-scoped room."""
-        print(f"{sid=};{environ=};{auth}")
         user = await sync_to_async(resolve_socket_user)(environ, auth)
         if user is None:
             raise ConnectionRefusedError("Authentication required.")
@@ -62,7 +76,14 @@ class MeetingNamespace(AsyncNamespace):
             client_session_key=data.get("client_session_key", ""),
             metadata=data.get("metadata", {}),
         )
-        await self.enter_room(sid, MeetingSocketEmitter.session_room_name(session.pk))
+        if (
+            connection.participant_id
+            and connection.status == RealtimeConnectionStatus.ACTIVE
+        ):
+            await self.enter_room(
+                sid,
+                MeetingSocketEmitter.session_room_name(session.pk),
+            )
         membership = await sync_to_async(MeetingPermissionService.get_room_membership)(session.room, profile)
         if membership and membership.can_manage_waiting_room:
             await self.enter_room(sid, MeetingSocketEmitter.coordinator_room_name(session.pk))
@@ -149,6 +170,24 @@ class MeetingNamespace(AsyncNamespace):
             participant=participant,
             reason=data.get("reason", ""),
         )
+
+    async def on_session_leave(self, sid: str, data: dict) -> dict:
+        """Persist an intentional departure and remove the socket from session rooms."""
+
+        profile = await self._get_profile(sid)
+        session = await self._get_session(data["session_id"])
+        participant = await sync_to_async(MeetingLifecycleService.leave_participant)(
+            session=session,
+            profile=profile,
+            socket_id=sid,
+            reason=data.get("reason", ""),
+        )
+        await self.leave_room(sid, MeetingSocketEmitter.session_room_name(session.pk))
+        await self.leave_room(sid, MeetingSocketEmitter.coordinator_room_name(session.pk))
+        return {
+            "ok": True,
+            "participant": MeetingStateBuilder.serialize_participant(participant),
+        }
 
     async def on_session_heartbeat(self, sid: str, _: dict | None = None) -> None:
         """Refresh realtime heartbeat state for the socket connection."""

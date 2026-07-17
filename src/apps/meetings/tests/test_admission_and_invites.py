@@ -12,7 +12,12 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from apps.meetings.exceptions import MeetingPermissionDeniedError
-from apps.meetings.models import MeetingRole, MeetingRoom, MeetingRoomMembership
+from apps.meetings.models import (
+    ExternalMeetingBinding,
+    MeetingRole,
+    MeetingRoom,
+    MeetingRoomMembership,
+)
 from apps.meetings.services.invitations import MeetingInvitationService
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.profiles.models import Profile
@@ -227,4 +232,11 @@ class MeetingAdmissionInviteTests(TestCase):
 
         self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(MeetingRoom.objects.filter(metadata__external_id="consultation:abc-123").count(), 1)
+        self.assertEqual(
+            ExternalMeetingBinding.objects.filter(
+                external_id="consultation:abc-123",
+                room=room,
+            ).count(),
+            1,
+        )
         self.assertEqual(second_response.json()["session_id"], data["session_id"])

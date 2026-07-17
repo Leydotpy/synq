@@ -1,0 +1,63 @@
+import core.models.fields.janus
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    dependencies = [
+        ("meetings", "0004_lifecycle_sweep_indexes_and_legacy_bindings"),
+    ]
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            database_operations=[],
+            state_operations=[
+                migrations.AlterField(
+                    model_name="meetingsession",
+                    name="control_handle_id",
+                    field=core.models.fields.janus.JanusPluginField(
+                        blank=True,
+                        db_index=True,
+                        identifier="publisher",
+                        janus_getter="apps.meetings.services.janus.resolve_janus_session",
+                        max_length=255,
+                        null=True,
+                        plugin_attr="control_handle",
+                        plugin_class=(
+                            "apps.meetings.services.janus."
+                            "NativeJanusIdVideoRoomPlugin"
+                        ),
+                        plugin_kwargs_factory=(
+                            "apps.meetings.services.janus."
+                            "meeting_session_control_plugin_kwargs"
+                        ),
+                    ),
+                ),
+                migrations.AlterField(
+                    model_name="participantmediahandle",
+                    name="janus_handle_id",
+                    field=core.models.fields.janus.JanusPluginField(
+                        blank=True,
+                        callback_factory="core.hooks.janus.plugin_callback_factory",
+                        db_index=True,
+                        identifier="publisher",
+                        identifier_getter=(
+                            "apps.meetings.services.janus."
+                            "participant_media_handle_identifier"
+                        ),
+                        janus_getter="apps.meetings.services.janus.resolve_janus_session",
+                        max_length=255,
+                        null=True,
+                        plugin_attr="handle",
+                        plugin_class=(
+                            "apps.meetings.services.janus."
+                            "NativeJanusIdVideoRoomPlugin"
+                        ),
+                        plugin_kwargs_factory=(
+                            "apps.meetings.services.janus."
+                            "participant_media_plugin_kwargs"
+                        ),
+                    ),
+                ),
+            ],
+        ),
+    ]

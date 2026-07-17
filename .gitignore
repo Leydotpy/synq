@@ -111,6 +111,12 @@ fabric.properties
 [Ll]ib64
 [Ll]ocal
 [Ss]cripts
+# Project launchers are source files, not virtual-environment Scripts folders.
+!scripts/
+!scripts/**
+!src/scripts/
+!src/scripts/**
+.synq-meet-dev*.wsl.json
 pyvenv.cfg
 pip-selfcheck.json
 
@@ -210,6 +216,8 @@ cover/
 local_settings.py
 local.py
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 db.sqlite3-journal
 
 # Flask stuff:

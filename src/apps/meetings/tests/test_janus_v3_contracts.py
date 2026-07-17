@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 from django.test import SimpleTestCase, override_settings
 from janus_api.models.base import Jsep
+from janus_api.models.request import PluginMessageRequest
 from janus_videoroom_plugin import (
     PublisherConfigureRequest,
     PublisherJoinAndConfigureRequest,
@@ -38,13 +39,16 @@ from janus_videoroom_plugin import (
 )
 
 from apps.meetings.models import (
+    MeetingSession,
     ParticipantConnection,
+    ParticipantMediaHandle,
     ParticipantStatus,
     RealtimeConnectionStatus,
 )
 from apps.meetings.realtime.namespace import MeetingNamespace
 from apps.meetings.services.janus import (
     JanusProcessRuntime,
+    NativeJanusIdVideoRoomPlugin,
     call_video_room_management_method,
     ensure_bound_plugin_attached,
     serialize_janus_response,
@@ -61,6 +65,82 @@ from core.models.fields.janus import (
     VideoRoomPublisherPluginField,
     VideoRoomSubscriberPluginField,
 )
+
+
+class NativeJanusIdAdapterContractTests(SimpleTestCase):
+    """Keep Janus' numeric handle identity intact at every app boundary."""
+
+    def test_native_integer_handle_survives_into_plugin_message_request(self) -> None:
+        session_id = 7_488_603_522_389_459
+        handle_id = 9_194_204_203_876_831
+        plugin = NativeJanusIdVideoRoomPlugin(
+            session=SimpleNamespace(id=session_id),
+        )
+        plugin._plugin_id = handle_id
+
+        request = PluginMessageRequest(
+            session_id=session_id,
+            handle_id=plugin.id,
+            body={"request": "exists", "room": 1},
+        )
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+        self.assertEqual(payload["handle_id"], handle_id)
+        self.assertIsInstance(payload["handle_id"], int)
+
+    def test_management_helper_constructs_native_id_adapter(self) -> None:
+        constructed: list[Any] = []
+
+        class AdapterProbe:
+            def __init__(self, *, session: Any) -> None:
+                self.session = session
+                self.attached = False
+                constructed.append(self)
+
+            async def attach(self) -> None:
+                self.attached = True
+
+            async def probe(self, value: str) -> str:
+                if not self.attached:
+                    raise AssertionError("management method ran before attach")
+                return f"native:{value}"
+
+            async def detach(self) -> None:
+                self.attached = False
+
+        session = object()
+        with (
+            patch(
+                "apps.meetings.services.janus.resolve_janus_session",
+                return_value=session,
+            ),
+            patch(
+                "apps.meetings.services.janus.NativeJanusIdVideoRoomPlugin",
+                AdapterProbe,
+            ),
+            patch(
+                "apps.meetings.services.janus.janus_runtime.run",
+                side_effect=asyncio.run,
+            ),
+        ):
+            result = call_video_room_management_method(
+                SimpleNamespace(),
+                "probe",
+                "room-7",
+            )
+
+        self.assertEqual(result, "native:room-7")
+        self.assertEqual(len(constructed), 1)
+        self.assertIs(constructed[0].session, session)
+
+    def test_meeting_handle_fields_resolve_native_id_adapter(self) -> None:
+        for model, field_name in (
+            (MeetingSession, "control_handle_id"),
+            (ParticipantMediaHandle, "janus_handle_id"),
+        ):
+            with self.subTest(model=model.__name__, field=field_name):
+                field = model._meta.get_field(field_name)
+                self.assertIs(field.plugin_class, NativeJanusIdVideoRoomPlugin)
 
 
 SERVER_ROOT = Path(__file__).resolve().parents[4]
@@ -305,7 +385,7 @@ class ManagementHandleContractTests(SimpleTestCase):
                 return_value=object(),
             ),
             patch(
-                "apps.meetings.services.janus.VideoRoomPlugin",
+                "apps.meetings.services.janus.NativeJanusIdVideoRoomPlugin",
                 _ManagementPlugin,
             ),
             patch(
