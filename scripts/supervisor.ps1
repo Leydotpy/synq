@@ -881,7 +881,7 @@ try {
     Set-DefaultEnvironment "NEXT_PUBLIC_SYNQ_SOCKET_NAMESPACE" "/meetings"
 
     $uv = Resolve-CommandPath "uv"
-    if (-not $NoFrontend) { $npm = Resolve-CommandPath "npm" }
+    if (-not $NoFrontend) { $npm = Resolve-CommandPath "bun" }
     $dockerCommand = Get-Command "docker" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $dockerCommand) { $docker = [string] $dockerCommand.Source }
     if (Test-WslAvailable) { $wsl = Resolve-WslExecutable }
