@@ -442,7 +442,7 @@ class MeetingSession(UUIDTimestampedModel):
     # Lifecycle phase used by APIs, workers, and Socket.IO flows to coordinate cleanup and UX.
     lifecycle_state = models.CharField(max_length=32, choices=MeetingLifecycleState.choices, default=MeetingLifecycleState.SCHEDULED)
     # Janus VideoRoom identifier provisioned for this live meeting session.
-    janus_room_id = models.IntegerField(blank=True)
+    janus_room_id = models.IntegerField(blank=True, null=True)
     # Secret used for privileged Janus room actions such as destroy or moderation commands.
     janus_room_secret = models.CharField(max_length=255, blank=True)
     # Optional participant PIN forwarded to Janus when the room requires a join secret.
