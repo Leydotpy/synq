@@ -663,9 +663,9 @@ class Participant(UUIDTimestampedModel):
     # Timestamp recording when the participant most recently raised their hand.
     raised_hand_at = models.DateTimeField(blank=True, null=True)
     # Janus publisher identifier returned when the participant joins the VideoRoom as a publisher.
-    janus_publisher_id = models.IntegerField(blank=True)
+    janus_publisher_id = models.IntegerField(blank=True, null=True)
     # Janus private identifier returned for subscriber operations tied to the publisher session.
-    janus_private_id = models.IntegerField(blank=True)
+    janus_private_id = models.IntegerField(blank=True, null=True)
     # Latest known Janus payload for this participant, including media and moderation state.
     janus_state = models.JSONField(default=dict, blank=True)
     # Timestamp recording when the participant was effectively admitted into the live meeting.
@@ -837,7 +837,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
     # Lifecycle phase of the Janus handle attachment and readiness flow.
     lifecycle_state = models.CharField(max_length=32, choices=JanusHandleLifecycleState.choices, default=JanusHandleLifecycleState.ATTACHING)
     # Diagnostic owner-session identifier; it is never portable across processes.
-    janus_session_id = models.IntegerField(blank=True)
+    janus_session_id = models.IntegerField(blank=True, null=True)
     # Janus plugin handle identifier persisted in the database and exposed as ``handle`` in Python.
     janus_handle_id = JanusPluginField(
         identifier=JanusHandleType.PUBLISHER,
@@ -852,7 +852,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
         db_index=True,
     )
     # Opaque identifier sent to Janus and echoed back for correlating logs or client requests.
-    opaque_id = models.CharField(max_length=255, blank=True)
+    opaque_id = models.CharField(max_length=255, blank=True, null=True)
     # Most recent SDP offer associated with the handle, retained for diagnostics and renegotiation.
     jsep_offer = models.JSONField(default=dict, blank=True)
     # Most recent SDP answer associated with the handle, retained for diagnostics and renegotiation.
@@ -905,11 +905,11 @@ class ParticipantStream(UUIDTimestampedModel):
     # Janus MID uniquely identifying the stream inside SDP and Janus events.
     janus_mid = models.CharField(max_length=64)
     # Janus publisher feed identifier associated with the stream when applicable.
-    janus_feed_id = models.IntegerField(blank=True)
+    janus_feed_id = models.IntegerField(blank=True, null=True)
     # Source MID used by Janus for subscriber-side feed mapping.
-    janus_feed_mid = models.CharField(max_length=64, blank=True)
+    janus_feed_mid = models.CharField(max_length=64, blank=True, null=True)
     # Codec currently negotiated for the stream when known.
-    codec = models.CharField(max_length=64, blank=True)
+    codec = models.CharField(max_length=64, blank=True, null=True)
     # Flag indicating whether the stream is presently active according to Janus state.
     is_active = models.BooleanField(default=False)
     # Flag indicating whether the stream is fully ready for media flow.
