@@ -170,6 +170,7 @@ class MeetingLifecycleService:
                 janus_room_pin=generate_short_code(8),
                 metadata=metadata or {},
             )
+
             participant = Participant(
                 room=room,
                 session=session,
