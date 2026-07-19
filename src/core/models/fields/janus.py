@@ -429,8 +429,6 @@ class JanusPluginField(models.IntegerField, Generic[PluginT]):
         plugin_kwargs_factory: str | PluginKwargsFactory | None = None,
         **kwargs: Any,
     ) -> None:
-        kwargs.setdefault("max_length", 255)
-
         identifier_value = identifier.value if isinstance(identifier, Enum) else str(identifier)
         if not identifier_value:
             raise TypeError("'identifier' is required for JanusPluginField.")
