@@ -442,7 +442,7 @@ class MeetingSession(UUIDTimestampedModel):
     # Lifecycle phase used by APIs, workers, and Socket.IO flows to coordinate cleanup and UX.
     lifecycle_state = models.CharField(max_length=32, choices=MeetingLifecycleState.choices, default=MeetingLifecycleState.SCHEDULED)
     # Janus VideoRoom identifier provisioned for this live meeting session.
-    janus_room_id = models.CharField(max_length=128, blank=True)
+    janus_room_id = models.IntegerField(max_length=128, blank=True)
     # Secret used for privileged Janus room actions such as destroy or moderation commands.
     janus_room_secret = models.CharField(max_length=255, blank=True)
     # Optional participant PIN forwarded to Janus when the room requires a join secret.
@@ -663,9 +663,9 @@ class Participant(UUIDTimestampedModel):
     # Timestamp recording when the participant most recently raised their hand.
     raised_hand_at = models.DateTimeField(blank=True, null=True)
     # Janus publisher identifier returned when the participant joins the VideoRoom as a publisher.
-    janus_publisher_id = models.CharField(max_length=128, blank=True)
+    janus_publisher_id = models.IntegerField(max_length=128, blank=True)
     # Janus private identifier returned for subscriber operations tied to the publisher session.
-    janus_private_id = models.CharField(max_length=128, blank=True)
+    janus_private_id = models.IntegerField(max_length=128, blank=True)
     # Latest known Janus payload for this participant, including media and moderation state.
     janus_state = models.JSONField(default=dict, blank=True)
     # Timestamp recording when the participant was effectively admitted into the live meeting.
@@ -837,7 +837,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
     # Lifecycle phase of the Janus handle attachment and readiness flow.
     lifecycle_state = models.CharField(max_length=32, choices=JanusHandleLifecycleState.choices, default=JanusHandleLifecycleState.ATTACHING)
     # Diagnostic owner-session identifier; it is never portable across processes.
-    janus_session_id = models.CharField(max_length=128, blank=True)
+    janus_session_id = models.IntegerField(blank=True)
     # Janus plugin handle identifier persisted in the database and exposed as ``handle`` in Python.
     janus_handle_id = JanusPluginField(
         identifier=JanusHandleType.PUBLISHER,
@@ -905,7 +905,7 @@ class ParticipantStream(UUIDTimestampedModel):
     # Janus MID uniquely identifying the stream inside SDP and Janus events.
     janus_mid = models.CharField(max_length=64)
     # Janus publisher feed identifier associated with the stream when applicable.
-    janus_feed_id = models.CharField(max_length=128, blank=True)
+    janus_feed_id = models.IntegerField(max_length=128, blank=True)
     # Source MID used by Janus for subscriber-side feed mapping.
     janus_feed_mid = models.CharField(max_length=64, blank=True)
     # Codec currently negotiated for the stream when known.

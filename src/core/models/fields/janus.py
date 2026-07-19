@@ -114,11 +114,11 @@ class BoundPluginHandle(Generic[PluginT]):
     instance: models.Model
     field: "JanusPluginField[PluginT]"
     session: AbstractBaseSession | None
-    raw_id: str | None = None
+    raw_id: int | None = None
     _plugin: PluginT | None = None
 
     @property
-    def id(self) -> str | None:
+    def id(self) -> int | None:
         """Return the best-known Janus handle identifier."""
 
         plugin = self._plugin
@@ -163,7 +163,7 @@ class BoundPluginHandle(Generic[PluginT]):
         persist: bool = False,
         using: str | None = None,
         update_fields: Sequence[str] | None = None,
-    ) -> str | None:
+    ) -> int | None:
         """Copy the current ``plugin.id`` back into the raw model field."""
 
         plugin_id = self.field.extract_plugin_id(self.plugin)
@@ -411,7 +411,7 @@ class BoundPluginDescriptor(Generic[PluginT]):
         )
 
 
-class JanusPluginField(models.CharField, Generic[PluginT]):
+class JanusPluginField(models.IntegerField, Generic[PluginT]):
     """Store a Janus plugin id in the database while exposing a bound plugin object."""
 
     descriptor_class = JanusPluginIdDeferredAttribute
@@ -549,13 +549,13 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
 
         return messages
 
-    def normalize_raw_id(self, value: object) -> str | None:
+    def normalize_raw_id(self, value: object) -> int | None:
         """Normalize raw ids, bound handles, or plugin objects to a database string."""
 
         if value in (None, ""):
             return None
 
-        if isinstance(value, str):
+        if isinstance(value, int):
             return value
 
         if isinstance(value, BoundPluginHandle):
@@ -571,7 +571,7 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
         )
 
     @staticmethod
-    def extract_plugin_id(plugin: object) -> str | None:
+    def extract_plugin_id(plugin: object) -> int | None:
         """Extract a plugin id while tolerating unattached ``janus_api`` plugin objects."""
 
         try:
@@ -581,14 +581,14 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
 
         if plugin_id in (None, ""):
             return None
-        if not isinstance(plugin_id, str):
+        if not isinstance(plugin_id, int):
             raise TypeError(
                 f"Expected plugin.id to be a string or None, got {type(plugin_id).__name__}.",
             )
         return plugin_id
 
     @staticmethod
-    def set_plugin_id(plugin: PluginT, plugin_id: str | None) -> None:
+    def set_plugin_id(plugin: PluginT, plugin_id: int | None) -> None:
         """Set the id on an already-instantiated plugin object."""
 
         setattr(plugin, "id", plugin_id)
@@ -596,7 +596,7 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
     def set_stored_value(
         self,
         instance: models.Model,
-        value: str | None,
+        value: int | None,
         *,
         clear_plugin_cache: bool,
     ) -> None:
@@ -607,7 +607,7 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
         if clear_plugin_cache:
             instance.__dict__.pop(self.plugin_cache_name, None)
 
-    def get_stored_value(self, instance: models.Model) -> str | None:
+    def get_stored_value(self, instance: models.Model) -> int | None:
         """Return the raw stored plugin id, respecting deferred Django fields."""
 
         if self.attname not in instance.__dict__:
@@ -668,7 +668,7 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
         self,
         *,
         instance: models.Model,
-        raw_id: str | None,
+        raw_id: int | None,
     ) -> PluginT:
         """Construct the bound plugin instance for the supplied model instance."""
 
@@ -705,13 +705,13 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
             return None
         return str(value)
 
-    def to_python(self, value: Any) -> str | None:
+    def to_python(self, value: Any) -> int | None:
         """Convert incoming values to a normalized plugin id string."""
 
         if value in (None, ""):
             return None
 
-        if isinstance(value, str):
+        if isinstance(value, int):
             return value
 
         if isinstance(value, BoundPluginHandle):
@@ -723,20 +723,20 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
 
         raise ValidationError(f"Cannot coerce value {value!r} into a Janus plugin id string.")
 
-    def get_prep_value(self, value: Any) -> str | None:
+    def get_prep_value(self, value: Any) -> int | None:
         """Prepare the normalized raw id for database persistence."""
 
         normalized = self.normalize_raw_id(value)
         if normalized is None:
             return None
-        return cast(str, super().get_prep_value(normalized))
+        return cast(int, super().get_prep_value(normalized))
 
-    def pre_save(self, model_instance: models.Model, add: bool) -> str | None:
+    def pre_save(self, model_instance: models.Model, add: bool) -> int | None:
         """Return the raw stored value during model persistence."""
 
         return self.get_stored_value(model_instance)
 
-    def value_from_object(self, obj: models.Model) -> str | None:
+    def value_from_object(self, obj: models.Model) -> int | None:
         """Return the raw plugin id from the supplied model instance."""
 
         return self.get_stored_value(obj)
@@ -745,7 +745,7 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
         """Return the serialized raw plugin id for Django fixtures."""
 
         value = self.value_from_object(obj)
-        return "" if value is None else value
+        return "" if value is None else str(value)
 
     def deconstruct(self) -> tuple[str, str, list[Any], dict[str, Any]]:
         """Serialize the field into migration-friendly constructor arguments."""
