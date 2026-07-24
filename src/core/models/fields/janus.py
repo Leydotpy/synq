@@ -511,11 +511,11 @@ class JanusPluginField(models.CharField, Generic[PluginT]):
 
         if plugin_id in (None, ""):
             return None
-        if not isinstance(plugin_id, str):
+        if not isinstance(plugin_id, int):
             raise TypeError(
                 f"Expected plugin.id to be a string or None, got {type(plugin_id).__name__}.",
             )
-        return plugin_id
+        return str(plugin_id)
 
     @staticmethod
     def set_plugin_id(plugin: PluginT, plugin_id: str | None) -> None:

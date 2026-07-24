@@ -111,7 +111,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    # "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
+    "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
     "core.middleware.janus.JanusSessionMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -372,3 +372,14 @@ SESSION_COOKIE_AGE = 60 * 60 * 24 * 30
 SESSION_COOKIE_SAMESITE = "lax"
 SESSION_SAVE_EVERY_REQUEST = True
 SESSION_COOKIE_SECURE = not DEBUG
+
+
+# Email Backend Configuration
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = config("DJANGO_EMAIL_HOST", default='smtp.gmail.com', cast=str)
+EMAIL_PORT = config("DJANGO_EMAIL_PORT", default=587, cast=int)
+EMAIL_USE_TLS = config("DJANGO_EMAIL_USE_TLS", cast=bool, default=True)
+
+# Authentication
+EMAIL_HOST_USER = config("DJANGO_EMAIL_USER", cast=str)  # Your actual Gmail address
+EMAIL_HOST_PASSWORD = config("DJANGO_EMAIL_PASSWORD", cast=str)  # The generated App Password (no spaces)
