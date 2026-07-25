@@ -33,7 +33,7 @@ from apps.meetings.services.janus import (
 )
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.services.permissions import MeetingPermissionService
-
+from core.utils import log_to_terminal
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,7 @@ def _reset_media_handle_for_connection(media_handle: ParticipantMediaHandle) -> 
             )
     media_handle.streams.all().delete()
     media_handle.janus_handle_id = None
-    media_handle.janus_session_id = ""
+    media_handle.janus_session_id = None
     media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHING
     media_handle.selected_streams = []
     media_handle.jsep_offer = {}
@@ -484,10 +484,10 @@ def _build_subscriber_targets(*, participant: Participant, publisher_payloads: S
     """Build the target publisher streams for the participant's multistream subscriber handle."""
 
     targets: list[SubscriberStreams] = []
-    local_feed_id = str(participant.janus_publisher_id or "")
+    local_feed_id = participant.janus_publisher_id or None
     for publisher in publisher_payloads:
         payload = _serialize_model(publisher)
-        publisher_id = str(payload.get("id") or "")
+        publisher_id = payload.get("id") or None
         if not publisher_id or publisher_id == local_feed_id:
             continue
         for stream_payload in payload.get("streams") or []:
@@ -584,12 +584,12 @@ class MeetingMediaSignalService:
             method_kwargs["metadata"] = _build_metadata(participant)
         elif media_handle.lifecycle_state == JanusHandleLifecycleState.ATTACHED:
             method_name = "publish"
-
-        print(method_name)
-        print(method_kwargs)
+        log_to_terminal("METHOD_NAME", method_name)
+        log_to_terminal("METHOD_KWARGS", method_kwargs)
         response = call_plugin_method(bound_handle, method_name, **method_kwargs)
 
         plugin_data = getattr(getattr(response, "plugindata", None), "data", None)
+        log_to_terminal("PLUGIN_DATA", plugin_data)
         serialized_response = serialize_janus_response(response)
         serialized_answer = _serialize_jsep(getattr(response, "jsep", None))
         now = timezone.now()
@@ -785,7 +785,7 @@ class MeetingMediaSignalService:
                 drop=drop or None,
             )
             action = "update"
-
+        log_to_terminal(action, response)
         if response is not None:
             serialized_response = serialize_janus_response(response)
             media_handle.janus_state = serialized_response
@@ -909,6 +909,7 @@ class MeetingMediaSignalService:
         )
         bound_handle = ensure_participant_media_plugin(media_handle)
         serialized_candidates = _serialize_trickle_candidates(list(candidates or []))
+        log_to_terminal("serialized ICE Candidates", serialized_candidates)
         if completed or not serialized_candidates:
             call_plugin_method(bound_handle, "complete_trickle")
         else:

@@ -294,7 +294,7 @@ def recover_stale_provisioning_sessions() -> int:
     session_ids = list(
         MeetingSession.objects.filter(
             lifecycle_state=MeetingLifecycleState.PROVISIONING,
-            janus_room_id="",
+            janus_room_id=None,
             updated_at__lt=threshold,
         ).values_list("pk", flat=True)
     )

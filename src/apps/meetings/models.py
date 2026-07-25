@@ -827,7 +827,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
         db_index=True,
     )
     # Opaque identifier sent to Janus and echoed back for correlating logs or client requests.
-    opaque_id = models.PositiveIntegerField(null=True, blank=True)
+    opaque_id = models.CharField(max_length=120, blank=True, null=True)
     # Most recent SDP offer associated with the handle, retained for diagnostics and renegotiation.
     jsep_offer = models.JSONField(default=dict, blank=True)
     # Most recent SDP answer associated with the handle, retained for diagnostics and renegotiation.

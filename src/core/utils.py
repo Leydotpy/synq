@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import string
+from typing import Any
 from uuid import uuid4
 
 from django.db import models
@@ -72,3 +73,10 @@ def generate_unique_slug(
         counter += 1
 
     return slug
+
+def log_to_terminal(name: str, value: Any) -> None:
+    print(
+        f"==============================================================={name}========================================================",
+        value,
+        sep="\n",
+    )
