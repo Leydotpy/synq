@@ -584,6 +584,9 @@ class MeetingMediaSignalService:
             method_kwargs["metadata"] = _build_metadata(participant)
         elif media_handle.lifecycle_state == JanusHandleLifecycleState.ATTACHED:
             method_name = "publish"
+
+        print(method_name)
+        print(method_kwargs)
         response = call_plugin_method(bound_handle, method_name, **method_kwargs)
 
         plugin_data = getattr(getattr(response, "plugindata", None), "data", None)

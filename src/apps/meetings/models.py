@@ -443,7 +443,7 @@ class MeetingSession(UUIDTimestampedModel):
     # Lifecycle phase used by APIs, workers, and Socket.IO flows to coordinate cleanup and UX.
     lifecycle_state = models.CharField(max_length=32, choices=MeetingLifecycleState.choices, default=MeetingLifecycleState.SCHEDULED)
     # Janus VideoRoom identifier provisioned for this live meeting session.
-    janus_room_id = models.CharField(max_length=128, blank=True)
+    janus_room_id = models.PositiveIntegerField(null=True, blank=True)
     # Secret used for privileged Janus room actions such as destroy or moderation commands.
     janus_room_secret = models.CharField(max_length=255, blank=True)
     # Optional participant PIN forwarded to Janus when the room requires a join secret.
@@ -640,9 +640,9 @@ class Participant(UUIDTimestampedModel):
     # Timestamp recording when the participant most recently raised their hand.
     raised_hand_at = models.DateTimeField(blank=True, null=True)
     # Janus publisher identifier returned when the participant joins the VideoRoom as a publisher.
-    janus_publisher_id = models.CharField(max_length=128, blank=True)
+    janus_publisher_id = models.PositiveIntegerField(null=True, blank=True)
     # Janus private identifier returned for subscriber operations tied to the publisher session.
-    janus_private_id = models.CharField(max_length=128, blank=True)
+    janus_private_id = models.PositiveIntegerField(null=True, blank=True)
     # Latest known Janus payload for this participant, including media and moderation state.
     janus_state = models.JSONField(default=dict, blank=True)
     # Timestamp recording when the participant was effectively admitted into the live meeting.
@@ -813,7 +813,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
     # Lifecycle phase of the Janus handle attachment and readiness flow.
     lifecycle_state = models.CharField(max_length=32, choices=JanusHandleLifecycleState.choices, default=JanusHandleLifecycleState.ATTACHING)
     # Janus session identifier used to coordinate plugin handles and cleanup.
-    janus_session_id = models.CharField(max_length=128, blank=True)
+    janus_session_id = models.PositiveIntegerField(null=True, blank=True)
     # Janus plugin handle identifier persisted in the database and exposed as ``handle`` in Python.
     janus_handle_id = JanusPluginField(
         identifier=JanusHandleType.PUBLISHER,
@@ -827,7 +827,7 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
         db_index=True,
     )
     # Opaque identifier sent to Janus and echoed back for correlating logs or client requests.
-    opaque_id = models.CharField(max_length=255, blank=True)
+    opaque_id = models.PositiveIntegerField(null=True, blank=True)
     # Most recent SDP offer associated with the handle, retained for diagnostics and renegotiation.
     jsep_offer = models.JSONField(default=dict, blank=True)
     # Most recent SDP answer associated with the handle, retained for diagnostics and renegotiation.
