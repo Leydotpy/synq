@@ -25,6 +25,7 @@ from janus_api.transport.websocket import WebsocketTransportClient
 from pydantic import TypeAdapter
 
 from apps.meetings.exceptions import JanusGatewayError
+from core.utils import log_to_terminal
 
 _janus_bootstrap_lock = threading.Lock()
 _janus_event_loop_lock = threading.Lock()
@@ -225,6 +226,7 @@ def _run_worker_janus_loop() -> None:
     janus_settings.JANUS_ENABLE_EVENTS = False
 
     async def bootstrap() -> None:
+        log_to_terminal("JANUS_SESSION", "Bootstrapping new janus session")
         global _worker_janus_start_error, _worker_local_manager
         try:
             manager = JanusSessionManager()

@@ -243,7 +243,7 @@ def provision_janus_room_for_session(self, session_id: str) -> dict:
             response = call_plugin_method(control_handle, "create", **payload)
             response_state = serialize_janus_response(response)
 
-        session.janus_room_id = str(payload["room"])
+        session.janus_room_id = payload["room"]
         session.janus_backend_server = getattr(settings, "JANUS_SESSION_URL", "")
         session.janus_state = {
             **response_state,
@@ -327,9 +327,8 @@ def attach_participant_media_handles(self, participant_id: str) -> dict:
             media_handle.janus_handle_id = None
         media_handle.connection = media_handle.connection or participant.connections.order_by("-connected_at").first()
         media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHING
-        media_handle.save(update_fields=["connection", "janus_handle_id", "lifecycle_state", "updated_at"])
         media_handle.last_event_at = timezone.now()
-        media_handle.save(update_fields=["lifecycle_state", "last_event_at", "updated_at"])
+        media_handle.save(update_fields=["connection", "janus_handle_id", "lifecycle_state", "updated_at", "last_event_at"])
         attached[handle_type] = media_handle.janus_handle_id
     MeetingLifecycleService.refresh_session_metrics(session=participant.session)
     MeetingSocketEmitter.emit_session_state(session=participant.session)

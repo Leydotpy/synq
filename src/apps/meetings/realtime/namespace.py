@@ -270,7 +270,7 @@ class MeetingNamespace(AsyncNamespace):
             participant=participant,
             connection=connection,
             handle_type=data["handle_type"],
-            candidates=data.get("candidates") or ([] if data.get("completed") else [data.get("candidate", {})]),
+            candidates=data.get("candidates") or (None if data.get("completed") else data.get("candidate", {})),
             completed=bool(data.get("completed", False)),
         )
 

@@ -222,6 +222,8 @@ def _get_or_create_media_handle(
             "opaque_id": f"{participant.pk}:{handle_type}",
         },
     )
+    logger.info("media_handle", media_handle)
+    logger.info("created", _)
     expected_connection = connection or media_handle.connection or participant.connections.order_by("-connected_at").first()
     updates: list[str] = []
     if expected_connection and media_handle.connection_id != expected_connection.pk:
@@ -504,23 +506,27 @@ def _build_subscriber_targets(*, participant: Participant, publisher_payloads: S
             )
     return targets
 
-
-def _serialize_trickle_candidates(candidates: Sequence[dict[str, Any]]) -> list[TrickleCandidate]:
+def _serialize_trickle_candidates(candidates: dict[str, Any]) -> TrickleCandidate:
     """Validate and coerce trickle candidate payloads from the frontend."""
 
-    serialized: list[TrickleCandidate] = []
-    for payload in candidates:
-        candidate_value = payload.get("candidate")
-        if not candidate_value:
-            continue
-        serialized.append(
-            TrickleCandidate(
-                candidate=str(candidate_value),
-                sdpMid=payload.get("sdpMid"),
-                sdpMLineIndex=payload.get("sdpMLineIndex"),
-            )
-        )
-    return serialized
+    ice_candidate = TrickleCandidate(
+        candidate=str(candidates.get("candidate")),
+        sdpMid=candidates.get("sdpMid"),
+        sdpMLineIndex=candidates.get("sdpMLineIndex"),
+    )
+
+    # serialized: list[TrickleCandidate] = []
+    # for payload in candidates:
+    #     _log_ice_candidates_to_terminal(payload)
+    #     candidate_value = payload.get("candidate")
+    #     if not candidate_value:
+    #         continue
+    #     serialized.append(
+    #         _sanitize_candidate(payload)
+    #     )
+    # return serialized
+    print("Ice Candidate", ice_candidate, type(ice_candidate))
+    return ice_candidate
 
 
 class MeetingMediaSignalService:
@@ -584,8 +590,6 @@ class MeetingMediaSignalService:
             method_kwargs["metadata"] = _build_metadata(participant)
         elif media_handle.lifecycle_state == JanusHandleLifecycleState.ATTACHED:
             method_name = "publish"
-        log_to_terminal("METHOD_NAME", method_name)
-        log_to_terminal("METHOD_KWARGS", method_kwargs)
         response = call_plugin_method(bound_handle, method_name, **method_kwargs)
 
         plugin_data = getattr(getattr(response, "plugindata", None), "data", None)
@@ -757,7 +761,7 @@ class MeetingMediaSignalService:
                 ParticipantSubscribeJoinRequest(
                     request="join",
                     ptype="subscriber",
-                    room=participant.session.janus_room_id or str(participant.session.pk),
+                    room=int(participant.session.janus_room_id or str(participant.session.pk)),
                     pin=participant.session.janus_room_pin or None,
                     private_id=participant.janus_private_id or None,
                     streams=targets,
@@ -893,11 +897,13 @@ class MeetingMediaSignalService:
         participant: Participant,
         connection: ParticipantConnection | None,
         handle_type: str,
-        candidates: Sequence[dict[str, Any]] | None = None,
+        candidates: dict[str, Any] | None = None,
         completed: bool = False,
     ) -> dict[str, Any]:
         """Forward browser ICE candidates to the Janus publisher or subscriber handle."""
-
+        log_to_terminal("ICE TRICKLE", "Trickling ICE for participant")
+        log_to_terminal("Handle Type", handle_type)
+        log_to_terminal("ICE Candidates", candidates)
         _ensure_media_session_ready(participant.session)
         if handle_type not in {JanusHandleType.PUBLISHER, JanusHandleType.SUBSCRIBER}:
             raise MeetingDomainError("Unsupported Janus handle type for ICE trickle.")
@@ -908,12 +914,15 @@ class MeetingMediaSignalService:
             connection=connection,
         )
         bound_handle = ensure_participant_media_plugin(media_handle)
-        serialized_candidates = _serialize_trickle_candidates(list(candidates or []))
-        log_to_terminal("serialized ICE Candidates", serialized_candidates)
+        serialized_candidates = _serialize_trickle_candidates(candidates or {})
+
+        print(serialized_candidates, type(serialized_candidates))
         if completed or not serialized_candidates:
             call_plugin_method(bound_handle, "complete_trickle")
+            logger.info("ICE trickle completed" )
         else:
             call_plugin_method(bound_handle, "trickle", candidates=serialized_candidates)
+            logger.info("ICE candidate still gathering")
         media_handle.connection = connection or media_handle.connection
         media_handle.last_event_at = timezone.now()
         media_handle.save(update_fields=["connection", "last_event_at", "updated_at"])

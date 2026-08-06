@@ -17,6 +17,7 @@ from apps.meetings.realtime.emitter import MeetingSocketEmitter
 from apps.meetings.services.signaling import MeetingMediaSignalService
 from conf.socketio import get_socket_server
 from core.models import JanusPluginField
+from core.utils import log_to_terminal
 
 JanusEvent = Mapping[str, Any]
 
@@ -165,6 +166,7 @@ def plugin_callback_factory(
             "socket_ids": _collect_socket_ids(instance),
             **_extract_context(instance),
         }
+        log_to_terminal("JANUS_EVENT", event)
         dispatch_janus_event(payload)
 
     def _on_rx_event(event: JanusEvent) -> None:
