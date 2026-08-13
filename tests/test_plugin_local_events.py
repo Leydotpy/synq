@@ -4,9 +4,9 @@ import asyncio
 
 import pytest
 
-from janus_api.lib.manager import PluginManager
-from janus_api.lib.plugins.base import Plugin
-from janus_api.models.response import DetachedResponse, MediaEventResponse
+from jrtc.lib.manager import PluginManager
+from jrtc.lib.plugins.base import Plugin
+from jrtc.models.response import DetachedResponse, MediaEventResponse
 
 
 class ExamplePlugin(Plugin):

@@ -9,12 +9,12 @@ import pytest
 from broka import DeliveryMode
 from broka.observability.metrics import InMemoryMetrics
 
-from janus_api.messaging import (
+from jrtc.messaging import (
     JanusEventPublisher,
     JanusResponseDispatcher,
     create_broker,
 )
-from janus_api.models.response import (
+from jrtc.models.response import (
     AckResponse,
     ErrorResponse,
     EventResponse,
@@ -22,7 +22,7 @@ from janus_api.models.response import (
     MediaEventResponse,
     SuccessResponse,
 )
-from janus_api.transport.websocket import WebsocketTransportClient
+from jrtc.transport.websocket import WebsocketTransportClient
 
 
 def _event_response() -> EventResponse:
@@ -497,7 +497,7 @@ async def test_websocket_transport_does_not_split_jsep_into_a_second_event() -> 
 
 async def test_http_transport_does_not_split_jsep_into_a_second_event() -> None:
     pytest.importorskip("httpx")
-    from janus_api.transport.http import HttpTransportClient
+    from jrtc.transport.http import HttpTransportClient
 
     publisher = RecordingPublisher()
     transport = HttpTransportClient(event_publisher=publisher)

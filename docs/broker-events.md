@@ -1,7 +1,7 @@
 # Janus broker events
 
 This guide describes the cross-process event contract implemented by
-`janus_api.messaging`. It targets Python 3.12 or newer and the versions pinned by
+`jrtc.messaging`. It targets Python 3.12 or newer and the versions pinned by
 this project: Broka 0.0.2 and Dispio 0.0.2.
 
 The short version is:
@@ -56,7 +56,7 @@ types are published:
 | `timeout` | `janus.timeout` |
 
 Use `JANUS_EVENT_ROUTES` and `DISPATCHABLE_JANUS_TYPES` from
-`janus_api.messaging` instead of duplicating this table in application code.
+`jrtc.messaging` instead of duplicating this table in application code.
 
 ## Physical destination and envelope contract
 
@@ -151,8 +151,7 @@ from collections.abc import Mapping
 from broka import AcknowledgementMode, Broker, Delivery, SubscriptionOptions
 from dispio import Dispatcher, ExactMatcher
 
-from janus_api.messaging import DEFAULT_PHYSICAL_ROUTE, create_broker
-
+from jrtc.messaging import DEFAULT_PHYSICAL_ROUTE, create_broker
 
 events = Dispatcher(name="third-party.janus-events")
 
@@ -244,7 +243,7 @@ They are useful for tests and for an embedded integration that shares the exact
 same `Broker` instance with `JanusEventPublisher`:
 
 ```python
-from janus_api.messaging import JanusEventPublisher, create_broker
+from jrtc.messaging import JanusEventPublisher, create_broker
 
 broker = create_broker(
     engine="memory",
@@ -276,7 +275,7 @@ are lost. ACK and reject are no-ops; requeue and defer are unsupported. Always u
 ```python
 import os
 
-from janus_api.messaging import create_broker
+from jrtc.messaging import create_broker
 
 broker = create_broker(
     engine="redis",
@@ -303,15 +302,15 @@ at-least-once delivery and pending-entry recovery.
 ```python
 import os
 
-from janus_api.messaging import create_broker
+from jrtc.messaging import create_broker
 
 broker = create_broker(
     engine="redis",
     engine_options={
         "mode": "streams",
         "url": os.environ["JANUS_REDIS_URL"],
-        "group": "analytics-janus-v1",       # stable per logical application
-        "consumer_name": "analytics-api-01", # unique per live replica
+        "group": "analytics-janus-v1",  # stable per logical application
+        "consumer_name": "analytics-api-01",  # unique per live replica
         "max_length": 1_000_000,
         "claim_idle_ms": 60_000,
         "claim_interval": 30.0,
@@ -340,7 +339,7 @@ different third-party applications need different queues to each receive a copy.
 ```python
 import os
 
-from janus_api.messaging import create_broker
+from jrtc.messaging import create_broker
 
 broker = create_broker(
     engine="rabbitmq",
@@ -375,7 +374,7 @@ a group; independent applications use different groups.
 ```python
 import os
 
-from janus_api.messaging import create_broker
+from jrtc.messaging import create_broker
 
 broker = create_broker(
     engine="kafka",
@@ -482,8 +481,8 @@ defaults are four workers, a global capacity of 1,024 admitted events, and a
 50-millisecond admission timeout.
 
 ```python
-from janus_api.messaging import JanusEventPublisher, create_broker
-from janus_api.transport.websocket import WebsocketTransportClient
+from jrtc.messaging import JanusEventPublisher, create_broker
+from jrtc.transport.websocket import WebsocketTransportClient
 
 broker = create_broker(engine="redis", engine_options=redis_options)
 publisher = JanusEventPublisher(
@@ -552,7 +551,7 @@ in-flight, and latency series through the same provider.
 Inject one metrics instance to correlate broker, publisher, and dispatcher state:
 
 ```python
-from janus_api.messaging import LogVistaMetrics, JanusEventPublisher, create_broker
+from jrtc.messaging import LogVistaMetrics, JanusEventPublisher, create_broker
 
 metrics = LogVistaMetrics()
 broker = create_broker(engine="redis", engine_options=redis_options, metrics=metrics)
@@ -639,7 +638,7 @@ an alpha dependency.
 
 Broka 0.0.2's `create_default_registry()` probes stale `pyev.engines.*` module
 paths for Redis, RabbitMQ, and Kafka. Optional-engine discovery can therefore fail
-even though `broka.engines.*` is installed. `janus_api.messaging.create_broker()`
+even though `broka.engines.*` is installed. `jrtc.messaging.create_broker()`
 avoids this defect with an isolated, lazy `EngineRegistry` that explicitly loads
 the five supported engine classes.
 

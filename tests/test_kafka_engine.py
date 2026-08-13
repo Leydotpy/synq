@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 from broka.engines.base import Availability, EnginePublishContext, EngineSubscription
 
-from janus_api.messaging.engines import KafkaEngine
-from janus_api.messaging.engines import kafka as kafka_module
+from jrtc.messaging.engines import KafkaEngine
+from jrtc.messaging.engines import kafka as kafka_module
 
 
 class _FakeSSLContext:

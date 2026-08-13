@@ -15,7 +15,7 @@ they use or implement their own client on the public `Plugin` base.
 > The product is named **Janus Core**. The exact `janus-core` distribution and
 > `janus_core` import namespace are already occupied on PyPI by an unrelated
 > project, so this project uses the publishable distribution name
-> `janus-api-core` and retains the stable `janus_api` Python namespace.
+> `jrtc` and retains the stable `jrtc` Python namespace.
 
 ## Requirements and installation
 
@@ -23,16 +23,16 @@ they use or implement their own client on the public `Plugin` base.
 - Janus Gateway with at least one enabled API transport
 
 ```bash
-pip install janus-api-core
+pip install jrtc
 
 # Plain HTTP/HTTPS transport
-pip install "janus-api-core[http]"
+pip install "jrtc[http]"
 
 # Explicit Kafka client support for the core broker adapter
-pip install "janus-api-core[kafka]"
+pip install "jrtc[kafka]"
 
 # Independent FastAPI monitoring and administration service
-pip install "janus-api-server[ops]"
+pip install "japi[ops]"
 ```
 
 The core runtime uses Pydantic, WebSockets, LogVista, Dispio, and Broka. Broka
@@ -40,19 +40,19 @@ The core runtime uses Pydantic, WebSockets, LogVista, Dispio, and Broka. Broka
 dependencies, even when an in-process engine is selected. HTTP transport is the
 core transport extra; the Kafka extra explicitly declares the client used by
 the hardened adapter instead of relying on Broka's transitive metadata.
-`janus-api-server` directly depends on core but core never imports FastAPI,
+`japi` directly depends on core but core never imports FastAPI,
 Starlette, Uvicorn, asyncpg, or the server package.
 
 ### Migrating from the bundled operations server
 
 The 3.1 package boundary is intentionally explicit:
 
-- Replace `janus_api.create_asgi_app` and `janus_api.api` imports with
-  `janus_api_server.create_asgi_app` and `janus_api_server.api`.
-- Replace `janus_api.contrib.admin.db.migrate` with
-  `janus_api_server.contrib.admin.db.migrate`.
-- Import `JanusSessionManager` from `janus_api` (or `janus_api.session`). The
-  former mixed `janus_api.servers` namespace is gone.
+- Replace `jrtc.create_asgi_app` and `jrtc.api` imports with
+  `japi.create_asgi_app` and `japi.api`.
+- Replace `jrtc.contrib.admin.db.migrate` with
+  `japi.contrib.admin.db.migrate`.
+- Import `JanusSessionManager` from `jrtc` (or `jrtc.session`). The
+  former mixed `jrtc.servers` namespace is gone.
 - Remove callers of the former `/manager` API. The operations service neither
   owns nor exposes application session pools.
 - Configure EventHandler delivery with `JANUS_EVENT_BROKER_*` settings. The
@@ -74,7 +74,7 @@ part of the same deployment:
 | `JANUS_ENABLE_EVENTS` | `JANUS_SERVER_ENABLE_EVENTS` |
 | `JANUS_MOUNT_LOGGING_APP` | `JANUS_SERVER_MOUNT_LOGGING_APP` |
 | `JANUS_ALLOWED_ORIGINS` | `JANUS_SERVER_ALLOWED_ORIGINS` |
-| `JANUS_API_ALLOW_CREDENTIALS` | `JANUS_SERVER_API_ALLOW_CREDENTIALS` |
+| `jrtc_ALLOW_CREDENTIALS` | `JANUS_SERVER_API_ALLOW_CREDENTIALS` |
 
 ## Client quick start
 
@@ -87,15 +87,15 @@ pip install janus-echotest-plugin
 ```python
 import asyncio
 
-from janus_api import JanusSession
+from jrtc import JanusSession
 from janus_echotest_plugin import EchoTestPlugin
 
 
 async def main() -> None:
-    async with JanusSession(url="ws://127.0.0.1:8188/janus") as session:
-        async with EchoTestPlugin(session=session) as echo:
-            reply = await echo.configure(audio=True, video=False)
-            print(reply.data)
+  async with JanusSession(url="ws://127.0.0.1:8188/janus") as session:
+    async with EchoTestPlugin(session=session) as echo:
+      reply = await echo.configure(audio=True, video=False)
+      print(reply.data)
 
 
 asyncio.run(main())
@@ -121,11 +121,11 @@ sockets, or an application-specific Janus transport can implement the small
 `JanusTransport` protocol and be injected without core interpreting its URL:
 
 ```python
-from janus_api import JanusSession
+from jrtc import JanusSession
 
 session = JanusSession(
-    transport=my_transport,
-    url="unix:///run/janus.sock",  # owned by the injected transport
+  transport=my_transport,
+  url="unix:///run/janus.sock",  # owned by the injected transport
 )
 await session.create()
 ```
@@ -151,52 +151,52 @@ The operations server deliberately creates neither one, which prevents duplicate
 Janus sessions when both packages run in the same process:
 
 ```python
-from janus_api import JanusSession
-from janus_api.messaging import JanusEventPublisher, create_broker
+from jrtc import JanusSession
+from jrtc.messaging import JanusEventPublisher, create_broker
 
 broker = create_broker(
-    engine="redis",
-    engine_options={
-        "mode": "streams",
-        "url": "redis://localhost:6379/0",
-    },
+  engine="redis",
+  engine_options={
+    "mode": "streams",
+    "url": "redis://localhost:6379/0",
+  },
 )
 
 async with JanusEventPublisher(broker) as publisher:
-    async with JanusSession(event_publisher=publisher) as session:
-        ...
+  async with JanusSession(event_publisher=publisher) as session:
+    ...
 ```
 
 Third-party applications subscribe to the exact physical destination and route
 on `delivery.envelope.type`:
 
 ```python
-from janus_api.messaging import DEFAULT_PHYSICAL_ROUTE, create_broker
+from jrtc.messaging import DEFAULT_PHYSICAL_ROUTE, create_broker
 
 subscriber = create_broker(
-    engine="redis",
-    engine_options={
-        "mode": "streams",
-        "url": "redis://localhost:6379/0",
-        "group": "analytics-janus-v1",
-        "consumer_name": "analytics-01",
-    },
+  engine="redis",
+  engine_options={
+    "mode": "streams",
+    "url": "redis://localhost:6379/0",
+    "group": "analytics-janus-v1",
+    "consumer_name": "analytics-01",
+  },
 )
 
 
 async def receive(delivery) -> None:
-    logical_type = delivery.envelope.type
-    response = delivery.message
-    jsep = response.get("jsep")
-    await application_events.handle(logical_type, response, jsep=jsep)
+  logical_type = delivery.envelope.type
+  response = delivery.message
+  jsep = response.get("jsep")
+  await application_events.handle(logical_type, response, jsep=jsep)
 
 
 async with subscriber:
-    subscription = await subscriber.subscribe(DEFAULT_PHYSICAL_ROUTE, receive)
-    try:
-        await stop_event.wait()
-    finally:
-        await subscription.close()
+  subscription = await subscriber.subscribe(DEFAULT_PHYSICAL_ROUTE, receive)
+  try:
+    await stop_event.wait()
+  finally:
+    await subscription.close()
 ```
 
 Redis Pub/Sub, Redis Streams, RabbitMQ, Kafka, native wire consumers,
@@ -211,16 +211,16 @@ Configure them once per session; representations and settings inspection redact
 their values.
 
 ```python
-from janus_api import JanusCredentials, JanusSession
+from jrtc import JanusCredentials, JanusSession
 
 credentials = JanusCredentials(token="client-token", api_secret="shared-secret")
 
 async with JanusSession(credentials=credentials) as session:
-    ...
+  ...
 ```
 
 A callable returning `JanusCredentials` may be supplied for credential rotation.
-The default session manager reads `JANUS_TOKEN` and `JANUS_API_SECRET`.
+The default session manager reads `JANUS_TOKEN` and `jrtc_SECRET`.
 
 ## Plugin projects
 
@@ -241,12 +241,12 @@ Streaming remains in the `plugins/janus-streaming-plugin`
 workspace as distribution `janus-api-streaming`, import package
 `janus_streaming`, and entry-point name `streaming`.
 
-Installed plugins are discovered lazily through the `janus_api.plugins` entry
+Installed plugins are discovered lazily through the `jrtc.plugins` entry
 point group. Importing Janus Core never scans or executes arbitrary local files
 and never imports unrelated named plugins.
 
 ```python
-from janus_api.lib import Plugin
+from jrtc.lib import Plugin
 
 # Resolves only the installed `echotest` entry point.
 echo = Plugin(identifier="echotest", session=session)
@@ -265,25 +265,25 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from janus_api.lib import Plugin
+from jrtc.lib import Plugin
 
 
 class StatusRequest(BaseModel):
-    request: Literal["status"] = "status"
+  request: Literal["status"] = "status"
 
 
 class MyPlugin(Plugin):
-    identifier = "my-plugin"
-    name = "janus.plugin.my-plugin"
+  identifier = "my-plugin"
+  name = "janus.plugin.my-plugin"
 
-    async def status(self):
-        return await self.send(StatusRequest())
+  async def status(self):
+    return await self.send(StatusRequest())
 ```
 
 To support lazy discovery from a separate distribution:
 
 ```toml
-[project.entry-points."janus_api.plugins"]
+[project.entry-points."jrtc.plugins"]
 my-plugin = "my_package.plugin:MyPlugin"
 ```
 
@@ -293,26 +293,26 @@ golden protocol tests derived from its Janus documentation.
 
 ## Session ownership and the separate operations server
 
-`JanusSessionManager` remains part of `janus-api-core` and owns a bounded,
+`JanusSessionManager` remains part of `jrtc` and owns a bounded,
 process-local session pool. Each application owns its Janus connections and
 passes the selected session to its own plugins. The operations server never
 creates, installs, or tears down a session or manager.
 
 ```python
-from janus_api import JanusSessionManager
+from jrtc import JanusSessionManager
 
 async with JanusSessionManager(pool_size=2) as manager:
-    session = manager.get_session(key="tenant-42")
-    if session is None:
-        raise RuntimeError("Janus is unavailable")
+  session = manager.get_session(key="tenant-42")
+  if session is None:
+    raise RuntimeError("Janus is unavailable")
 ```
 
-Install `janus-api-server` independently for monitoring and administration. Its
+Install `japi` independently for monitoring and administration. Its
 ASGI lifespan owns only server resources such as the Admin monitor, optional
 Timescale storage, EventHandler broker sink, and log tailer:
 
 ```python
-from janus_api_server import create_asgi_app
+from japi import create_asgi_app
 
 app = create_asgi_app(mount_rest_api=True)
 ```
@@ -343,7 +343,7 @@ effect:
 ```python
 import asyncio
 
-from janus_api_server.contrib.admin.db import migrate
+from japi.contrib.admin.db import migrate
 
 asyncio.run(migrate())
 ```
@@ -363,7 +363,7 @@ recursively redacts nested credentials, creates restrictive files, and supports
 size-based or external watched rotation:
 
 ```python
-from janus_api.core.logging import install_colored_logging
+from jrtc.core.logging import install_colored_logging
 
 install_colored_logging(logfile="/var/log/myapp/janus.jsonl", rotation="watched")
 ```
@@ -383,7 +383,7 @@ manager. The package itself deliberately does not load `.env` files.
 | `JANUS_SHUTDOWN_TIMEOUT` | `10` | Total bounded session-shutdown budget |
 | `JANUS_DETACH_CONCURRENCY` | `16` | Concurrent handle detach limit |
 | `JANUS_TOKEN` | unset | Janus token authentication |
-| `JANUS_API_SECRET` | unset | Janus shared API secret |
+| `jrtc_SECRET` | unset | Janus shared API secret |
 | `JANUS_BROKER_ENGINE` | `memory` | `memory`, `local`, `redis`, `rabbitmq`, or `kafka` |
 | `JANUS_BROKER_ROUTE` | `janus.events` | Exact physical event destination |
 | `JANUS_BROKER_ENGINE_OPTIONS` | `{}` | JSON object passed to the selected Broka engine |
@@ -395,12 +395,12 @@ manager. The package itself deliberately does not load `.env` files.
 | `JANUS_BROKER_DRAIN_TIMEOUT` | `10` | Publisher shutdown/drain budget in seconds |
 
 Use a custom typed module through `JANUS_SETTINGS_MODULE` for more complex core
-deployments; explicit overrides are available through `janus_api.conf.configure`.
+deployments; explicit overrides are available through `jrtc.conf.configure`.
 
 ## Operations server configuration
 
 The server loads its own settings independently through
-`JANUS_SERVER_SETTINGS_MODULE` or `janus_api_server.configure`. Important
+`JANUS_SERVER_SETTINGS_MODULE` or `japi.configure`. Important
 defaults are:
 
 | Variable | Default | Purpose |
@@ -446,11 +446,11 @@ monitoring availability need to scale.
 ```bash
 uv sync --all-packages --all-extras --group dev
 uv run pytest
-uv run ruff check src tests packages/janus-api-server/src packages/janus-api-server/tests
-uv run ruff format --check src tests packages/janus-api-server/src packages/janus-api-server/tests
-uv run mypy src/janus_api packages/janus-api-server/src/janus_api_server
-uv build --package janus-api-core
-uv build --package janus-api-server
+uv run ruff check src tests packages/japi/src packages/japi/tests
+uv run ruff format --check src tests packages/japi/src packages/japi/tests
+uv run mypy src/jrtc packages/japi/src/japi
+uv build --package jrtc
+uv build --package japi
 ```
 
 The tracked tests cover response validation, local plugin lifecycle, complete
@@ -476,7 +476,7 @@ and deployment limits.
 
 ## 2.x migration notes
 
-- Distribution: `janus-api` → `janus-api-core`; import namespace remains `janus_api`.
+- Distribution: `janus-api` → `jrtc`; import namespace remains `jrtc`.
 - `WebsocketSession` remains an alias of the transport-agnostic `JanusSession`.
 - Named plugin models, clients, and the old VideoRoom facade moved out of core.
 - Streaming moved completely to `janus-api-streaming` under `plugins`.

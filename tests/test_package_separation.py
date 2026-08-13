@@ -6,11 +6,11 @@ import ast
 import tomllib
 from pathlib import Path
 
-import janus_api
+import jrtc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CORE_SOURCE = PROJECT_ROOT / "src" / "janus_api"
-SERVER_SOURCE = PROJECT_ROOT / "packages" / "janus-api-server" / "src" / "janus_api_server"
+CORE_SOURCE = PROJECT_ROOT / "src" / "jrtc"
+SERVER_SOURCE = PROJECT_ROOT / "packages" / "japi" / "src" / "japi"
 
 
 def _imports(source_file: Path) -> set[str]:
@@ -35,25 +35,25 @@ def _offending_imports(source_root: Path, forbidden_roots: set[str]) -> list[str
 
 
 def test_session_manager_remains_a_public_core_api() -> None:
-    from janus_api import JanusSessionManager
-    from janus_api.session import JanusSessionManager as SessionManager
+    from jrtc import JanusSessionManager
+    from jrtc.session import JanusSessionManager as SessionManager
 
     assert JanusSessionManager is SessionManager
-    assert "JanusSessionManager" in janus_api.__all__
+    assert "JanusSessionManager" in jrtc.__all__
 
 
 def test_core_does_not_depend_on_the_operations_server_stack() -> None:
     assert (
         _offending_imports(
             CORE_SOURCE,
-            {"fastapi", "starlette", "asyncpg", "janus_api_server"},
+            {"fastapi", "starlette", "asyncpg", "japi"},
         )
         == []
     )
 
 
 def test_server_never_uses_aiokafka_producer_directly() -> None:
-    assert SERVER_SOURCE.is_dir(), "the janus-api-server source package must exist"
+    assert SERVER_SOURCE.is_dir(), "the japi source package must exist"
 
     direct_imports = _offending_imports(SERVER_SOURCE, {"aiokafka"})
     direct_references: list[str] = []
@@ -85,23 +85,23 @@ def test_server_contains_no_manager_rest_surface() -> None:
 def test_distribution_metadata_enforces_the_one_way_dependency_boundary() -> None:
     core = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     server = tomllib.loads(
-        (PROJECT_ROOT / "packages" / "janus-api-server" / "pyproject.toml").read_text(
+        (PROJECT_ROOT / "packages" / "japi" / "pyproject.toml").read_text(
             encoding="utf-8"
         )
     )
 
-    assert core["project"]["name"] == "janus-api-core"
-    assert server["project"]["name"] == "janus-api-server"
-    assert core["tool"]["setuptools"]["packages"]["find"]["include"] == ["janus_api*"]
-    assert server["tool"]["setuptools"]["packages"]["find"]["include"] == ["janus_api_server*"]
+    assert core["project"]["name"] == "jrtc"
+    assert server["project"]["name"] == "japi"
+    assert core["tool"]["setuptools"]["packages"]["find"]["include"] == ["jrtc*"]
+    assert server["tool"]["setuptools"]["packages"]["find"]["include"] == ["japi*"]
 
     core_requirements = "\n".join(core["project"]["dependencies"]).casefold()
     assert "fastapi" not in core_requirements
     assert "starlette" not in core_requirements
     assert "asyncpg" not in core_requirements
-    assert "janus-api-server" not in core_requirements
+    assert "japi" not in core_requirements
 
     server_requirements = "\n".join(server["project"]["dependencies"]).casefold()
-    assert "janus-api-core==3.1.0" in server_requirements
+    assert "jrtc==3.1.0" in server_requirements
     assert "fastapi" in server_requirements
-    assert server["tool"]["uv"]["sources"]["janus-api-core"] == {"workspace": True}
+    assert server["tool"]["uv"]["sources"]["jrtc"] == {"workspace": True}

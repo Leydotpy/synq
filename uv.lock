@@ -8,8 +8,8 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "janus-api-core",
-    "janus-api-server",
+    "jrtc",
+    "japi",
 ]
 
 [[package]]
@@ -412,7 +412,7 @@ wheels = [
 ]
 
 [[package]]
-name = "janus-api-core"
+name = "jrtc"
 version = "3.1.0"
 source = { editable = "." }
 dependencies = [
@@ -466,13 +466,13 @@ dev = [
 ]
 
 [[package]]
-name = "janus-api-server"
+name = "japi"
 version = "3.1.0"
-source = { editable = "packages/janus-api-server" }
+source = { editable = "packages/japi" }
 dependencies = [
     { name = "broka" },
     { name = "fastapi" },
-    { name = "janus-api-core" },
+    { name = "jrtc" },
     { name = "starlette" },
     { name = "uvicorn" },
     { name = "websockets" },
@@ -483,11 +483,11 @@ admin = [
     { name = "asyncpg" },
 ]
 kafka = [
-    { name = "janus-api-core", extra = ["kafka"] },
+    { name = "jrtc", extra = ["kafka"] },
 ]
 ops = [
     { name = "asyncpg" },
-    { name = "janus-api-core", extra = ["kafka"] },
+    { name = "jrtc", extra = ["kafka"] },
 ]
 
 [package.metadata]
@@ -496,9 +496,9 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'ops'", specifier = ">=0.29,<1" },
     { name = "broka", specifier = "==0.0.2" },
     { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "janus-api-core", editable = "." },
-    { name = "janus-api-core", extras = ["kafka"], marker = "extra == 'kafka'", editable = "." },
-    { name = "janus-api-core", extras = ["kafka"], marker = "extra == 'ops'", editable = "." },
+    { name = "jrtc", editable = "." },
+    { name = "jrtc", extras = ["kafka"], marker = "extra == 'kafka'", editable = "." },
+    { name = "jrtc", extras = ["kafka"], marker = "extra == 'ops'", editable = "." },
     { name = "starlette", specifier = ">=1.3.1,<2" },
     { name = "uvicorn", specifier = ">=0.30,<1" },
     { name = "websockets", specifier = ">=14,<17" },

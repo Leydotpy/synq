@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # The product is called "Janus Core". The exact `janus-core` distribution and
 # `janus_core` import namespace are already owned by an unrelated PyPI project.
-name = "janus-api-core"
+name = "jrtc"
 version = "3.1.0"
 description = "Plugin-agnostic async Python core for the Janus WebRTC Gateway"
 authors = [{ name = "Leydotpy", email = "leydotpy.dev@gmail.com" }]
@@ -64,19 +64,16 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["janus_api*"]
-exclude = ["janus_api.tests*", "janus_api.*.tests*"]
+include = ["jrtc*"]
+exclude = ["jrtc.tests*", "jrtc.*.tests*"]
 
 [tool.setuptools.package-data]
-janus_api = ["py.typed"]
-
-[tool.uv.workspace]
-members = ["packages/janus-api-server"]
+jrtc = ["py.typed"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"
-testpaths = ["tests", "packages/janus-api-server/tests"]
+testpaths = ["tests", "packages/japi/tests"]
 markers = [
     "integration: requires an external service",
     "janus: requires a running Janus Gateway",

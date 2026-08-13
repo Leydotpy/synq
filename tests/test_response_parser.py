@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from janus_api.models.response import EventResponse, parse_janus_response
+from jrtc.models.response import EventResponse, parse_janus_response
 
 
 def test_event_response_retains_jsep_in_the_original_envelope() -> None:
