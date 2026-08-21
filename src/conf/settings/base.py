@@ -102,7 +102,6 @@ MIDDLEWARE = [
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django_clerk_sdk.core.auth.clerk.middleware.ClerkMiddleware",
-    "core.middleware.janus.JanusSessionMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -236,6 +235,55 @@ JANUS_DEFAULT_ROOM_CONFIGURATION = {
     "videoorient_ext": True,
     "transport_wide_cc_ext": True,
 }
+
+# JRTC application events are a separate plane from the Janus command
+# connection above. Redis Streams is the durable production default; memory
+# and local engines are intended only for tests or same-process development.
+JRTC_EVENTS_ENABLED = env_bool("JRTC_EVENTS_ENABLED", default=True)
+JRTC_EVENT_BROKER_ENGINE = os.getenv("JRTC_EVENT_BROKER_ENGINE", "redis")
+JRTC_EVENT_PHYSICAL_ROUTE = os.getenv("JRTC_EVENT_PHYSICAL_ROUTE", "janus.events")
+JRTC_EVENT_PUBLISH_WORKERS = int(os.getenv("JRTC_EVENT_PUBLISH_WORKERS", "4"))
+JRTC_EVENT_PUBLISH_QUEUE_CAPACITY = int(
+    os.getenv("JRTC_EVENT_PUBLISH_QUEUE_CAPACITY", "1024")
+)
+JRTC_EVENT_PUBLISH_ADMISSION_TIMEOUT = float(
+    os.getenv("JRTC_EVENT_PUBLISH_ADMISSION_TIMEOUT", "0.05")
+)
+JRTC_EVENT_PUBLISH_TIMEOUT = float(os.getenv("JRTC_EVENT_PUBLISH_TIMEOUT", "5"))
+JRTC_EVENT_DRAIN_TIMEOUT = float(os.getenv("JRTC_EVENT_DRAIN_TIMEOUT", "10"))
+JRTC_EVENT_CONSUMER_CONCURRENCY = int(
+    os.getenv("JRTC_EVENT_CONSUMER_CONCURRENCY", "1")
+)
+JRTC_EVENT_CONSUMER_CAPACITY = int(os.getenv("JRTC_EVENT_CONSUMER_CAPACITY", "100"))
+
+JRTC_REDIS_URL = os.getenv("JRTC_REDIS_URL", REDIS_URL)
+JRTC_REDIS_MODE = os.getenv("JRTC_REDIS_MODE", "streams")
+JRTC_REDIS_GROUP = os.getenv("JRTC_REDIS_GROUP", "synq-jrtc-events")
+JRTC_REDIS_CONSUMER_NAME = os.getenv("JRTC_REDIS_CONSUMER_NAME", "synq-jrtc-events")
+JRTC_REDIS_MAX_LENGTH = int(os.getenv("JRTC_REDIS_MAX_LENGTH", "100000"))
+JRTC_REDIS_CLAIM_IDLE_MS = int(os.getenv("JRTC_REDIS_CLAIM_IDLE_MS", "60000"))
+JRTC_REDIS_CLAIM_INTERVAL = float(os.getenv("JRTC_REDIS_CLAIM_INTERVAL", "5"))
+
+JRTC_RABBITMQ_URL = os.getenv(
+    "JRTC_RABBITMQ_URL",
+    "amqp://guest:guest@127.0.0.1:5672/",
+)
+JRTC_RABBITMQ_EXCHANGE = os.getenv("JRTC_RABBITMQ_EXCHANGE", "synq.jrtc")
+JRTC_RABBITMQ_QUEUE = os.getenv("JRTC_RABBITMQ_QUEUE", "synq.jrtc.events")
+JRTC_RABBITMQ_DLX = os.getenv("JRTC_RABBITMQ_DLX", "synq.jrtc.dlx")
+
+JRTC_KAFKA_BOOTSTRAP_SERVERS = env_list(
+    "JRTC_KAFKA_BOOTSTRAP_SERVERS",
+    default=["127.0.0.1:9092"],
+)
+JRTC_KAFKA_GROUP_ID = os.getenv("JRTC_KAFKA_GROUP_ID", "synq-jrtc-events")
+JRTC_KAFKA_SECURITY_PROTOCOL = os.getenv(
+    "JRTC_KAFKA_SECURITY_PROTOCOL",
+    "PLAINTEXT",
+)
+JRTC_KAFKA_SASL_MECHANISM = os.getenv("JRTC_KAFKA_SASL_MECHANISM") or None
+JRTC_KAFKA_USERNAME = os.getenv("JRTC_KAFKA_USERNAME") or None
+JRTC_KAFKA_PASSWORD = os.getenv("JRTC_KAFKA_PASSWORD") or None
 
 MEETING_CONNECTION_STALE_SECONDS = int(os.getenv("MEETING_CONNECTION_STALE_SECONDS", "90"))
 MEETING_FRONTEND_BASE_URL = os.getenv("MEETING_FRONTEND_BASE_URL", "http://localhost:3000")

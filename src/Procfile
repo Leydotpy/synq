@@ -1,3 +1,4 @@
 web: uv run manage.py runjanus
 worker: celery -A conf worker -P solo -l INFO -E
 beat: celery -A conf.celery beat -l INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler
+jrtc-events: uv run manage.py run_jrtc_events

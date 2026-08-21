@@ -112,7 +112,7 @@ class MeetingLifecycleMaintenanceTests(MeetingLifecycleTestMixin, TestCase):
         stale_timestamp = timezone.now() - timedelta(minutes=5)
         MeetingSession.objects.filter(pk=stale.pk).update(updated_at=stale_timestamp)
         MeetingSession.objects.filter(pk=already_provisioned.pk).update(
-            janus_room_id="janus-room-ready",
+            janus_room_id=8_181,
             updated_at=stale_timestamp,
         )
         MeetingSession.objects.filter(pk=terminal.pk).update(updated_at=stale_timestamp)

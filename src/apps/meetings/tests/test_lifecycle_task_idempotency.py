@@ -9,7 +9,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from django.utils import timezone
-from janus_videoroom_plugin import VideoRoomCreated, VideoRoomReply, VideoRoomSuccess
+from jrtc_video import VideoRoomCreated, VideoRoomReply, VideoRoomSuccess
 
 from apps.meetings.exceptions import JanusGatewayError
 from apps.meetings.models import (
@@ -56,7 +56,7 @@ class JanusLifecycleTaskIdempotencyTests(TestCase):
         return profile, room, session
 
     @staticmethod
-    def created_reply(room_id: int | str) -> VideoRoomReply:
+    def created_reply(room_id: int) -> VideoRoomReply:
         """Build the typed Janus v3 response accepted by the task adapter."""
 
         return VideoRoomReply(
@@ -107,7 +107,8 @@ class JanusLifecycleTaskIdempotencyTests(TestCase):
     @patch("apps.meetings.tasks.call_video_room_management_method")
     def test_provision_already_provisioned_live_session_is_a_noop(self, janus_call) -> None:
         _profile, _room, session = self.make_session("provisioned-host")
-        expected_state = {"plugindata": {"data": {"room": "existing-room"}}}
+        existing_room_id = 4_242
+        expected_state = {"plugindata": {"data": {"room": existing_room_id}}}
 
         for lifecycle_state in (
             MeetingLifecycleState.WAITING,
@@ -116,7 +117,7 @@ class JanusLifecycleTaskIdempotencyTests(TestCase):
             with self.subTest(lifecycle_state=lifecycle_state):
                 MeetingSession.objects.filter(pk=session.pk).update(
                     lifecycle_state=lifecycle_state,
-                    janus_room_id="existing-room",
+                    janus_room_id=existing_room_id,
                     janus_state=expected_state,
                 )
 
@@ -152,7 +153,7 @@ class JanusLifecycleTaskIdempotencyTests(TestCase):
                 second_result = provision_janus_room_for_session.run(str(session.pk))
 
         session.refresh_from_db()
-        self.assertEqual(session.janus_room_id, str(expected_room_id))
+        self.assertEqual(session.janus_room_id, expected_room_id)
         self.assertEqual(session.lifecycle_state, MeetingLifecycleState.WAITING)
         self.assertEqual(first_result, session.janus_state)
         self.assertEqual(second_result, session.janus_state)
@@ -202,7 +203,7 @@ class JanusLifecycleTaskIdempotencyTests(TestCase):
 
         session.refresh_from_db()
         self.assertEqual(janus_call.call_count, 2)
-        self.assertEqual(session.janus_room_id, str(expected_room_id))
+        self.assertEqual(session.janus_room_id, expected_room_id)
         self.assertTrue(result["reconciled_existing_room"])
 
     @patch("apps.meetings.tasks.call_video_room_management_method")
@@ -300,7 +301,7 @@ class JanusLifecycleTaskIdempotencyTests(TestCase):
 
         session.refresh_from_db()
         self.assertEqual(session.lifecycle_state, MeetingLifecycleState.ENDED)
-        self.assertEqual(session.janus_room_id, str(expected_room_id))
+        self.assertEqual(session.janus_room_id, expected_room_id)
         self.assertIsNone(session.cleanup_completed_at)
         self.assertEqual(result, session.janus_state)
         queue_cleanup.assert_called_once_with(str(session.pk))

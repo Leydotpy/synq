@@ -1,12 +1,15 @@
-"""Middleware that exposes the process-local Janus session on Django requests."""
+"""Deprecated compatibility middleware for the retired request Janus coupling."""
 
 from __future__ import annotations
 
-from janus_api.conf import Janus
-
-
 class JanusSessionMiddleware:
-    """Attach the current ``janus_api`` session handle to each incoming request."""
+    """Pass requests through without acquiring process-local JRTC resources.
+
+    The class remains importable for deployments whose settings have not yet
+    been rolled forward.  Media services acquire JRTC explicitly; ordinary
+    HTTP requests no longer receive ``request.janus`` or
+    ``request.janus_session`` attributes.
+    """
 
     def __init__(self, get_response):
         """Store Django's downstream request callable."""
@@ -14,8 +17,6 @@ class JanusSessionMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        """Expose the shared Janus session so views do not need to import global state."""
+        """Continue the middleware chain without hidden session acquisition."""
 
-        request.janus = Janus.get_session()
-        request.janus_session = request.janus
         return self.get_response(request)

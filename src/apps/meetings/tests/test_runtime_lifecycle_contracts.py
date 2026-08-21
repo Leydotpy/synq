@@ -173,7 +173,7 @@ class MeetingRuntimeLifecycleContractTests(TestCase):
             participant=host_participant,
             handle_type=JanusHandleType.PUBLISHER,
             opaque_id="private-opaque-id",
-            janus_session_id="private-janus-session",
+            janus_session_id=7_488_603_522_389_459,
             janus_state={"secret": "private-handle-state"},
         )
         guest_connection = ParticipantConnection.objects.create(
@@ -211,13 +211,13 @@ class MeetingRuntimeLifecycleContractTests(TestCase):
             "host-secret-key",
             "connection-secret",
             "private-opaque-id",
-            "private-janus-session",
+            "7488603522389459",
             "private-handle-state",
             "raw-janus-secret",
             "stream-secret",
         ):
             self.assertNotIn(secret, serialized)
-        self.assertEqual(host_state["janus"]["participants"][0]["id"], 42)
+        self.assertEqual(host_state["janus"]["participants"][0]["id"], "42")
         self.assertEqual(
             MeetingSocketEmitter.active_participant_socket_ids(session.pk),
             ["host-secret-socket"],

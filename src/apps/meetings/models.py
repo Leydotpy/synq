@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from django.contrib.auth.hashers import check_password, make_password
@@ -11,7 +12,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 
 from apps.profiles.models import Profile
-from core.models import JanusPluginField, UUIDTimestampedModel
+from core.models import UUIDTimestampedModel
 
 
 def coordinator_permission_defaults(role: str) -> dict[str, bool]:
@@ -200,6 +201,21 @@ class MeetingEventType(models.TextChoices):
     JANUS_HANDLE_FAILED = "janus_handle_failed", "Janus Handle Failed"
     STATE_SYNCED = "state_synced", "State Synced"
     CLEANUP_COMPLETED = "cleanup_completed", "Cleanup Completed"
+
+
+class JrtcEventReceiptStatus(models.TextChoices):
+    """Track whether an admitted JRTC broker event completed its durable work."""
+
+    RECEIVED = "received", "Received"
+    PROCESSED = "processed", "Processed"
+    FAILED = "failed", "Failed"
+
+
+class JrtcBrowserOutboxStatus(models.TextChoices):
+    """Track durable browser forwarding for one authorized event target."""
+
+    PENDING = "pending", "Pending"
+    DELIVERED = "delivered", "Delivered"
 
 
 class MeetingSessionQuerySet(models.QuerySet):
@@ -427,14 +443,9 @@ class MeetingSession(UUIDTimestampedModel):
     room = models.ForeignKey(MeetingRoom, on_delete=models.CASCADE, related_name="sessions")
     # Profile that explicitly started this live session instance.
     started_by_profile = models.ForeignKey(Profile, on_delete=models.PROTECT, related_name="started_meeting_sessions")
-    # Legacy control-handle slot retained for schema compatibility. Core v3
-    # room management uses short-lived process-owned VideoRoom handles.
-    control_handle_id = JanusPluginField(
-        identifier=JanusHandleType.PUBLISHER,
-        plugin_class="apps.meetings.services.janus.NativeJanusIdVideoRoomPlugin",
-        plugin_attr="control_handle",
-        janus_getter="apps.meetings.services.janus.resolve_janus_session",
-        plugin_kwargs_factory="apps.meetings.services.janus.meeting_session_control_plugin_kwargs",
+    # Legacy control-handle identifier retained for diagnostics and forward
+    # schema compatibility. Management handles themselves are process-local.
+    control_handle_id = models.PositiveBigIntegerField(
         blank=True,
         null=True,
         db_index=True,
@@ -442,7 +453,7 @@ class MeetingSession(UUIDTimestampedModel):
     # Lifecycle phase used by APIs, workers, and Socket.IO flows to coordinate cleanup and UX.
     lifecycle_state = models.CharField(max_length=32, choices=MeetingLifecycleState.choices, default=MeetingLifecycleState.SCHEDULED)
     # Janus VideoRoom identifier provisioned for this live meeting session.
-    janus_room_id = models.IntegerField(blank=True, null=True)
+    janus_room_id = models.PositiveBigIntegerField(blank=True, null=True)
     # Secret used for privileged Janus room actions such as destroy or moderation commands.
     janus_room_secret = models.CharField(max_length=255, blank=True)
     # Optional participant PIN forwarded to Janus when the room requires a join secret.
@@ -663,9 +674,9 @@ class Participant(UUIDTimestampedModel):
     # Timestamp recording when the participant most recently raised their hand.
     raised_hand_at = models.DateTimeField(blank=True, null=True)
     # Janus publisher identifier returned when the participant joins the VideoRoom as a publisher.
-    janus_publisher_id = models.IntegerField(blank=True, null=True)
+    janus_publisher_id = models.PositiveBigIntegerField(blank=True, null=True)
     # Janus private identifier returned for subscriber operations tied to the publisher session.
-    janus_private_id = models.IntegerField(blank=True, null=True)
+    janus_private_id = models.PositiveBigIntegerField(blank=True, null=True)
     # Latest known Janus payload for this participant, including media and moderation state.
     janus_state = models.JSONField(default=dict, blank=True)
     # Timestamp recording when the participant was effectively admitted into the live meeting.
@@ -740,25 +751,34 @@ class Participant(UUIDTimestampedModel):
         return self.get_media_handle_record(JanusHandleType.TEXTROOM)
 
     @property
-    def publisher_mediahandle(self):
-        """Return the bound publisher plugin handle for this participant, if present."""
+    def publisher_mediahandle(self) -> "ParticipantMediaHandle | None":
+        """Return the persisted publisher record as a compatibility alias.
 
-        record = self.publisher_mediahandle_record
-        return record.handle if record else None
+        Live JRTC plugins are process-local and must be resolved through the
+        runtime handle registry; an ORM participant never materializes one.
+        """
 
-    @property
-    def subscriber_mediahandle(self):
-        """Return the bound subscriber plugin handle for this participant, if present."""
-
-        record = self.subscriber_mediahandle_record
-        return record.handle if record else None
+        return self.publisher_mediahandle_record
 
     @property
-    def textroom_mediahandle(self):
-        """Return the bound textroom plugin handle for this participant, if present."""
+    def subscriber_mediahandle(self) -> "ParticipantMediaHandle | None":
+        """Return the persisted subscriber record as a compatibility alias.
 
-        record = self.textroom_mediahandle_record
-        return record.handle if record else None
+        Live JRTC plugins are process-local and must be resolved through the
+        runtime handle registry; an ORM participant never materializes one.
+        """
+
+        return self.subscriber_mediahandle_record
+
+    @property
+    def textroom_mediahandle(self) -> "ParticipantMediaHandle | None":
+        """Return the persisted text-room record as a compatibility alias.
+
+        Live JRTC plugins are process-local and must be resolved through the
+        runtime handle registry; an ORM participant never materializes one.
+        """
+
+        return self.textroom_mediahandle_record
 
 
 class ParticipantConnection(UUIDTimestampedModel):
@@ -811,11 +831,9 @@ class ParticipantConnection(UUIDTimestampedModel):
         return f"{self.profile} via {self.socket_id}"
 
     def mark_heartbeat(self) -> None:
-        """Update the heartbeat timestamp and reactivate stale connections."""
+        """Update heartbeat time without changing the connection generation."""
 
         self.last_heartbeat_at = timezone.now()
-        if self.status == RealtimeConnectionStatus.STALE:
-            self.status = RealtimeConnectionStatus.ACTIVE
 
     def mark_disconnected(self) -> None:
         """Mark the socket as disconnected while preserving historical metadata."""
@@ -837,19 +855,26 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
     # Lifecycle phase of the Janus handle attachment and readiness flow.
     lifecycle_state = models.CharField(max_length=32, choices=JanusHandleLifecycleState.choices, default=JanusHandleLifecycleState.ATTACHING)
     # Diagnostic owner-session identifier; it is never portable across processes.
-    janus_session_id = models.IntegerField(blank=True, null=True)
-    # Janus plugin handle identifier persisted in the database and exposed as ``handle`` in Python.
-    janus_handle_id = JanusPluginField(
-        identifier=JanusHandleType.PUBLISHER,
-        plugin_class="apps.meetings.services.janus.NativeJanusIdVideoRoomPlugin",
-        identifier_getter="apps.meetings.services.janus.participant_media_handle_identifier",
-        plugin_attr="handle",
-        callback_factory="core.hooks.janus.plugin_callback_factory",
-        janus_getter="apps.meetings.services.janus.resolve_janus_session",
-        plugin_kwargs_factory="apps.meetings.services.janus.participant_media_plugin_kwargs",
+    janus_session_id = models.PositiveBigIntegerField(blank=True, null=True)
+    # Diagnostic Janus handle identifier. Live plugin objects are owned by the
+    # process-local JRTC registry and are never materialized by the ORM.
+    janus_handle_id = models.PositiveBigIntegerField(blank=True, null=True)
+    # Process/pod identity that owns the corresponding live registry binding.
+    # A persisted owner is correlation metadata, not proof that a handle lives.
+    runtime_owner_id = models.CharField(
+        max_length=255,
         blank=True,
         null=True,
         db_index=True,
+    )
+    # Short-lived persistence fence for one resolve/attach attempt.  Domain
+    # lifecycle events are allowed to update ``lifecycle_state`` while this
+    # claim is active, so the two concerns must not share one column.
+    runtime_claim_id = models.UUIDField(
+        blank=True,
+        null=True,
+        editable=False,
+        default=None,
     )
     # Opaque identifier sent to Janus and echoed back for correlating logs or client requests.
     opaque_id = models.CharField(max_length=255, blank=True, null=True)
@@ -872,6 +897,10 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
         indexes = [
             models.Index(fields=("participant", "handle_type"), name="meet_mh_part_type_idx"),
             models.Index(fields=("janus_handle_id",), name="meet_mh_jhandle_idx"),
+            models.Index(
+                fields=("janus_session_id", "janus_handle_id"),
+                name="meet_mh_jsess_jhandle_idx",
+            ),
             models.Index(fields=("lifecycle_state",), name="meet_mh_state_idx"),
         ]
 
@@ -905,7 +934,7 @@ class ParticipantStream(UUIDTimestampedModel):
     # Janus MID uniquely identifying the stream inside SDP and Janus events.
     janus_mid = models.CharField(max_length=64)
     # Janus publisher feed identifier associated with the stream when applicable.
-    janus_feed_id = models.IntegerField(blank=True, null=True)
+    janus_feed_id = models.PositiveBigIntegerField(blank=True, null=True)
     # Source MID used by Janus for subscriber-side feed mapping.
     janus_feed_mid = models.CharField(max_length=64, blank=True, null=True)
     # Codec currently negotiated for the stream when known.
@@ -1023,3 +1052,84 @@ class MeetingEvent(UUIDTimestampedModel):
         """Return a readable event label for diagnostics and admin screens."""
 
         return f"{self.event_type} for {self.session}"
+
+
+class JrtcEventReceipt(UUIDTimestampedModel):
+    """Durably admit one broker envelope before applying idempotent side effects.
+
+    Consumers must create this row in the same database transaction as their
+    domain mutations. The unique broker ``event_id`` turns redelivery into a
+    harmless uniqueness conflict rather than a second set of side effects.
+    """
+
+    event_id = models.UUIDField(unique=True, editable=False)
+    event_type = models.CharField(max_length=128)
+    status = models.CharField(
+        max_length=16,
+        choices=JrtcEventReceiptStatus.choices,
+        default=JrtcEventReceiptStatus.RECEIVED,
+    )
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(blank=True, null=True)
+    delivery_attempts = models.PositiveIntegerField(default=1)
+    duplicate_count = models.PositiveBigIntegerField(default=0)
+    last_error = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        """Support operational scans without high-cardinality index labels."""
+
+        ordering = ("received_at",)
+        indexes = [
+            models.Index(
+                fields=("status", "received_at"),
+                name="meet_jrtc_receipt_status_idx",
+            ),
+            models.Index(
+                fields=("event_type", "received_at"),
+                name="meet_jrtc_receipt_type_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        """Return a concise broker receipt label for diagnostics."""
+
+        return f"{self.event_type}:{self.event_id} ({self.status})"
+
+
+class JrtcBrowserEventOutbox(UUIDTimestampedModel):
+    """Durable, at-least-once Socket.IO forwarding derived from one event."""
+
+    receipt = models.ForeignKey(
+        JrtcEventReceipt,
+        on_delete=models.CASCADE,
+        related_name="browser_outbox",
+    )
+    dispatch_index = models.PositiveIntegerField()
+    socket_id = models.CharField(max_length=255)
+    payload = models.JSONField(default=dict)
+    status = models.CharField(
+        max_length=16,
+        choices=JrtcBrowserOutboxStatus.choices,
+        default=JrtcBrowserOutboxStatus.PENDING,
+    )
+    delivery_attempts = models.PositiveIntegerField(default=0)
+    delivered_at = models.DateTimeField(blank=True, null=True)
+    last_error = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        """Fence duplicate targets and support pending-delivery scans."""
+
+        ordering = ("created_at", "dispatch_index")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("receipt", "dispatch_index", "socket_id"),
+                name="meet_jrtc_outbox_target_uniq",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=("status", "created_at"),
+                name="meet_jrtc_outbox_status_idx",
+            )
+        ]

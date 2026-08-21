@@ -746,6 +746,7 @@ class MeetingLifecycleService:
         """Remove a participant from a live session and schedule downstream cleanup."""
 
         MeetingPermissionService.require_session_permission(session=session, profile_or_user=actor_profile, permission_field="can_manage_participants")
+        cleanup_snapshot: dict[str, object]
         with transaction.atomic():
             participant.mark_left(status=ParticipantStatus.REMOVED)
             participant.save()
@@ -759,6 +760,17 @@ class MeetingLifecycleService:
                 actor_participant=participant,
                 payload={"participant_id": str(participant.pk), "reason": reason},
             )
+            from apps.meetings.tasks import build_participant_media_cleanup_snapshot
+
+            cleanup_handles = list(
+                ParticipantMediaHandle.objects.select_for_update(of=("self",))
+                .filter(participant=participant)
+                .order_by("pk")
+            )
+            cleanup_snapshot = build_participant_media_cleanup_snapshot(
+                participant,
+                media_handles=cleanup_handles,
+            )
             MeetingLifecycleService.refresh_session_metrics(session=session)
 
         def emit_updates() -> None:
@@ -767,7 +779,11 @@ class MeetingLifecycleService:
             from apps.meetings.realtime.emitter import MeetingSocketEmitter
             from apps.meetings.tasks import detach_participant_media_handles
 
-            dispatch_task(detach_participant_media_handles, str(participant.pk))
+            dispatch_task(
+                detach_participant_media_handles,
+                str(participant.pk),
+                cleanup_snapshot,
+            )
             MeetingSocketEmitter.emit_participant_removed(session=session, participant=participant, reason=reason)
             MeetingSocketEmitter.emit_session_state(session=session)
 
@@ -785,6 +801,7 @@ class MeetingLifecycleService:
         """Persist an intentional departure instead of waiting for heartbeat expiry."""
 
         participant = None
+        cleanup_snapshot: dict[str, object] | None = None
         with transaction.atomic():
             session = MeetingSession.objects.select_for_update().get(pk=session.pk)
             connection = None
@@ -826,6 +843,17 @@ class MeetingLifecycleService:
                     actor_participant=participant,
                     payload={"participant_id": str(participant.pk), "reason": reason},
                 )
+                from apps.meetings.tasks import build_participant_media_cleanup_snapshot
+
+                cleanup_handles = list(
+                    ParticipantMediaHandle.objects.select_for_update(of=("self",))
+                    .filter(participant=participant)
+                    .order_by("pk")
+                )
+                cleanup_snapshot = build_participant_media_cleanup_snapshot(
+                    participant,
+                    media_handles=cleanup_handles,
+                )
             elif connection:
                 connection.session = None
                 connection.participant = None
@@ -848,7 +876,11 @@ class MeetingLifecycleService:
             if changed and participant is not None:
                 from apps.meetings.tasks import detach_participant_media_handles
 
-                dispatch_task(detach_participant_media_handles, str(participant.pk))
+                dispatch_task(
+                    detach_participant_media_handles,
+                    str(participant.pk),
+                    cleanup_snapshot,
+                )
             MeetingSocketEmitter.emit_session_state(session=session)
 
         transaction.on_commit(emit_updates)
@@ -967,15 +999,22 @@ class MeetingLifecycleService:
 
     @staticmethod
     def mark_connection_heartbeat(*, socket_id: str) -> ParticipantConnection | None:
-        """Refresh heartbeat timestamps for an active realtime connection."""
+        """Refresh an active generation without resurrecting a superseded socket."""
 
-        connection = ParticipantConnection.objects.filter(socket_id=socket_id).select_related("participant").first()
-        if not connection:
-            return None
-        connection.mark_heartbeat()
-        connection.save()
+        now = timezone.now()
+        updated = ParticipantConnection.objects.filter(
+            socket_id=socket_id,
+            status__in=ACTIVE_CONNECTION_STATUSES,
+        ).update(last_heartbeat_at=now, updated_at=now)
+        connection = (
+            ParticipantConnection.objects.filter(socket_id=socket_id)
+            .select_related("participant")
+            .first()
+        )
+        if not connection or not updated:
+            return connection
         if connection.participant:
-            connection.participant.last_seen_at = timezone.now()
+            connection.participant.last_seen_at = now
             connection.participant.save(update_fields=["last_seen_at", "updated_at"])
         return connection
 
@@ -983,13 +1022,36 @@ class MeetingLifecycleService:
     def mark_connection_disconnected(*, socket_id: str) -> ParticipantConnection | None:
         """Mark a realtime connection as disconnected and degrade participant presence when necessary."""
 
-        connection = ParticipantConnection.objects.select_related("participant", "session").filter(socket_id=socket_id).first()
-        if not connection:
+        connection_reference = ParticipantConnection.objects.filter(
+            socket_id=socket_id
+        ).only("pk").first()
+        if connection_reference is None:
             return None
+        media_handles_to_release: list[ParticipantMediaHandle] = []
         with transaction.atomic():
+            # Media command paths lock handle rows before their connection row.
+            # Use the same order here to avoid a PostgreSQL command/disconnect
+            # deadlock, then perform network cleanup only after commit.
+            media_handles_to_release = list(
+                ParticipantMediaHandle.objects.select_for_update(of=("self",))
+                .filter(connection_id=connection_reference.pk)
+                .select_related("participant")
+                .order_by("pk")
+            )
+            connection = (
+                ParticipantConnection.objects.select_for_update(of=("self",))
+                .select_related("participant", "session")
+                .filter(pk=connection_reference.pk, socket_id=socket_id)
+                .first()
+            )
+            if not connection:
+                return None
             connection.mark_disconnected()
             connection.save()
             if connection.participant:
+                # Snapshot the exact locally-owned handle generation while the
+                # socket and handle rows are locked. Network detach happens
+                # only after this transaction commits.
                 still_active = connection.participant.connections.exclude(socket_id=socket_id).filter(
                     status__in=[RealtimeConnectionStatus.CONNECTED, RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
                 ).exists()
@@ -1002,6 +1064,17 @@ class MeetingLifecycleService:
                 session = connection.session
             else:
                 session = None
+        if media_handles_to_release:
+            from apps.meetings.services.janus import (
+                release_disconnected_participant_media_plugins,
+            )
+
+            release_disconnected_participant_media_plugins(media_handles_to_release)
+        from apps.meetings.services.janus import (
+            release_local_media_plugins_for_connection,
+        )
+
+        release_local_media_plugins_for_connection(connection.pk)
         if session:
             from apps.meetings.realtime.emitter import MeetingSocketEmitter
 

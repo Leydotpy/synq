@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
@@ -14,6 +14,8 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from apps.meetings.exceptions import JanusGatewayError
+from apps.meetings.jrtc.errors import JrtcHandleOwnershipError
+from apps.meetings.jrtc.handles import BoundVideoRoomHandle, HandleResolution
 from apps.meetings.models import (
     JanusHandleLifecycleState,
     JanusHandleType,
@@ -28,8 +30,13 @@ from apps.meetings.models import (
     ParticipantStatus,
     RealtimeConnectionStatus,
 )
-from apps.meetings.services.janus import build_room_payload
+from apps.meetings.services.janus import (
+    build_room_payload,
+    ensure_participant_media_plugin,
+    janus_runtime,
+)
 from apps.meetings.services.lifecycle import MeetingLifecycleService
+from apps.meetings.services.signaling import _get_or_create_media_handle
 from apps.meetings.tasks import (
     attach_participant_media_handles,
     detach_participant_media_handles,
@@ -68,6 +75,285 @@ class MeetingLifecycleHardeningTests(TestCase):
             started_by_profile=profile,
         )
         return profile, room, session
+
+    def test_active_unrelated_connection_cannot_steal_media_ownership(self):
+        profile, _room, session = self.make_session("media-owner-fence")
+        participant = session.participants.get(profile=profile)
+        old_connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-owner-old",
+            client_session_key="browser-old",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        new_connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-owner-new",
+            client_session_key="browser-new",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        media_handle = ParticipantMediaHandle.objects.create(
+            participant=participant,
+            connection=old_connection,
+            handle_type=JanusHandleType.PUBLISHER,
+            janus_session_id=101,
+            janus_handle_id=201,
+            runtime_owner_id="runtime-old",
+        )
+
+        with self.assertRaises(JrtcHandleOwnershipError):
+            _get_or_create_media_handle(
+                participant=participant,
+                handle_type=JanusHandleType.PUBLISHER,
+                connection=new_connection,
+                allow_ownership_handoff=True,
+            )
+
+        media_handle.refresh_from_db()
+        self.assertEqual(media_handle.connection_id, old_connection.pk)
+        self.assertEqual(media_handle.janus_handle_id, 201)
+        self.assertEqual(media_handle.runtime_owner_id, "runtime-old")
+
+    def test_same_client_generation_explicitly_releases_stale_media_claim(self):
+        profile, _room, session = self.make_session("media-owner-recovery")
+        participant = session.participants.get(profile=profile)
+        participant.janus_publisher_id = 301
+        participant.janus_private_id = 401
+        participant.save(
+            update_fields=["janus_publisher_id", "janus_private_id", "updated_at"]
+        )
+        old_connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-recovery-old",
+            client_session_key="browser-generation",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        new_connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-recovery-new",
+            client_session_key="browser-generation",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        ParticipantMediaHandle.objects.create(
+            participant=participant,
+            connection=old_connection,
+            handle_type=JanusHandleType.PUBLISHER,
+            janus_session_id=101,
+            janus_handle_id=201,
+            runtime_owner_id="runtime-old",
+            selected_streams=[{"feed": "301"}],
+            janus_state={"janus": "event"},
+        )
+
+        with patch(
+            "apps.meetings.services.signaling.participant_media_plugin_is_locally_owned",
+            return_value=True,
+        ), patch(
+            "apps.meetings.services.signaling.release_unclaimed_local_participant_media_plugin",
+            return_value=True,
+        ) as release_local:
+            media_handle = _get_or_create_media_handle(
+                participant=participant,
+                handle_type=JanusHandleType.PUBLISHER,
+                connection=new_connection,
+                allow_ownership_handoff=True,
+            )
+
+        old_connection.refresh_from_db()
+        participant.refresh_from_db()
+        self.assertEqual(old_connection.status, RealtimeConnectionStatus.DISCONNECTED)
+        self.assertEqual(media_handle.connection_id, new_connection.pk)
+        self.assertIsNone(media_handle.janus_session_id)
+        self.assertIsNone(media_handle.janus_handle_id)
+        self.assertIsNone(media_handle.runtime_owner_id)
+        self.assertEqual(media_handle.selected_streams, [])
+        self.assertEqual(media_handle.janus_state, {})
+        self.assertIsNone(participant.janus_publisher_id)
+        self.assertIsNone(participant.janus_private_id)
+        release_local.assert_called_once()
+
+        with self.assertRaises(JrtcHandleOwnershipError):
+            _get_or_create_media_handle(
+                participant=participant,
+                handle_type=JanusHandleType.PUBLISHER,
+                connection=old_connection,
+                allow_ownership_handoff=True,
+            )
+        media_handle.refresh_from_db()
+        self.assertEqual(media_handle.connection_id, new_connection.pk)
+
+    def test_continuity_command_never_hands_off_an_inactive_foreign_handle(self):
+        profile, _room, session = self.make_session("media-continuity-fence")
+        participant = session.participants.get(profile=profile)
+        old_connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-continuity-old",
+            status=RealtimeConnectionStatus.DISCONNECTED,
+        )
+        new_connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-continuity-new",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        media_handle = ParticipantMediaHandle.objects.create(
+            participant=participant,
+            connection=old_connection,
+            handle_type=JanusHandleType.SUBSCRIBER,
+            janus_session_id=101,
+            janus_handle_id=201,
+            runtime_owner_id="runtime-old",
+        )
+
+        with self.assertRaises(JrtcHandleOwnershipError):
+            _get_or_create_media_handle(
+                participant=participant,
+                handle_type=JanusHandleType.SUBSCRIBER,
+                connection=new_connection,
+                allow_ownership_handoff=False,
+            )
+
+        media_handle.refresh_from_db()
+        self.assertEqual(media_handle.connection_id, old_connection.pk)
+        self.assertEqual(media_handle.janus_handle_id, 201)
+
+    def test_ownerless_detaching_sentinel_is_recoverable_on_retry(self):
+        profile, _room, session = self.make_session("media-handoff-retry")
+        participant = session.participants.get(profile=profile)
+        connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-handoff-retry-socket",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        ParticipantMediaHandle.objects.create(
+            participant=participant,
+            connection=connection,
+            handle_type=JanusHandleType.SUBSCRIBER,
+            lifecycle_state=JanusHandleLifecycleState.DETACHING,
+            janus_session_id=None,
+            janus_handle_id=None,
+            runtime_owner_id=None,
+        )
+
+        with patch(
+            "apps.meetings.services.signaling.release_unclaimed_local_participant_media_plugin",
+            return_value=False,
+        ) as cleanup:
+            media_handle = _get_or_create_media_handle(
+                participant=participant,
+                handle_type=JanusHandleType.SUBSCRIBER,
+                connection=connection,
+            )
+
+        self.assertEqual(
+            media_handle.lifecycle_state,
+            JanusHandleLifecycleState.ATTACHING,
+        )
+        cleanup.assert_called_once()
+
+    def test_disconnected_generation_cannot_be_resurrected_by_heartbeat(self):
+        profile, _room, session = self.make_session("media-heartbeat-fence")
+        participant = session.participants.get(profile=profile)
+        connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-heartbeat-disconnected",
+            status=RealtimeConnectionStatus.DISCONNECTED,
+            disconnected_at=timezone.now(),
+        )
+        previous_heartbeat = connection.last_heartbeat_at
+
+        returned = MeetingLifecycleService.mark_connection_heartbeat(
+            socket_id=connection.socket_id
+        )
+
+        connection.refresh_from_db()
+        self.assertEqual(connection.status, RealtimeConnectionStatus.DISCONNECTED)
+        self.assertEqual(connection.last_heartbeat_at, previous_heartbeat)
+        self.assertEqual(returned.status, RealtimeConnectionStatus.DISCONNECTED)
+
+    def test_failed_finalize_releases_claim_and_detaches_exact_new_binding(self):
+        profile, _room, session = self.make_session("media-claim-compensation")
+        participant = session.participants.get(profile=profile)
+        connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="media-claim-compensation-socket",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        media_handle = ParticipantMediaHandle.objects.create(
+            participant=participant,
+            connection=connection,
+            handle_type=JanusHandleType.PUBLISHER,
+            lifecycle_state=JanusHandleLifecycleState.READY,
+        )
+        binding = BoundVideoRoomHandle(
+            model_id=str(media_handle.pk),
+            session_id=101,
+            handle_id=201,
+            plugin=Mock(),
+            owner_id="runtime-test",
+        )
+        resolution = HandleResolution(
+            binding=binding,
+            recreated=True,
+            replaced_stale=False,
+        )
+        resolve_marker = object()
+        detach_marker = object()
+        resolve_call = Mock(return_value=resolve_marker)
+        detach_call = Mock(return_value=detach_marker)
+
+        with (
+            patch.object(janus_runtime, "reset_after_fork"),
+            patch.object(janus_runtime, "_state", janus_runtime.RUNNING),
+            patch.object(janus_runtime, "_owner_id", "runtime-test"),
+            patch.object(
+                janus_runtime.adapter,
+                "resolve_handle",
+                new=resolve_call,
+            ),
+            patch.object(
+                janus_runtime.registry,
+                "detach",
+                new=detach_call,
+            ),
+            patch.object(
+                janus_runtime,
+                "run",
+                side_effect=[resolution, None],
+            ),
+            patch(
+                "apps.meetings.services.lifecycle.record_session_event",
+                side_effect=RuntimeError("event persistence failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "event persistence failed"),
+        ):
+            ensure_participant_media_plugin(media_handle, recreate=True)
+
+        media_handle.refresh_from_db()
+        self.assertIsNone(media_handle.runtime_owner_id)
+        self.assertIsNone(media_handle.janus_session_id)
+        self.assertIsNone(media_handle.janus_handle_id)
+        self.assertEqual(
+            media_handle.lifecycle_state,
+            JanusHandleLifecycleState.READY,
+        )
+        detach_call.assert_called_once_with(str(media_handle.pk), expected=binding)
 
     @override_settings(MEETING_CONNECTION_STALE_SECONDS=90)
     def test_stale_sweep_cas_does_not_overwrite_racing_heartbeat(self):
@@ -319,13 +605,13 @@ class MeetingLifecycleHardeningTests(TestCase):
             ).exists(),
         )
 
-    def _create_foreign_handles(self, *, handle: str, publisher_id: str):
+    def _create_foreign_handles(self, *, handle: str, publisher_id: int | None):
         """Create stale cross-process handles carrying state that must be erased."""
 
         profile, _room, session = self.make_session(handle)
         participant = session.participants.get(profile=profile)
         participant.janus_publisher_id = publisher_id
-        participant.janus_private_id = "private-77"
+        participant.janus_private_id = 77
         participant.save(
             update_fields=["janus_publisher_id", "janus_private_id", "updated_at"],
         )
@@ -337,8 +623,9 @@ class MeetingLifecycleHardeningTests(TestCase):
                 participant=participant,
                 handle_type=handle_type,
                 lifecycle_state=JanusHandleLifecycleState.READY,
-                janus_session_id="foreign-process-session",
-                janus_handle_id=f"foreign-handle-{handle}-{index}",
+                janus_session_id=10_000 + index,
+                janus_handle_id=20_000 + index,
+                runtime_owner_id="foreign-runtime-owner",
                 selected_streams=[{"feed": "remote-feed"}],
                 janus_state={"private": "legacy-state"},
             )
@@ -356,12 +643,13 @@ class MeetingLifecycleHardeningTests(TestCase):
         """Assert cleanup removed every non-portable reference and stream row."""
 
         participant.refresh_from_db()
-        self.assertEqual(participant.janus_publisher_id, "")
-        self.assertEqual(participant.janus_private_id, "")
+        self.assertIsNone(participant.janus_publisher_id)
+        self.assertIsNone(participant.janus_private_id)
         for media_handle in handles:
             media_handle.refresh_from_db()
             self.assertIsNone(media_handle.janus_handle_id)
-            self.assertEqual(media_handle.janus_session_id, "")
+            self.assertIsNone(media_handle.janus_session_id)
+            self.assertIsNone(media_handle.runtime_owner_id)
             self.assertEqual(media_handle.selected_streams, [])
             self.assertEqual(media_handle.janus_state, {})
             self.assertEqual(
@@ -375,11 +663,10 @@ class MeetingLifecycleHardeningTests(TestCase):
 
         _session, participant, handles = self._create_foreign_handles(
             handle="foreign-kick-host",
-            publisher_id="publisher-42",
+            publisher_id=42,
         )
 
         with (
-            patch("apps.meetings.tasks.resolve_owned_janus_session", return_value=None),
             patch(
                 "apps.meetings.tasks.call_video_room_management_method",
                 return_value=SimpleNamespace(videoroom="success"),
@@ -393,22 +680,21 @@ class MeetingLifecycleHardeningTests(TestCase):
 
         kick.assert_called_once()
         self.assertEqual(kick.call_args.args[1], "kick")
-        self.assertEqual(kick.call_args.args[2].id, "publisher-42")
+        self.assertEqual(kick.call_args.args[2].id, 42)
         self._assert_foreign_handles_cleared(
             participant=participant,
             handles=handles,
         )
 
     def test_numeric_publisher_id_is_kicked_with_its_native_json_type(self):
-        """Decimal IDs persisted in text fields return to Janus as integers."""
+        """Publisher IDs remain native integers across the management boundary."""
 
         _session, participant, handles = self._create_foreign_handles(
             handle="numeric-kick-host",
-            publisher_id="927",
+            publisher_id=927,
         )
 
         with (
-            patch("apps.meetings.tasks.resolve_owned_janus_session", return_value=None),
             patch(
                 "apps.meetings.tasks.call_video_room_management_method",
                 return_value=SimpleNamespace(videoroom="success"),
@@ -434,14 +720,49 @@ class MeetingLifecycleHardeningTests(TestCase):
 
         _session, participant, handles = self._create_foreign_handles(
             handle="foreign-absent-host",
-            publisher_id="",
+            publisher_id=None,
         )
 
         with (
-            patch("apps.meetings.tasks.resolve_owned_janus_session", return_value=None),
             patch(
                 "apps.meetings.tasks._video_room_participants",
                 return_value=([], {"videoroom": "participants"}),
+            ) as list_participants,
+            patch(
+                "apps.meetings.tasks.call_video_room_management_method",
+            ) as kick,
+            patch(
+                "apps.meetings.tasks.MeetingLifecycleService.refresh_session_metrics",
+            ),
+            patch("apps.meetings.tasks.MeetingSocketEmitter.emit_session_state"),
+        ):
+            detach_participant_media_handles.run(str(participant.pk))
+
+        list_participants.assert_called_once()
+        kick.assert_not_called()
+        self._assert_foreign_handles_cleared(
+            participant=participant,
+            handles=handles,
+        )
+
+    def test_remote_metadata_without_publisher_id_is_tolerated(self):
+        """A partial management row cannot revive an unusable publisher ID."""
+
+        _session, participant, handles = self._create_foreign_handles(
+            handle="foreign-partial-host",
+            publisher_id=None,
+        )
+        remote_participant = {
+            "metadata": {"participant_id": str(participant.pk)},
+        }
+
+        with (
+            patch(
+                "apps.meetings.tasks._video_room_participants",
+                return_value=(
+                    [remote_participant],
+                    {"videoroom": "participants"},
+                ),
             ) as list_participants,
             patch(
                 "apps.meetings.tasks.call_video_room_management_method",

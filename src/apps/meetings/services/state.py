@@ -5,6 +5,7 @@ from __future__ import annotations
 from django.db.models import Prefetch, Q
 from django.utils import timezone
 
+from apps.meetings.jrtc.ids import optional_janus_id_to_wire
 from apps.meetings.models import (
     MeetingJoinRequest,
     MeetingJoinRequestStatus,
@@ -34,6 +35,23 @@ PRIVATE_SESSION_METADATA_KEYS = {
     "source",
     "tenant_id",
 }
+
+
+def _serialize_janus_id(value: object) -> str | None:
+    """Return a positive Janus identifier as a browser-safe decimal string.
+
+    Persisted domain fields are integers. The narrow numeric-string branch is
+    retained only for legacy JSON snapshots already stored in ``janus_state``;
+    named identifiers, booleans, zero, and negative values are not exposed.
+    """
+
+    if isinstance(value, str) and value.strip().isdecimal():
+        numeric_value = int(value.strip())
+        return str(numeric_value) if numeric_value > 0 else None
+    try:
+        return optional_janus_id_to_wire(value)
+    except TypeError:
+        return None
 
 
 class MeetingStateBuilder:
@@ -194,7 +212,7 @@ class MeetingStateBuilder:
             "id": str(session.pk),
             "started_by_profile": MeetingStateBuilder.serialize_profile_summary(session.started_by_profile),
             "lifecycle_state": session.lifecycle_state,
-            "janus_room_id": session.janus_room_id,
+            "janus_room_id": _serialize_janus_id(session.janus_room_id),
             "state_version": session.state_version,
             "started_at": session.started_at.isoformat() if session.started_at else None,
             "ended_at": session.ended_at.isoformat() if session.ended_at else None,
@@ -255,7 +273,9 @@ class MeetingStateBuilder:
             "is_muted": participant.is_muted,
             "is_camera_blocked": participant.is_camera_blocked,
             "raised_hand_at": participant.raised_hand_at.isoformat() if participant.raised_hand_at else None,
-            "janus_publisher_id": participant.janus_publisher_id,
+            "janus_publisher_id": _serialize_janus_id(
+                participant.janus_publisher_id,
+            ),
             "joined_at": participant.joined_at.isoformat() if participant.joined_at else None,
             "left_at": participant.left_at.isoformat() if participant.left_at else None,
             "last_seen_at": participant.last_seen_at.isoformat() if participant.last_seen_at else None,
@@ -283,7 +303,9 @@ class MeetingStateBuilder:
                             "direction": stream.direction,
                             "media_kind": stream.media_kind,
                             "janus_mid": stream.janus_mid,
-                            "janus_feed_id": stream.janus_feed_id,
+                            "janus_feed_id": _serialize_janus_id(
+                                stream.janus_feed_id,
+                            ),
                             "janus_feed_mid": stream.janus_feed_mid,
                             "codec": stream.codec,
                             "is_active": stream.is_active,
@@ -348,14 +370,16 @@ class MeetingStateBuilder:
                             if key in raw_stream
                         },
                     )
-            participants.append(
-                {
-                    key: raw_participant.get(key)
-                    for key in ("id", "display", "publisher", "talking")
-                    if key in raw_participant
-                }
-                | {"streams": streams},
-            )
+            participant_payload = {
+                key: raw_participant.get(key)
+                for key in ("display", "publisher", "talking")
+                if key in raw_participant
+            }
+            if "id" in raw_participant:
+                participant_payload["id"] = _serialize_janus_id(
+                    raw_participant.get("id"),
+                )
+            participants.append(participant_payload | {"streams": streams})
         return {"participants": participants}
 
     @staticmethod

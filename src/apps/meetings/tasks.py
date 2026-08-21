@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 
 from celery import shared_task
@@ -11,13 +12,14 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
-from janus_videoroom_plugin import (
+from jrtc_video import (
     VideoRoomCreateRequest,
     VideoRoomDestroyRequest,
     VideoRoomKickRequest,
 )
 
 from apps.meetings.exceptions import JanusGatewayError
+from apps.meetings.jrtc.ids import require_janus_id
 from apps.meetings.models import (
     JanusHandleLifecycleState,
     JanusHandleType,
@@ -37,11 +39,8 @@ from apps.meetings.models import (
 from apps.meetings.realtime.emitter import MeetingSocketEmitter
 from apps.meetings.services.janus import (
     build_room_payload,
-    call_plugin_method,
     call_video_room_management_method,
-    coerce_janus_id,
     janus_room_id_for_session,
-    resolve_owned_janus_session,
     serialize_janus_response,
     video_room_reply_data,
 )
@@ -53,6 +52,114 @@ from apps.meetings.services.lifecycle import (
 from apps.meetings.services.signaling import MeetingMediaSignalService
 
 logger = logging.getLogger(__name__)
+
+
+def _require_positive_janus_id(value: object, *, kind: str) -> int:
+    """Validate the strict positive-integer identifier required by JRTC."""
+
+    try:
+        return require_janus_id(value, name=kind)
+    except TypeError as exc:
+        raise JanusGatewayError(f"A {kind} must be a positive integer.") from exc
+
+
+def build_participant_media_cleanup_snapshot(
+    participant: Participant,
+    *,
+    media_handles: Sequence[ParticipantMediaHandle] | None = None,
+) -> dict[str, object]:
+    """Serialize the exact participant/handle generation a cleanup may mutate."""
+
+    handles = list(
+        media_handles
+        if media_handles is not None
+        else participant.media_handles.order_by("pk")
+    )
+    return {
+        "participant_status": str(participant.status),
+        "janus_publisher_id": participant.janus_publisher_id,
+        "janus_private_id": participant.janus_private_id,
+        "handles": [
+            {
+                "id": str(handle.pk),
+                "handle_type": str(handle.handle_type),
+                "connection_id": (
+                    None if handle.connection_id is None else str(handle.connection_id)
+                ),
+                "janus_session_id": handle.janus_session_id,
+                "janus_handle_id": handle.janus_handle_id,
+                "runtime_owner_id": handle.runtime_owner_id,
+                "runtime_claim_id": (
+                    None
+                    if handle.runtime_claim_id is None
+                    else str(handle.runtime_claim_id)
+                ),
+            }
+            for handle in handles
+        ],
+    }
+
+
+def _media_cleanup_snapshot_matches(
+    participant: Participant,
+    media_handles: Sequence[ParticipantMediaHandle],
+    snapshot: Mapping[str, object],
+) -> bool:
+    """Return whether current rows still equal a queued cleanup generation."""
+
+    if (
+        str(participant.status) != str(snapshot.get("participant_status") or "")
+        or participant.janus_publisher_id != snapshot.get("janus_publisher_id")
+        or participant.janus_private_id != snapshot.get("janus_private_id")
+    ):
+        return False
+    raw_handles = snapshot.get("handles")
+    if not isinstance(raw_handles, list):
+        return False
+    expected = {
+        str(item.get("id")): item
+        for item in raw_handles
+        if isinstance(item, Mapping) and item.get("id")
+    }
+    if len(expected) != len(raw_handles) or len(media_handles) != len(expected):
+        return False
+    for handle in media_handles:
+        item = expected.get(str(handle.pk))
+        if item is None or (
+            str(handle.handle_type) != str(item.get("handle_type") or "")
+            or (
+                None if handle.connection_id is None else str(handle.connection_id)
+            )
+            != item.get("connection_id")
+            or handle.janus_session_id != item.get("janus_session_id")
+            or handle.janus_handle_id != item.get("janus_handle_id")
+            or handle.runtime_owner_id != item.get("runtime_owner_id")
+            or (
+                None
+                if handle.runtime_claim_id is None
+                else str(handle.runtime_claim_id)
+            )
+            != item.get("runtime_claim_id")
+        ):
+            return False
+    return True
+
+
+def _load_matching_media_cleanup_generation(
+    participant_id: str,
+    snapshot: Mapping[str, object],
+) -> tuple[Participant, list[ParticipantMediaHandle]] | None:
+    """Read and validate a cleanup generation without retaining stale objects."""
+
+    participant = Participant.objects.select_related("session").filter(
+        pk=participant_id
+    ).first()
+    if participant is None:
+        return None
+    media_handles = list(participant.media_handles.order_by("pk"))
+    if not _media_cleanup_snapshot_matches(participant, media_handles, snapshot):
+        return None
+    return participant, media_handles
 
 
 @shared_task(
@@ -242,11 +349,15 @@ def queue_due_meeting_invitation_emails() -> int:
 
 def _video_room_exists(
     session: MeetingSession,
-    room_id: int | str,
+    room_id: int,
 ) -> tuple[bool | None, object]:
     """Return whether Janus currently reports the configured room."""
 
-    response = call_video_room_management_method(session, "exists", room_id)
+    response = call_video_room_management_method(
+        session,
+        "exists",
+        _require_positive_janus_id(room_id, kind="Janus room ID"),
+    )
     data = video_room_reply_data(response)
     if isinstance(data, dict):
         exists = data.get("exists")
@@ -263,7 +374,10 @@ def _video_room_participants(
     response = call_video_room_management_method(
         session,
         "list_participants",
-        janus_room_id_for_session(session),
+        _require_positive_janus_id(
+            janus_room_id_for_session(session),
+            kind="Janus room ID",
+        ),
     )
     data = video_room_reply_data(response)
     if isinstance(data, dict):
@@ -316,6 +430,10 @@ def provision_janus_room_for_session(self, session_id: str) -> dict:
     session.updated_at = lease_time
 
     payload = build_room_payload(session)
+    payload["room"] = _require_positive_janus_id(
+        payload.get("room"),
+        kind="Janus room ID",
+    )
     request = VideoRoomCreateRequest(**payload)
     reconciled_existing_room = False
     try:
@@ -329,8 +447,15 @@ def provision_janus_room_for_session(self, session_id: str) -> dict:
             raise create_error
         reconciled_existing_room = True
     plugin_data = video_room_reply_data(response)
-    room_id = str(getattr(plugin_data, "room", None) or request.room)
-    print(room_id)
+    returned_room_id = (
+        plugin_data.get("room")
+        if isinstance(plugin_data, dict)
+        else getattr(plugin_data, "room", None)
+    )
+    room_id = _require_positive_janus_id(
+        request.room if returned_room_id is None else returned_room_id,
+        kind="Janus room ID",
+    )
     serialized_response = serialize_janus_response(response)
     if reconciled_existing_room:
         serialized_response["reconciled_existing_room"] = True
@@ -491,75 +616,72 @@ def attach_participant_media_handles(self, participant_id: str) -> dict:
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_jitter=True, max_retries=5)
-def detach_participant_media_handles(self, participant_id: str) -> None:
-    """Detach locally owned handles and retain foreign-owned IDs as pending."""
+def detach_participant_media_handles(
+    self,
+    participant_id: str,
+    cleanup_snapshot: Mapping[str, object] | None = None,
+) -> None:
+    """Invalidate persisted handles without adopting them in a Celery process.
 
-    participant = Participant.objects.select_related("session").get(pk=participant_id)
-    media_handles = list(participant.media_handles.all())
-    local_session = resolve_owned_janus_session(participant)
-    local_session_id = str(local_session.id) if local_session is not None else ""
-    pending_remote_detach = False
-    pending_publisher_detach = False
-    pending_handles: list[ParticipantMediaHandle] = []
+    Live JRTC plugins belong to the ASGI process and registry that created
+    them. This task therefore uses the VideoRoom management plane to remove a
+    publisher when necessary, then clears only durable correlation metadata.
+    """
 
-    for handle in media_handles:
-        detached = not bool(handle.janus_handle_id)
-        if (
-            handle.janus_handle_id
-            and handle.janus_session_id
-            and str(handle.janus_session_id) == local_session_id
-        ):
-            # Materializing the stored bound handle is sufficient for detach;
-            # do not call the attachment helper during cleanup.
-            try:
-                call_plugin_method(handle.handle, "detach")
-                detached = True
-            except JanusGatewayError:
-                detached = False
-
-        if not detached:
-            pending_remote_detach = True
-            pending_handles.append(handle)
-            if handle.handle_type == JanusHandleType.PUBLISHER:
-                pending_publisher_detach = True
-            handle.lifecycle_state = JanusHandleLifecycleState.DETACHING
-            handle.last_event_at = timezone.now()
-            handle.save(
-                update_fields=[
-                    "lifecycle_state",
-                    "last_event_at",
-                    "updated_at",
-                ],
-            )
-            continue
-
-        handle.streams.all().delete()
-        handle.janus_handle_id = None
-        handle.janus_session_id = ""
-        handle.selected_streams = []
-        handle.janus_state = {}
-        handle.lifecycle_state = JanusHandleLifecycleState.DETACHED
-        handle.last_event_at = timezone.now()
-        handle.save(
-            update_fields=[
-                "janus_handle_id",
-                "janus_session_id",
-                "selected_streams",
-                "janus_state",
-                "lifecycle_state",
-                "last_event_at",
-                "updated_at",
-            ],
+    del self
+    participant = Participant.objects.select_related("session").filter(
+        pk=participant_id
+    ).first()
+    if participant is None:
+        return
+    media_handles = list(participant.media_handles.order_by("pk"))
+    if cleanup_snapshot is None:
+        cleanup_snapshot = build_participant_media_cleanup_snapshot(
+            participant,
+            media_handles=media_handles,
         )
-    publisher_removed = not pending_publisher_detach
-    if pending_publisher_detach:
-        janus_room_id = janus_room_id_for_session(participant.session)
+    elif not isinstance(cleanup_snapshot, Mapping):
+        logger.warning(
+            "Skipping participant media cleanup with a malformed generation snapshot",
+            extra={"participant_id": participant_id},
+        )
+        return
+    matched = _load_matching_media_cleanup_generation(
+        participant_id,
+        cleanup_snapshot,
+    )
+    if matched is None:
+        logger.info(
+            "Skipping superseded participant media cleanup generation",
+            extra={"participant_id": participant_id},
+        )
+        return
+    participant, media_handles = matched
+    publisher_cleanup_required = participant.janus_publisher_id is not None or any(
+        handle.handle_type == JanusHandleType.PUBLISHER
+        and any(
+            value is not None
+            for value in (
+                handle.janus_session_id,
+                handle.janus_handle_id,
+                handle.runtime_owner_id,
+            )
+        )
+        for handle in media_handles
+    )
+    publisher_removed = not publisher_cleanup_required
+
+    if publisher_cleanup_required:
+        janus_room_id = _require_positive_janus_id(
+            janus_room_id_for_session(participant.session),
+            kind="Janus room ID",
+        )
         publisher_id = (
-            coerce_janus_id(
+            _require_positive_janus_id(
                 participant.janus_publisher_id,
                 kind="Janus publisher ID",
             )
-            if participant.janus_publisher_id
+            if participant.janus_publisher_id is not None
             else None
         )
         if publisher_id is None:
@@ -569,17 +691,28 @@ def detach_participant_media_handles(self, participant_id: str) -> None:
                 if isinstance(metadata, dict) and str(metadata.get("participant_id")) == str(
                     participant.pk
                 ):
-                    remote_publisher_id = _participant_value(remote_participant, "id")
-                    if remote_publisher_id is not None and remote_publisher_id != "":
-                        publisher_id = coerce_janus_id(
+                    remote_publisher_id = _participant_value(
+                        remote_participant,
+                        "id",
+                    )
+                    if remote_publisher_id is not None:
+                        publisher_id = _require_positive_janus_id(
                             remote_publisher_id,
                             kind="Janus publisher ID",
                         )
-                    break
+                        break
             if participants is not None and publisher_id is None:
                 publisher_removed = True
 
         if publisher_id is not None:
+            if (
+                _load_matching_media_cleanup_generation(
+                    participant_id,
+                    cleanup_snapshot,
+                )
+                is None
+            ):
+                return
             try:
                 call_video_room_management_method(
                     participant.session,
@@ -598,46 +731,62 @@ def detach_participant_media_handles(self, participant_id: str) -> None:
                     raise kick_error
                 if participants is None:
                     raise kick_error
-                publisher_removed = all(
-                    str(_participant_value(item, "id") or "") != str(publisher_id)
-                    for item in participants
-                )
+                publisher_removed = True
+                for remote_participant in participants:
+                    remote_publisher_id = _participant_value(remote_participant, "id")
+                    if remote_publisher_id is None:
+                        continue
+                    if (
+                        _require_positive_janus_id(
+                            remote_publisher_id,
+                            kind="Janus publisher ID",
+                        )
+                        == publisher_id
+                    ):
+                        publisher_removed = False
+                        break
                 if not publisher_removed:
                     raise kick_error
         elif not publisher_removed:
             raise JanusGatewayError(
-                "Unable to identify the foreign-owned Janus publisher for removal."
+                "Unable to identify the process-owned Janus publisher for removal."
             )
 
-    if pending_handles and publisher_removed:
-        # Cross-process Janus handles cannot be reused safely. Once the
-        # publisher is confirmed absent from the room, clear every stale local
-        # reference so a later rejoin can attach fresh publisher/subscriber
-        # handles instead of remaining stuck in DETACHING.
-        detached_at = timezone.now()
-        for handle in pending_handles:
-            handle.streams.all().delete()
-            handle.janus_handle_id = None
-            handle.janus_session_id = ""
-            handle.selected_streams = []
-            handle.janus_state = {}
-            handle.lifecycle_state = JanusHandleLifecycleState.DETACHED
-            handle.last_event_at = detached_at
-            handle.save(
-                update_fields=[
-                    "janus_handle_id",
-                    "janus_session_id",
-                    "selected_streams",
-                    "janus_state",
-                    "lifecycle_state",
-                    "last_event_at",
-                    "updated_at",
-                ],
-            )
+    if not publisher_removed:
+        raise JanusGatewayError("The Janus publisher could not be removed.")
 
-    if not pending_remote_detach or publisher_removed:
-        participant.janus_publisher_id = ""
-        participant.janus_private_id = ""
+    detached_at = timezone.now()
+    with transaction.atomic():
+        media_handles = list(
+            ParticipantMediaHandle.objects.select_for_update(of=("self",))
+            .filter(participant_id=participant_id)
+            .order_by("pk")
+        )
+        participant = (
+            Participant.objects.select_for_update(of=("self",))
+            .select_related("session")
+            .get(pk=participant_id)
+        )
+        if not _media_cleanup_snapshot_matches(
+            participant,
+            media_handles,
+            cleanup_snapshot,
+        ):
+            return
+        ParticipantStream.objects.filter(media_handle__in=media_handles).delete()
+        ParticipantMediaHandle.objects.filter(pk__in=[item.pk for item in media_handles]).update(
+            janus_handle_id=None,
+            janus_session_id=None,
+            runtime_owner_id=None,
+            runtime_claim_id=None,
+            selected_streams=[],
+            janus_state={},
+            lifecycle_state=JanusHandleLifecycleState.DETACHED,
+            last_event_at=detached_at,
+            updated_at=detached_at,
+        )
+        participant.janus_publisher_id = None
+        participant.janus_private_id = None
         participant.save(
             update_fields=[
                 "janus_publisher_id",
@@ -712,7 +861,10 @@ def destroy_janus_room_for_session(
             "cleanup_request_id": cleanup_request_id,
         }
 
-    room_id = janus_room_id_for_session(session)
+    room_id = _require_positive_janus_id(
+        janus_room_id_for_session(session),
+        kind="Janus room ID",
+    )
     request = VideoRoomDestroyRequest(
         room=room_id,
         secret=session.janus_room_secret or None,
@@ -753,7 +905,9 @@ def destroy_janus_room_for_session(
         ).delete()
         ParticipantMediaHandle.objects.filter(participant__session=session).update(
             janus_handle_id=None,
-            janus_session_id="",
+            janus_session_id=None,
+            runtime_owner_id=None,
+            runtime_claim_id=None,
             selected_streams=[],
             janus_state={},
             lifecycle_state=JanusHandleLifecycleState.DETACHED,
@@ -761,8 +915,8 @@ def destroy_janus_room_for_session(
             updated_at=cleanup_time,
         )
         Participant.objects.filter(session=session).update(
-            janus_publisher_id="",
-            janus_private_id="",
+            janus_publisher_id=None,
+            janus_private_id=None,
             updated_at=cleanup_time,
         )
         session.control_handle_id = None
@@ -977,7 +1131,7 @@ def recover_stale_provisioning_sessions() -> int:
     candidates = list(
         MeetingSession.objects.filter(
             lifecycle_state=MeetingLifecycleState.PROVISIONING,
-            janus_room_id="",
+            janus_room_id__isnull=True,
             updated_at__lt=cutoff,
         ).values_list("pk", "updated_at"),
     )
@@ -986,7 +1140,7 @@ def recover_stale_provisioning_sessions() -> int:
         claimed = MeetingSession.objects.filter(
             pk=session_id,
             lifecycle_state=MeetingLifecycleState.PROVISIONING,
-            janus_room_id="",
+            janus_room_id__isnull=True,
             updated_at=previous_updated_at,
         ).update(updated_at=lease_time)
         if not claimed:
@@ -997,7 +1151,7 @@ def recover_stale_provisioning_sessions() -> int:
             MeetingSession.objects.filter(
                 pk=session_id,
                 lifecycle_state=MeetingLifecycleState.PROVISIONING,
-                janus_room_id="",
+                janus_room_id__isnull=True,
                 updated_at=lease_time,
             ).update(updated_at=previous_updated_at)
             continue
