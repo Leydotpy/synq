@@ -184,7 +184,9 @@ def send_meeting_invitation_email(
     try:
         with transaction.atomic():
             invitation = (
-                MeetingInvitation.objects.select_for_update()
+                # ``issuer_profile`` is nullable and therefore outer-joined.
+                # PostgreSQL must lock only the invitation row, not that join.
+                MeetingInvitation.objects.select_for_update(of=("self",))
                 .select_related(
                     "issuer_profile",
                     "session__room",

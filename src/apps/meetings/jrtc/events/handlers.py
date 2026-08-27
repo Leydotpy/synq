@@ -101,7 +101,11 @@ class DjangoJanusEventReconciler:
     def _correlated_handles(event: JanusBrokerEvent) -> list[Any]:
         from apps.meetings.models import ParticipantMediaHandle
 
-        queryset = ParticipantMediaHandle.objects.select_for_update().select_related(
+        # ``connection`` is nullable. Lock only correlated handle rows so
+        # PostgreSQL doesn't apply FOR UPDATE to the outer-joined connection.
+        queryset = ParticipantMediaHandle.objects.select_for_update(
+            of=("self",),
+        ).select_related(
             "connection",
             "participant__session",
             "participant__room",
@@ -308,7 +312,12 @@ class SocketIoJanusEventEmitter:
                     )
                 except Exception:
                     logger.exception(
-                        "Unable to emit a JRTC event to a participant socket"
+                        "Unable to emit a JRTC event to a participant socket",
+                        extra={
+                            "janus_event_type": dispatch.payload.get(
+                                "event", {}
+                            ).get("janus")
+                        },
                     )
                     raise
 

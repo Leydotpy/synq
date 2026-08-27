@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
 from django.utils.text import slugify
@@ -215,7 +215,9 @@ class JrtcBrowserOutboxStatus(models.TextChoices):
     """Track durable browser forwarding for one authorized event target."""
 
     PENDING = "pending", "Pending"
+    DELIVERING = "delivering", "Delivering"
     DELIVERED = "delivered", "Delivered"
+    DISCARDED = "discarded", "Discarded"
 
 
 class MeetingSessionQuerySet(models.QuerySet):
@@ -449,11 +451,16 @@ class MeetingSession(UUIDTimestampedModel):
         blank=True,
         null=True,
         db_index=True,
+        validators=[MinValueValidator(1)],
     )
     # Lifecycle phase used by APIs, workers, and Socket.IO flows to coordinate cleanup and UX.
     lifecycle_state = models.CharField(max_length=32, choices=MeetingLifecycleState.choices, default=MeetingLifecycleState.SCHEDULED)
     # Janus VideoRoom identifier provisioned for this live meeting session.
-    janus_room_id = models.PositiveBigIntegerField(blank=True, null=True)
+    janus_room_id = models.PositiveBigIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
     # Secret used for privileged Janus room actions such as destroy or moderation commands.
     janus_room_secret = models.CharField(max_length=255, blank=True)
     # Optional participant PIN forwarded to Janus when the room requires a join secret.
@@ -487,6 +494,18 @@ class MeetingSession(UUIDTimestampedModel):
         """Declare ordering and indexes that support hot session retrieval."""
 
         ordering = ("-created_at",)
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(control_handle_id__isnull=True)
+                | models.Q(control_handle_id__gt=0),
+                name="meet_sess_control_gt_zero",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(janus_room_id__isnull=True)
+                | models.Q(janus_room_id__gt=0),
+                name="meet_sess_room_gt_zero",
+            ),
+        ]
         indexes = [
             models.Index(fields=("room", "lifecycle_state"), name="meeting_session_room_state_idx"),
             models.Index(fields=("janus_room_id",), name="meeting_session_janus_room_idx"),
@@ -674,9 +693,17 @@ class Participant(UUIDTimestampedModel):
     # Timestamp recording when the participant most recently raised their hand.
     raised_hand_at = models.DateTimeField(blank=True, null=True)
     # Janus publisher identifier returned when the participant joins the VideoRoom as a publisher.
-    janus_publisher_id = models.PositiveBigIntegerField(blank=True, null=True)
+    janus_publisher_id = models.PositiveBigIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
     # Janus private identifier returned for subscriber operations tied to the publisher session.
-    janus_private_id = models.PositiveBigIntegerField(blank=True, null=True)
+    janus_private_id = models.PositiveBigIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
     # Latest known Janus payload for this participant, including media and moderation state.
     janus_state = models.JSONField(default=dict, blank=True)
     # Timestamp recording when the participant was effectively admitted into the live meeting.
@@ -692,7 +719,22 @@ class Participant(UUIDTimestampedModel):
         """Declare ordering, indexes, and uniqueness for participant state."""
 
         ordering = ("display_name",)
-        constraints = [models.UniqueConstraint(fields=("session", "profile"), name="meeting_participant_unique_per_session_profile")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("session", "profile"),
+                name="meeting_participant_unique_per_session_profile",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(janus_publisher_id__isnull=True)
+                | models.Q(janus_publisher_id__gt=0),
+                name="meet_part_pub_gt_zero",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(janus_private_id__isnull=True)
+                | models.Q(janus_private_id__gt=0),
+                name="meet_part_private_gt_zero",
+            ),
+        ]
         indexes = [
             models.Index(fields=("session", "status"), name="meet_part_sess_status_idx"),
             models.Index(fields=("session", "role"), name="meet_part_sess_role_idx"),
@@ -855,10 +897,18 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
     # Lifecycle phase of the Janus handle attachment and readiness flow.
     lifecycle_state = models.CharField(max_length=32, choices=JanusHandleLifecycleState.choices, default=JanusHandleLifecycleState.ATTACHING)
     # Diagnostic owner-session identifier; it is never portable across processes.
-    janus_session_id = models.PositiveBigIntegerField(blank=True, null=True)
+    janus_session_id = models.PositiveBigIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
     # Diagnostic Janus handle identifier. Live plugin objects are owned by the
     # process-local JRTC registry and are never materialized by the ORM.
-    janus_handle_id = models.PositiveBigIntegerField(blank=True, null=True)
+    janus_handle_id = models.PositiveBigIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
     # Process/pod identity that owns the corresponding live registry binding.
     # A persisted owner is correlation metadata, not proof that a handle lives.
     runtime_owner_id = models.CharField(
@@ -893,7 +943,22 @@ class ParticipantMediaHandle(UUIDTimestampedModel):
         """Declare indexes optimized for Janus handle reconciliation."""
 
         ordering = ("participant", "handle_type")
-        constraints = [models.UniqueConstraint(fields=("participant", "handle_type"), name="meeting_media_handle_unique_per_type")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("participant", "handle_type"),
+                name="meeting_media_handle_unique_per_type",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(janus_session_id__isnull=True)
+                | models.Q(janus_session_id__gt=0),
+                name="meet_mh_session_gt_zero",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(janus_handle_id__isnull=True)
+                | models.Q(janus_handle_id__gt=0),
+                name="meet_mh_handle_gt_zero",
+            ),
+        ]
         indexes = [
             models.Index(fields=("participant", "handle_type"), name="meet_mh_part_type_idx"),
             models.Index(fields=("janus_handle_id",), name="meet_mh_jhandle_idx"),
@@ -934,7 +999,11 @@ class ParticipantStream(UUIDTimestampedModel):
     # Janus MID uniquely identifying the stream inside SDP and Janus events.
     janus_mid = models.CharField(max_length=64)
     # Janus publisher feed identifier associated with the stream when applicable.
-    janus_feed_id = models.PositiveBigIntegerField(blank=True, null=True)
+    janus_feed_id = models.PositiveBigIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
     # Source MID used by Janus for subscriber-side feed mapping.
     janus_feed_mid = models.CharField(max_length=64, blank=True, null=True)
     # Codec currently negotiated for the stream when known.
@@ -954,7 +1023,17 @@ class ParticipantStream(UUIDTimestampedModel):
         """Declare indexes that support stream reconciliation and state fan-out."""
 
         ordering = ("participant", "direction", "media_kind", "janus_mid")
-        constraints = [models.UniqueConstraint(fields=("media_handle", "janus_mid"), name="meeting_stream_unique_per_handle_mid")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("media_handle", "janus_mid"),
+                name="meeting_stream_unique_per_handle_mid",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(janus_feed_id__isnull=True)
+                | models.Q(janus_feed_id__gt=0),
+                name="meet_stream_feed_gt_zero",
+            ),
+        ]
         indexes = [
             models.Index(fields=("participant", "direction"), name="meet_stream_part_dir_idx"),
             models.Index(fields=("janus_feed_id",), name="meeting_stream_feed_idx"),
@@ -1131,5 +1210,9 @@ class JrtcBrowserEventOutbox(UUIDTimestampedModel):
             models.Index(
                 fields=("status", "created_at"),
                 name="meet_jrtc_outbox_status_idx",
-            )
+            ),
+            models.Index(
+                fields=("status", "updated_at"),
+                name="meet_jrtc_outbox_retry_idx",
+            ),
         ]

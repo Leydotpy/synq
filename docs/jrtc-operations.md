@@ -51,6 +51,26 @@ by the JRTC envelope UUID is admitted in the same transaction as domain state
 changes. Redelivery therefore skips domain side effects. This is application
 idempotency, not an exactly-once claim.
 
+Browser fan-out uses a durable `JrtcBrowserEventOutbox` row per authorized
+socket target. An initial emit failure leaves that row pending and fails the
+broker handler, but recovery does not depend on the broker delivering the
+envelope again. The dedicated consumer continuously claims eligible rows in
+bounded batches and retries them from the database. A conditional
+`delivering` status plus `updated_at` is the cross-process lease; an abandoned
+lease becomes eligible after `JRTC_EVENT_OUTBOX_LEASE_TIMEOUT`.
+
+Before every immediate or delayed emit, the relay rechecks the persisted
+connection ID, session ID, socket ID, and active connection state. A target
+that is no longer authorized is terminally marked `discarded`. Successful
+targets are never replayed during a partial fan-out retry. The browser also
+deduplicates the envelope `event_id`, covering the narrow case where an emit
+finishes after its database lease expires.
+
+An immediate Socket.IO failure is translated to
+`JrtcBrowserDispatchFailure` with the original exception chained for server
+diagnostics; broker or Socket.IO implementation exceptions are never exposed
+as a browser contract.
+
 Backend identities must be configured on the engine because Broka 0.0.2 does
 not derive them from `SubscriptionOptions`:
 
@@ -108,6 +128,8 @@ separate:
 - `JRTC_EVENT_PHYSICAL_ROUTE`
 - `JRTC_EVENT_PUBLISH_*`, `JRTC_EVENT_DRAIN_TIMEOUT`
 - `JRTC_EVENT_CONSUMER_CONCURRENCY`, `JRTC_EVENT_CONSUMER_CAPACITY`
+- `JRTC_EVENT_OUTBOX_POLL_INTERVAL`, `JRTC_EVENT_OUTBOX_RETRY_DELAY`
+- `JRTC_EVENT_OUTBOX_LEASE_TIMEOUT`, `JRTC_EVENT_OUTBOX_BATCH_SIZE`
 - `JRTC_REDIS_*`, `JRTC_RABBITMQ_*`, and `JRTC_KAFKA_*`
 
 Use memory/local only in tests or deliberate same-process development.
@@ -123,10 +145,19 @@ synq-beat        celery -A conf.celery beat ...
 synq-jrtc-events python manage.py run_jrtc_events
 ```
 
-The event consumer handles SIGINT/SIGTERM, closes its subscription, then shuts
-down its broker connection. Deploy at least one consumer per durable group;
-scale with backend-aware replicas rather than starting an authoritative
-consumer in every web worker.
+After the broker subscription is established, the consumer prints a readiness
+line beginning with `JRTC event consumer running and listening for events`.
+The line includes only the backend, physical route, live consumer identity,
+and durable group/queue; broker URLs and credentials are never printed. Treat
+that line (or the equivalent structured readiness log), rather than process
+existence alone, as the consumer's startup signal.
+
+The event consumer handles SIGINT/SIGTERM, closes its subscription, lets the
+browser-outbox relay finish its active bounded sweep, then shuts down its
+broker connection. Deploy at least one consumer per durable group; scale with
+backend-aware replicas rather than starting an authoritative consumer in every
+web worker. Each replica may sweep the shared outbox safely because claims use
+conditional database leases.
 
 ## Security and retention
 
@@ -140,6 +171,26 @@ Set Redis Stream trimming, Kafka topic retention, or RabbitMQ TTL/DLX policies
 to the organization's media-metadata retention requirement. Redis credentials,
 RabbitMQ URLs, Kafka SASL secrets, Janus tokens, and API secrets must come from
 the deployment secret store and must not be returned to clients.
+
+The database receipt/outbox replay horizon defaults to 30 days through
+`JRTC_EVENT_RECEIPT_RETENTION_DAYS`. Keep it at least as long as the broker and
+dead-letter replay horizon, then schedule this command daily:
+
+```bash
+python manage.py prune_jrtc_event_history
+```
+
+The command deletes in bounded batches and never removes a receipt that still
+has a pending or leased browser delivery. Use `--dry-run`, `--days`, and
+`--batch-size` when validating a deployment-specific policy.
+
+`run_jrtc_events` writes low-cardinality structured records for acknowledged
+events, failures, and non-empty outbox sweeps. Embedded health integrations can
+read `JrtcEventConsumer.inspect()` for consumer/outbox counters and handler
+latency, and `consumer.broker.metrics.snapshot()` for Broka's existing lag,
+in-flight, retry, dead-letter, and acknowledgement series. JRTC's publisher
+metrics are emitted through its configured LogVista metrics provider. None of
+these metric labels contain session, handle, participant, socket, or room IDs.
 
 Operational dashboards should track runtime readiness, active/stale handles,
 publisher admission/drop/failure counts and queue depth, consumer lag/retries/

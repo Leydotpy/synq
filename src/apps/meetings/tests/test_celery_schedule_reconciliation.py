@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from django.conf import settings
 from django.core.management import CommandError, call_command
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from django_celery_beat.models import IntervalSchedule, PeriodicTask, PeriodicTasks
 from django_celery_beat.schedulers import DatabaseScheduler
@@ -52,7 +52,7 @@ EXPECTED_SCHEDULES = {
 }
 
 
-class CeleryBeatConfigurationTests(TestCase):
+class CeleryBeatConfigurationTests(TransactionTestCase):
     """Keep clean-install schedule materialization aligned with the registry."""
 
     def test_source_controlled_schedules_match_registry_and_defaults(self) -> None:

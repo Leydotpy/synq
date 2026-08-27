@@ -203,6 +203,7 @@ class Command(RunserverCommand):
             lifespan="on",
             # Uvicorn handles its own internal logging, but we can set the level
             log_level="info" if settings.DEBUG else "warning",
+            log_config=None
         )
 
         try:

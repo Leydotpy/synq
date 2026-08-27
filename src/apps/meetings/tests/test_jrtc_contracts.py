@@ -8,7 +8,7 @@ import importlib.util
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch, sentinel
 from uuid import uuid4
 
 from django.db import models
@@ -16,6 +16,8 @@ from django.test import SimpleTestCase, override_settings
 from pydantic import ValidationError as PydanticValidationError
 
 from jrtc.models.base import Jsep
+from jrtc.models.response import AckResponse, EventResponse
+from jrtc.transport.websocket import WebsocketTransportClient
 from jrtc_video import (
     PublisherJoinAndConfigureRequest,
     SubscribeTarget,
@@ -277,7 +279,7 @@ class HandleRegistryContractTests(SimpleTestCase):
         registry = JrtcHandleRegistry("owner-a")
         session = _FakeSession()
         with patch("apps.meetings.jrtc.handles.VideoRoomPlugin", _FakePlugin):
-            result = await registry.resolve_or_attach(
+            await registry.resolve_or_attach(
                 HandleBindingSpec(model_id="domain-1"),
                 session=session,
                 recreate=True,
@@ -354,6 +356,42 @@ class HandleRegistryContractTests(SimpleTestCase):
 
 
 class CommandPlaneContractTests(SimpleTestCase):
+    async def test_ack_does_not_complete_a_wait_for_event_transaction(self) -> None:
+        """JRTC resolves the Future only when the final plugin event arrives."""
+
+        transport = WebsocketTransportClient()
+        future = asyncio.get_running_loop().create_future()
+        transport._transactions["command-1"] = {
+            "future": future,
+            "request": "message",
+        }
+        acknowledgement = AckResponse(
+            janus="ack",
+            transaction="command-1",
+        )
+        final_event = EventResponse.model_validate(
+            {
+                "janus": "event",
+                "transaction": "command-1",
+                "session_id": 101,
+                "sender": 201,
+                "plugindata": {
+                    "plugin": "janus.plugin.videoroom",
+                    "data": {"videoroom": "joined", "room": 301},
+                },
+            }
+        )
+
+        await transport._resolve_ack(acknowledgement)
+
+        self.assertFalse(future.done())
+        self.assertIn("command-1", transport._transactions)
+
+        await transport._resolve_transaction(final_event)
+
+        self.assertIs(await future, final_event)
+        self.assertNotIn("command-1", transport._transactions)
+
     async def test_join_and_configure_stays_one_direct_plugin_command(self) -> None:
         adapter = VideoRoomAdapter(Mock(), Mock())
         adapter.invoke = AsyncMock(return_value=object())
@@ -377,6 +415,92 @@ class CommandPlaneContractTests(SimpleTestCase):
             offer,
         )
 
+    async def test_signaling_commands_return_direct_adapter_results(self) -> None:
+        """Every media command remains a direct live-plugin invocation."""
+
+        adapter = VideoRoomAdapter(Mock(), Mock())
+        adapter.invoke = AsyncMock(return_value=sentinel.reply)
+        binding = BoundVideoRoomHandle(
+            model_id="domain-1",
+            session_id=101,
+            handle_id=201,
+            plugin=Mock(),
+            owner_id="owner-a",
+        )
+        offer = Jsep(type="offer", sdp="v=0\r\n")
+        answer = Jsep(type="answer", sdp="v=0\r\n")
+        publish_body = SimpleNamespace()
+        configure_body = SimpleNamespace()
+        subscriber_join = SimpleNamespace()
+        subscriber_update = SimpleNamespace()
+        candidates = (SimpleNamespace(),)
+        commands = (
+            (
+                "publish",
+                lambda: adapter.publish(binding, offer, body=publish_body),
+                (binding, "publish", offer),
+                {"body": publish_body},
+            ),
+            (
+                "configure_publisher",
+                lambda: adapter.configure_publisher(
+                    binding,
+                    configure_body,
+                    offer=offer,
+                ),
+                (binding, "configure_publisher", configure_body),
+                {"offer": offer},
+            ),
+            (
+                "join_subscriber",
+                lambda: adapter.join_subscriber(binding, subscriber_join),
+                (binding, "join_subscriber", subscriber_join),
+                {},
+            ),
+            (
+                "update_subscription",
+                lambda: adapter.update_subscription(
+                    binding,
+                    subscriber_update,
+                ),
+                (binding, "update_subscription", subscriber_update),
+                {},
+            ),
+            (
+                "start",
+                lambda: adapter.start_subscriber(binding, answer=answer),
+                (binding, "start"),
+                {"answer": answer},
+            ),
+            (
+                "trickle",
+                lambda: adapter.trickle(binding, candidates),
+                (binding, "trickle", candidates),
+                {},
+            ),
+            (
+                "complete_trickle",
+                lambda: adapter.complete_trickle(binding),
+                (binding, "complete_trickle"),
+                {},
+            ),
+            (
+                "unpublish",
+                lambda: adapter.unpublish(binding),
+                (binding, "unpublish"),
+                {},
+            ),
+        )
+
+        for name, command, expected_args, expected_kwargs in commands:
+            with self.subTest(command=name):
+                adapter.invoke.reset_mock()
+                self.assertIs(await command(), sentinel.reply)
+                adapter.invoke.assert_awaited_once_with(
+                    *expected_args,
+                    **expected_kwargs,
+                )
+
     async def test_hangup_does_not_implicitly_detach_the_plugin(self) -> None:
         adapter = VideoRoomAdapter(Mock(), Mock())
         adapter.invoke = AsyncMock(return_value="hung-up")
@@ -398,6 +522,20 @@ class RuntimeLifecycleContractTests(SimpleTestCase):
             with (
                 self.subTest(invalid=invalid),
                 override_settings(JRTC_EVENT_PUBLISH_TIMEOUT=invalid),
+                self.assertRaises(ValueError),
+            ):
+                load_event_config()
+
+    def test_outbox_retry_settings_reject_nonpositive_values(self) -> None:
+        for setting_name, invalid in (
+            ("JRTC_EVENT_OUTBOX_POLL_INTERVAL", 0),
+            ("JRTC_EVENT_OUTBOX_RETRY_DELAY", -1),
+            ("JRTC_EVENT_OUTBOX_LEASE_TIMEOUT", float("nan")),
+            ("JRTC_EVENT_OUTBOX_BATCH_SIZE", True),
+        ):
+            with (
+                self.subTest(setting=setting_name, invalid=invalid),
+                override_settings(**{setting_name: invalid}),
                 self.assertRaises(ValueError),
             ):
                 load_event_config()

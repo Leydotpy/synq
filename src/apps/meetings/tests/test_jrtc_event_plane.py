@@ -3,19 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import timedelta
+from io import StringIO
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from uuid import uuid4
 
 from asgiref.sync import async_to_sync
 from broka import AcknowledgementMode, Envelope
+from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.test import SimpleTestCase, TestCase
+from django.utils import timezone
 from jrtc.messaging import DEFAULT_PHYSICAL_ROUTE, JANUS_EVENT_ROUTES
 
 from apps.meetings.jrtc.config import JrtcEventConfig
+from apps.meetings.jrtc.errors import JrtcBrowserDispatchFailure
 from apps.meetings.jrtc.events.consumer import (
     JrtcEventConsumer,
     subscription_options,
+)
+from apps.meetings.jrtc.events.dispatcher import (
+    DispatchOutcome,
+    JrtcEventDispatcher,
+    OutboxRetryOutcome,
 )
 from apps.meetings.jrtc.events.handlers import (
     DjangoJanusEventReconciler,
@@ -26,7 +38,17 @@ from apps.meetings.jrtc.events.idempotency import DjangoEventReceiptStore
 from apps.meetings.jrtc.events.schemas import JanusBrokerEvent, event_from_delivery
 from apps.meetings.jrtc.ids import janus_event_to_wire
 from apps.meetings.management.commands.run_jrtc_events import run_until_stopped
-from apps.meetings.models import JrtcEventReceipt, JrtcEventReceiptStatus
+from apps.meetings.models import (
+    JrtcBrowserEventOutbox,
+    JrtcBrowserOutboxStatus,
+    JrtcEventReceipt,
+    JrtcEventReceiptStatus,
+    MeetingRoom,
+    MeetingSession,
+    Participant,
+    ParticipantConnection,
+    RealtimeConnectionStatus,
+)
 
 
 def _config(
@@ -214,6 +236,327 @@ class JrtcEventReceiptTests(TestCase):
         self.assertEqual(failed.status, JrtcEventReceiptStatus.PROCESSED)
 
 
+class JrtcBrowserOutboxTests(TestCase):
+    """Keep private realtime events pending until Socket.IO delivery succeeds."""
+
+    def test_failed_emit_is_retried_without_broker_redelivery(self) -> None:
+        event = _event()
+        dispatch = SocketDispatch(
+            payload={
+                "event_id": str(event.event_id),
+                "session_id": "meeting-session",
+                "event": {"janus": "trickle", "candidate": {"completed": True}},
+            },
+            socket_ids=("socket-owner",),
+            session_room="",
+        )
+        reconciler = SimpleNamespace(reconcile=Mock(return_value=(dispatch,)))
+        emitter = SimpleNamespace(
+            emit_many=AsyncMock(
+                side_effect=[RuntimeError("socket unavailable"), None]
+            )
+        )
+        dispatcher = JrtcEventDispatcher(
+            reconciler=reconciler,
+            emitter=emitter,
+        )
+
+        with patch.object(
+            dispatcher,
+            "_browser_dispatch_is_authorized",
+            return_value=True,
+        ):
+            with self.assertRaises(JrtcBrowserDispatchFailure):
+                async_to_sync(dispatcher.dispatch)(event)
+
+            receipt = JrtcEventReceipt.objects.get(event_id=event.event_id)
+            outbox = JrtcBrowserEventOutbox.objects.get(receipt=receipt)
+            self.assertEqual(receipt.status, JrtcEventReceiptStatus.PROCESSED)
+            self.assertEqual(outbox.status, JrtcBrowserOutboxStatus.PENDING)
+            self.assertEqual(outbox.delivery_attempts, 1)
+            self.assertEqual(outbox.last_error, "RuntimeError")
+            JrtcBrowserEventOutbox.objects.filter(pk=outbox.pk).update(
+                updated_at=timezone.now() - timedelta(seconds=5)
+            )
+
+            outcome = async_to_sync(
+                dispatcher.retry_pending_browser_dispatches
+            )(
+                limit=10,
+                retry_delay=1.0,
+                lease_timeout=30.0,
+            )
+
+        outbox.refresh_from_db()
+        receipt.refresh_from_db()
+        self.assertEqual(outcome.attempted, 1)
+        self.assertEqual(outcome.delivered, 1)
+        self.assertEqual(outbox.status, JrtcBrowserOutboxStatus.DELIVERED)
+        self.assertEqual(outbox.delivery_attempts, 2)
+        self.assertIsNotNone(outbox.delivered_at)
+        self.assertEqual(receipt.duplicate_count, 0)
+        reconciler.reconcile.assert_called_once_with(event)
+        self.assertEqual(emitter.emit_many.await_count, 2)
+
+    def test_partial_fanout_retry_emits_only_the_pending_target(self) -> None:
+        event = _event()
+        dispatch = SocketDispatch(
+            payload={
+                "event_id": str(event.event_id),
+                "session_id": "meeting-session",
+                "event": {"janus": "trickle", "candidate": {"completed": True}},
+            },
+            socket_ids=("socket-first", "socket-second"),
+            session_room="",
+        )
+        attempts: list[str] = []
+        second_failed = False
+
+        async def emit(dispatches) -> None:
+            nonlocal second_failed
+            socket_id = dispatches[0].socket_ids[0]
+            attempts.append(socket_id)
+            if socket_id == "socket-second" and not second_failed:
+                second_failed = True
+                raise RuntimeError("second socket unavailable")
+
+        dispatcher = JrtcEventDispatcher(
+            reconciler=SimpleNamespace(reconcile=Mock(return_value=(dispatch,))),
+            emitter=SimpleNamespace(emit_many=AsyncMock(side_effect=emit)),
+        )
+
+        with patch.object(
+            dispatcher,
+            "_browser_dispatch_is_authorized",
+            return_value=True,
+        ):
+            with self.assertRaises(JrtcBrowserDispatchFailure):
+                async_to_sync(dispatcher.dispatch)(event)
+
+            first = JrtcBrowserEventOutbox.objects.get(socket_id="socket-first")
+            second = JrtcBrowserEventOutbox.objects.get(socket_id="socket-second")
+            self.assertEqual(first.status, JrtcBrowserOutboxStatus.DELIVERED)
+            self.assertEqual(second.status, JrtcBrowserOutboxStatus.PENDING)
+            JrtcBrowserEventOutbox.objects.filter(pk=second.pk).update(
+                updated_at=timezone.now() - timedelta(seconds=5)
+            )
+
+            outcome = async_to_sync(
+                dispatcher.retry_pending_browser_dispatches
+            )(
+                limit=10,
+                retry_delay=1.0,
+                lease_timeout=30.0,
+            )
+
+        self.assertEqual(outcome.attempted, 1)
+        self.assertEqual(outcome.delivered, 1)
+        self.assertEqual(attempts, ["socket-first", "socket-second", "socket-second"])
+
+    def test_retry_discards_a_target_that_is_no_longer_authorized(self) -> None:
+        receipt = JrtcEventReceipt.objects.create(
+            event_id=uuid4(),
+            event_type="janus.trickle",
+            status=JrtcEventReceiptStatus.PROCESSED,
+        )
+        outbox = JrtcBrowserEventOutbox.objects.create(
+            receipt=receipt,
+            dispatch_index=0,
+            socket_id="stale-socket",
+            payload={
+                "event_id": str(receipt.event_id),
+                "connection_id": str(uuid4()),
+                "session_id": str(uuid4()),
+                "event": {"janus": "trickle"},
+            },
+        )
+        JrtcBrowserEventOutbox.objects.filter(pk=outbox.pk).update(
+            updated_at=timezone.now() - timedelta(seconds=5)
+        )
+        emitter = SimpleNamespace(emit_many=AsyncMock())
+        dispatcher = JrtcEventDispatcher(emitter=emitter)
+
+        outcome = async_to_sync(
+            dispatcher.retry_pending_browser_dispatches
+        )(
+            limit=10,
+            retry_delay=1.0,
+            lease_timeout=30.0,
+        )
+
+        outbox.refresh_from_db()
+        self.assertEqual(outcome.discarded, 1)
+        self.assertEqual(outbox.status, JrtcBrowserOutboxStatus.DISCARDED)
+        self.assertEqual(outbox.last_error, "target_not_authorized")
+        emitter.emit_many.assert_not_awaited()
+
+    def test_retry_reauthorizes_the_exact_live_connection_generation(self) -> None:
+        user = get_user_model().objects.create_user(
+            username="outbox-owner",
+            email="outbox-owner@example.com",
+            password=None,
+            clerk_user_id="clerk_outbox_owner",
+        )
+        profile = user.profile
+        room = MeetingRoom.objects.create(
+            title="Outbox authorization",
+            created_by_profile=profile,
+        )
+        session = MeetingSession.objects.create(
+            room=room,
+            started_by_profile=profile,
+        )
+        participant = Participant.objects.create(
+            room=room,
+            session=session,
+            profile=profile,
+            display_name="Outbox Owner",
+        )
+        connection = ParticipantConnection.objects.create(
+            session=session,
+            participant=participant,
+            profile=profile,
+            socket_id="authorized-socket",
+            status=RealtimeConnectionStatus.ACTIVE,
+        )
+        receipt = JrtcEventReceipt.objects.create(
+            event_id=uuid4(),
+            event_type="janus.webrtcup",
+            status=JrtcEventReceiptStatus.PROCESSED,
+        )
+        outbox = JrtcBrowserEventOutbox.objects.create(
+            receipt=receipt,
+            dispatch_index=0,
+            socket_id=connection.socket_id,
+            payload={
+                "event_id": str(receipt.event_id),
+                "connection_id": str(connection.pk),
+                "session_id": str(session.pk),
+                "event": {"janus": "webrtcup"},
+            },
+        )
+        JrtcBrowserEventOutbox.objects.filter(pk=outbox.pk).update(
+            updated_at=timezone.now() - timedelta(seconds=5)
+        )
+        emitter = SimpleNamespace(emit_many=AsyncMock())
+        dispatcher = JrtcEventDispatcher(emitter=emitter)
+
+        outcome = async_to_sync(
+            dispatcher.retry_pending_browser_dispatches
+        )(
+            limit=10,
+            retry_delay=1.0,
+            lease_timeout=30.0,
+        )
+
+        outbox.refresh_from_db()
+        self.assertEqual(outcome.delivered, 1)
+        self.assertEqual(outbox.status, JrtcBrowserOutboxStatus.DELIVERED)
+        emitter.emit_many.assert_awaited_once()
+
+    def test_retry_recovers_only_an_expired_delivery_lease(self) -> None:
+        receipt = JrtcEventReceipt.objects.create(
+            event_id=uuid4(),
+            event_type="janus.media",
+            status=JrtcEventReceiptStatus.PROCESSED,
+        )
+        outbox = JrtcBrowserEventOutbox.objects.create(
+            receipt=receipt,
+            dispatch_index=0,
+            socket_id="leased-socket",
+            payload={
+                "event_id": str(receipt.event_id),
+                "connection_id": str(uuid4()),
+                "session_id": str(uuid4()),
+                "event": {"janus": "media"},
+            },
+            status=JrtcBrowserOutboxStatus.DELIVERING,
+        )
+        emitter = SimpleNamespace(emit_many=AsyncMock())
+        dispatcher = JrtcEventDispatcher(emitter=emitter)
+
+        active_lease = async_to_sync(
+            dispatcher.retry_pending_browser_dispatches
+        )(
+            limit=10,
+            retry_delay=1.0,
+            lease_timeout=30.0,
+        )
+        self.assertEqual(active_lease.attempted, 0)
+
+        JrtcBrowserEventOutbox.objects.filter(pk=outbox.pk).update(
+            updated_at=timezone.now() - timedelta(seconds=60)
+        )
+        with patch.object(
+            dispatcher,
+            "_browser_dispatch_is_authorized",
+            return_value=True,
+        ):
+            expired_lease = async_to_sync(
+                dispatcher.retry_pending_browser_dispatches
+            )(
+                limit=10,
+                retry_delay=1.0,
+                lease_timeout=30.0,
+            )
+
+        outbox.refresh_from_db()
+        self.assertEqual(expired_lease.attempted, 1)
+        self.assertEqual(expired_lease.delivered, 1)
+        self.assertEqual(outbox.status, JrtcBrowserOutboxStatus.DELIVERED)
+        emitter.emit_many.assert_awaited_once()
+
+    def test_pruning_preserves_pending_and_recent_receipts(self) -> None:
+        old_at = timezone.now() - timedelta(days=60)
+        prunable = JrtcEventReceipt.objects.create(
+            event_id=uuid4(),
+            event_type="janus.event",
+            status=JrtcEventReceiptStatus.PROCESSED,
+        )
+        pending = JrtcEventReceipt.objects.create(
+            event_id=uuid4(),
+            event_type="janus.event",
+            status=JrtcEventReceiptStatus.PROCESSED,
+        )
+        recent = JrtcEventReceipt.objects.create(
+            event_id=uuid4(),
+            event_type="janus.event",
+            status=JrtcEventReceiptStatus.PROCESSED,
+        )
+        JrtcEventReceipt.objects.filter(pk__in=[prunable.pk, pending.pk]).update(
+            received_at=old_at,
+            updated_at=old_at,
+        )
+        # A recently retried receipt may have an old admission timestamp, but
+        # its latest activity must restart the retention horizon.
+        JrtcEventReceipt.objects.filter(pk=recent.pk).update(received_at=old_at)
+        JrtcBrowserEventOutbox.objects.create(
+            receipt=prunable,
+            dispatch_index=0,
+            socket_id="socket-delivered",
+            payload={"event": {"janus": "webrtcup"}},
+            status=JrtcBrowserOutboxStatus.DELIVERED,
+        )
+        JrtcBrowserEventOutbox.objects.create(
+            receipt=pending,
+            dispatch_index=0,
+            socket_id="socket-pending",
+            payload={"event": {"janus": "trickle"}},
+            status=JrtcBrowserOutboxStatus.PENDING,
+        )
+
+        call_command(
+            "prune_jrtc_event_history",
+            days=30,
+            batch_size=1,
+            stdout=StringIO(),
+        )
+
+        self.assertFalse(JrtcEventReceipt.objects.filter(pk=prunable.pk).exists())
+        self.assertTrue(JrtcEventReceipt.objects.filter(pk=pending.pk).exists())
+        self.assertTrue(JrtcEventReceipt.objects.filter(pk=recent.pk).exists())
+
+
 class JrtcEventReconcilerTests(SimpleTestCase):
     """Preserve metadata reconciliation while suppressing duplicate JSEP."""
 
@@ -350,6 +693,7 @@ class JrtcEventReconcilerTests(SimpleTestCase):
         )
 
         self.assertEqual(dispatch.payload["session_id"], str(meeting_session_id))
+        self.assertEqual(dispatch.payload["event_id"], str(event.event_id))
         self.assertEqual(dispatch.socket_ids, ("socket-owner",))
         self.assertNotIn("socket_ids", dispatch.payload)
         self.assertEqual(dispatch.payload["connection_id"], str(connection_id))
@@ -480,6 +824,20 @@ class SocketIoJrtcEventEmitterTests(SimpleTestCase):
 
         server.emit.assert_not_awaited()
 
+    def test_emit_failure_propagates_to_prevent_broker_ack(self) -> None:
+        server = SimpleNamespace(
+            emit=AsyncMock(side_effect=RuntimeError("socket unavailable"))
+        )
+        emitter = SocketIoJanusEventEmitter(lambda: server)
+        dispatch = SocketDispatch(
+            payload={"event": {"janus": "webrtcup"}},
+            socket_ids=("socket-1",),
+            session_room="",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "socket unavailable"):
+            async_to_sync(emitter.emit_many)((dispatch,))
+
 
 class JrtcEventConsumerTests(SimpleTestCase):
     """Exercise lifecycle and manual ACK ordering without a live broker."""
@@ -509,8 +867,13 @@ class JrtcEventConsumerTests(SimpleTestCase):
     def test_delivery_is_acked_only_after_awaited_dispatch(self) -> None:
         order: list[str] = []
 
-        async def dispatch(_event) -> None:
+        async def dispatch(_event) -> DispatchOutcome:
             order.append("dispatch")
+            return DispatchOutcome(
+                duplicate=False,
+                correlated_handles=1,
+                browser_dispatches=0,
+            )
 
         async def ack() -> None:
             order.append("ack")
@@ -537,10 +900,23 @@ class JrtcEventConsumerTests(SimpleTestCase):
         async_to_sync(consumer.handle_delivery)(delivery)
 
         self.assertEqual(order, ["dispatch", "ack"])
+        metrics = consumer.inspect()
+        self.assertEqual(metrics["received"], 1)
+        self.assertEqual(metrics["handled"], 1)
+        self.assertEqual(metrics["acknowledged"], 1)
+        self.assertEqual(metrics["failures"], 0)
+        self.assertEqual(metrics["correlated_handles"], 1)
+        self.assertEqual(metrics["correlation_misses"], 0)
+        self.assertEqual(metrics["event_types"], {"janus.event": 1})
+        self.assertGreaterEqual(metrics["handler_duration_ms"]["last"], 0)
 
     def test_failed_dispatch_is_not_acknowledged(self) -> None:
         dispatcher = SimpleNamespace(
-            dispatch=AsyncMock(side_effect=RuntimeError("failed durable work"))
+            dispatch=AsyncMock(
+                side_effect=JrtcBrowserDispatchFailure(
+                    "failed durable Socket.IO work"
+                )
+            )
         )
         consumer = JrtcEventConsumer(
             MagicMock(),
@@ -557,10 +933,48 @@ class JrtcEventConsumerTests(SimpleTestCase):
         )
         delivery.ack = AsyncMock()
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(JrtcBrowserDispatchFailure):
             async_to_sync(consumer.handle_delivery)(delivery)
 
         delivery.ack.assert_not_awaited()
+        metrics = consumer.inspect()
+        self.assertEqual(metrics["failures"], 1)
+        self.assertEqual(metrics["socketio_failures"], 1)
+        self.assertEqual(metrics["acknowledged"], 0)
+
+    def test_uncorrelated_event_is_counted_without_blocking_ack(self) -> None:
+        dispatcher = SimpleNamespace(
+            dispatch=AsyncMock(
+                return_value=DispatchOutcome(
+                    duplicate=False,
+                    correlated_handles=0,
+                    browser_dispatches=0,
+                )
+            )
+        )
+        consumer = JrtcEventConsumer(
+            MagicMock(),
+            _config(),
+            dispatcher=dispatcher,
+        )
+        delivery = _delivery(
+            {
+                "janus": "media",
+                "session_id": 101,
+                "sender": 202,
+                "type": "video",
+                "receiving": True,
+            },
+            event_type="janus.media",
+        )
+        delivery.ack = AsyncMock()
+
+        async_to_sync(consumer.handle_delivery)(delivery)
+
+        delivery.ack.assert_awaited_once()
+        metrics = consumer.inspect()
+        self.assertEqual(metrics["correlation_misses"], 1)
+        self.assertEqual(metrics["correlated_handles"], 0)
 
     def test_stop_closes_subscription_before_broker(self) -> None:
         order: list[str] = []
@@ -585,6 +999,47 @@ class JrtcEventConsumerTests(SimpleTestCase):
         self.assertEqual(order, ["subscription", "broker"])
         self.assertEqual(consumer.state, JrtcEventConsumer.STOPPED)
 
+    def test_consumer_sweeps_outbox_without_a_broker_delivery(self) -> None:
+        async def scenario() -> tuple[dict[str, object], AsyncMock]:
+            swept = asyncio.Event()
+            retry = AsyncMock(
+                side_effect=lambda **_kwargs: (
+                    swept.set()
+                    or OutboxRetryOutcome(
+                        attempted=1,
+                        delivered=1,
+                        discarded=0,
+                        failed=0,
+                    )
+                )
+            )
+            dispatcher = SimpleNamespace(
+                dispatch=AsyncMock(),
+                retry_pending_browser_dispatches=retry,
+            )
+            broker = SimpleNamespace(
+                startup=AsyncMock(),
+                shutdown=AsyncMock(),
+                subscribe=AsyncMock(
+                    return_value=SimpleNamespace(close=AsyncMock())
+                ),
+            )
+            consumer = JrtcEventConsumer(
+                broker,
+                replace(_config(), outbox_poll_interval=0.01),
+                dispatcher=dispatcher,
+            )
+            await consumer.start()
+            await asyncio.wait_for(swept.wait(), timeout=1.0)
+            await consumer.stop()
+            return consumer.inspect(), retry
+
+        metrics, retry = async_to_sync(scenario)()
+
+        retry.assert_awaited()
+        self.assertEqual(metrics["outbox_retry_attempts"], 1)
+        self.assertEqual(metrics["outbox_retry_delivered"], 1)
+
     def test_durable_options_match_backend_capabilities(self) -> None:
         streams = subscription_options(
             _config(engine="redis", engine_options={"mode": "streams"})
@@ -593,6 +1048,8 @@ class JrtcEventConsumerTests(SimpleTestCase):
             _config(engine="redis", engine_options={"mode": "pubsub"})
         )
         rabbit = subscription_options(_config(engine="rabbitmq"))
+        kafka = subscription_options(_config(engine="kafka"))
+        memory = subscription_options(_config(engine="memory"))
 
         self.assertTrue(streams.durable)
         self.assertEqual(streams.consumer_group, "synq-tests")
@@ -600,6 +1057,10 @@ class JrtcEventConsumerTests(SimpleTestCase):
         self.assertIsNone(pubsub.consumer_group)
         self.assertTrue(rabbit.durable)
         self.assertIsNone(rabbit.consumer_group)
+        self.assertTrue(kafka.durable)
+        self.assertEqual(kafka.consumer_group, "synq-tests")
+        self.assertFalse(memory.durable)
+        self.assertIsNone(memory.consumer_group)
 
 
 class RunJrtcEventsCommandTests(SimpleTestCase):

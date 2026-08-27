@@ -19,11 +19,13 @@ dependencies = [
     "aio-pika>=10.0.1,<11",
     "jrtc[kafka]>=3.1,<4",
     "jrtc-video>=3,<4",
+    "logvista>=0.1,<1",
     "python-decouple>=3.8",
     "python-socketio>=5.16.3",
     "redis>=8.0.1",
     "starlette>=1.3.1",
     "uvicorn>=0.51.0",
+    "psycopg[binary,pool]>=3.3.4",
 ]
 
 [tool.uv]

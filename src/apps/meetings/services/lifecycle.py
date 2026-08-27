@@ -509,7 +509,6 @@ class MeetingLifecycleService:
                 resolution_reason="Profile entered without waiting-room review.",
                 updated_at=now,
             )
-            created = participant is None
             if participant is None:
                 participant = Participant(
                     room=session.room,
@@ -747,12 +746,20 @@ class MeetingLifecycleService:
 
         MeetingPermissionService.require_session_permission(session=session, profile_or_user=actor_profile, permission_field="can_manage_participants")
         cleanup_snapshot: dict[str, object]
+        cleanup_socket_ids: tuple[str, ...]
         with transaction.atomic():
             participant.mark_left(status=ParticipantStatus.REMOVED)
             participant.save()
-            participant.connections.filter(
+            active_connections = participant.connections.filter(
                 status__in=[RealtimeConnectionStatus.CONNECTED, RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
-            ).update(status=RealtimeConnectionStatus.DISCONNECTED, disconnected_at=timezone.now(), updated_at=timezone.now())
+            )
+            cleanup_socket_ids = tuple(
+                active_connections.exclude(socket_id="").values_list(
+                    "socket_id",
+                    flat=True,
+                )
+            )
+            active_connections.update(status=RealtimeConnectionStatus.DISCONNECTED, disconnected_at=timezone.now(), updated_at=timezone.now())
             record_session_event(
                 session=session,
                 event_type=MeetingEventType.PARTICIPANT_REMOVED,
@@ -786,6 +793,7 @@ class MeetingLifecycleService:
             )
             MeetingSocketEmitter.emit_participant_removed(session=session, participant=participant, reason=reason)
             MeetingSocketEmitter.emit_session_state(session=session)
+            MeetingSocketEmitter.disconnect_sockets(cleanup_socket_ids)
 
         transaction.on_commit(emit_updates)
         return participant
@@ -802,6 +810,7 @@ class MeetingLifecycleService:
 
         participant = None
         cleanup_snapshot: dict[str, object] | None = None
+        cleanup_socket_ids: tuple[str, ...] = ()
         with transaction.atomic():
             session = MeetingSession.objects.select_for_update().get(pk=session.pk)
             connection = None
@@ -828,10 +837,17 @@ class MeetingLifecycleService:
             if changed:
                 participant.mark_left(status=ParticipantStatus.LEFT)
                 participant.save()
-                participant.connections.filter(
+                active_connections = participant.connections.filter(
                     session=session,
                     status__in=ACTIVE_CONNECTION_STATUSES,
-                ).update(
+                )
+                cleanup_socket_ids = tuple(
+                    active_connections.exclude(socket_id="").values_list(
+                        "socket_id",
+                        flat=True,
+                    )
+                )
+                active_connections.update(
                     status=RealtimeConnectionStatus.DISCONNECTED,
                     disconnected_at=now,
                     updated_at=now,
@@ -882,6 +898,7 @@ class MeetingLifecycleService:
                     cleanup_snapshot,
                 )
             MeetingSocketEmitter.emit_session_state(session=session)
+            MeetingSocketEmitter.disconnect_sockets(cleanup_socket_ids)
 
         transaction.on_commit(emit_updates)
         return participant

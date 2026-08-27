@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
 from asgiref.sync import async_to_sync
 from django.db.models import Q
@@ -180,6 +181,27 @@ class MeetingSocketEmitter:
             payload={"message": message, "details": details or {}},
             room=room,
         )
+
+    @staticmethod
+    def disconnect_sockets(socket_ids: Iterable[object]) -> None:
+        """Force owner-routed namespace disconnects for revoked generations."""
+
+        from conf.socketio import get_socket_server
+
+        server = get_socket_server()
+        for socket_id in dict.fromkeys(str(value) for value in socket_ids if value):
+            try:
+                # AsyncRedisManager publishes this operation to the worker
+                # that owns the socket, whose on_disconnect then invalidates
+                # connection-tagged process-local JRTC bindings.
+                async_to_sync(server.disconnect)(
+                    socket_id,
+                    namespace=MeetingSocketEmitter.namespace,
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to disconnect a revoked meeting socket",
+                )
 
     @staticmethod
     def session_room_name(session_id) -> str:

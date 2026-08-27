@@ -50,6 +50,10 @@ class JrtcBrokerConsumerFailure(JrtcError):
     """The authoritative event consumer could not continue safely."""
 
 
+class JrtcBrowserDispatchFailure(JrtcBrokerConsumerFailure):
+    """An authorized durable event could not reach its Socket.IO target."""
+
+
 class VideoRoomCommandError(JrtcError):
     """Janus rejected or failed a VideoRoom command."""
 
@@ -59,6 +63,7 @@ class VideoRoomProtocolError(VideoRoomCommandError):
 
 
 __all__ = [
+    "JrtcBrowserDispatchFailure",
     "JrtcBrokerConsumerFailure",
     "JrtcBrokerPublishFailure",
     "JrtcBrokerUnavailable",

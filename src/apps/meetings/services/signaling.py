@@ -593,7 +593,9 @@ def _get_or_create_media_handle(
         )
         if not created:
             media_handle = (
-                ParticipantMediaHandle.objects.select_for_update()
+                # ``connection`` is nullable, so keep PostgreSQL's row lock
+                # on the media-handle table while still preloading the join.
+                ParticipantMediaHandle.objects.select_for_update(of=("self",))
                 .select_related("connection", "participant")
                 .get(pk=media_handle.pk)
             )

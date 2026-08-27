@@ -7,6 +7,11 @@ See [docs/jrtc-operations.md](docs/jrtc-operations.md) for the command/event
 architecture, runtime ownership rules, broker configuration, deployment units,
 failure recovery, and security guidance.
 
+Copy [`.env.example`](.env.example) to an untracked `.env` for local
+development and supply the `DATABASE_*` PostgreSQL values there. Process
+environment variables take precedence in deployed services; database secrets
+must not be placed in Django settings or committed files.
+
 Common validation commands:
 
 ```powershell

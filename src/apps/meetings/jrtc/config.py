@@ -7,9 +7,9 @@ keeps command connectivity separate from the authoritative event plane.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Literal
 
 from django.conf import settings as django_settings
 from jrtc.conf import configure as configure_jrtc_settings
@@ -36,6 +36,10 @@ class JrtcEventConfig:
     consumer_group: str
     consumer_name: str
     engine_options: dict[str, object]
+    outbox_poll_interval: float = 1.0
+    outbox_retry_delay: float = 2.0
+    outbox_lease_timeout: float = 30.0
+    outbox_batch_size: int = 100
 
 
 def _positive_int(name: str, value: object) -> int:
@@ -179,6 +183,22 @@ def load_event_config(*, consumer_name: str | None = None) -> JrtcEventConfig:
         consumer_group=logical_group,
         consumer_name=name,
         engine_options={key: value for key, value in engine_options.items() if value is not None},
+        outbox_poll_interval=_positive_number(
+            "JRTC_EVENT_OUTBOX_POLL_INTERVAL",
+            django_settings.JRTC_EVENT_OUTBOX_POLL_INTERVAL,
+        ),
+        outbox_retry_delay=_positive_number(
+            "JRTC_EVENT_OUTBOX_RETRY_DELAY",
+            django_settings.JRTC_EVENT_OUTBOX_RETRY_DELAY,
+        ),
+        outbox_lease_timeout=_positive_number(
+            "JRTC_EVENT_OUTBOX_LEASE_TIMEOUT",
+            django_settings.JRTC_EVENT_OUTBOX_LEASE_TIMEOUT,
+        ),
+        outbox_batch_size=_positive_int(
+            "JRTC_EVENT_OUTBOX_BATCH_SIZE",
+            django_settings.JRTC_EVENT_OUTBOX_BATCH_SIZE,
+        ),
     )
 
 

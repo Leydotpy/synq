@@ -10,9 +10,11 @@ from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError
 
-from apps.meetings.jrtc.config import load_event_config
+from apps.meetings.jrtc.config import JrtcEventConfig, load_event_config
 from apps.meetings.jrtc.events.consumer import JrtcEventConsumer, build_event_consumer
 from apps.meetings.jrtc.ownership import new_runtime_owner_id
+
+ConsumerReadyCallback = Callable[[JrtcEventConsumer], None]
 
 
 class Command(BaseCommand):
@@ -46,17 +48,57 @@ class Command(BaseCommand):
                 )
                 return
             consumer = build_event_consumer(config)
-            asyncio.run(run_until_stopped(consumer))
+            asyncio.run(
+                run_until_stopped(
+                    consumer,
+                    on_ready=self._report_ready,
+                )
+            )
+            self.stdout.write(
+                self.style.SUCCESS("JRTC event consumer stopped cleanly.")
+            )
         except KeyboardInterrupt:
             self.stdout.write(self.style.WARNING("JRTC event consumer interrupted."))
         except Exception as exc:
             raise CommandError("JRTC event consumer terminated with an error.") from exc
+
+    def _report_ready(self, consumer: JrtcEventConsumer) -> None:
+        """Write and flush feedback only after the subscription is active."""
+
+        self.stdout.write(
+            self.style.SUCCESS(consumer_readiness_message(consumer.config))
+        )
+        self.stdout.flush()
+
+
+def consumer_readiness_message(config: JrtcEventConfig) -> str:
+    """Describe the active subscription without exposing connection secrets."""
+
+    details = [
+        f"backend={config.engine!r}",
+        f"route={config.physical_route!r}",
+        f"consumer={config.consumer_name!r}",
+    ]
+    if config.engine == "redis":
+        mode = str(config.engine_options.get("mode", "streams"))
+        details.insert(1, f"mode={mode!r}")
+        if mode == "streams":
+            details.append(f"group={config.consumer_group!r}")
+    elif config.engine == "rabbitmq":
+        details.append(f"queue={config.consumer_group!r}")
+    elif config.engine == "kafka":
+        details.append(f"group={config.consumer_group!r}")
+    return (
+        "JRTC event consumer running and listening for events "
+        f"({', '.join(details)})."
+    )
 
 
 async def run_until_stopped(
     consumer: JrtcEventConsumer,
     *,
     stop_event: asyncio.Event | None = None,
+    on_ready: ConsumerReadyCallback | None = None,
 ) -> None:
     """Run one consumer until SIGINT/SIGTERM or an injected stop event."""
 
@@ -64,6 +106,8 @@ async def run_until_stopped(
     cleanup_signals: Callable[[], None] = lambda: None
     await consumer.start()
     try:
+        if on_ready is not None:
+            on_ready(consumer)
         if stop_event is None:
             cleanup_signals = _install_signal_handlers(selected_stop_event)
         await selected_stop_event.wait()
@@ -109,4 +153,8 @@ def _install_signal_handlers(stop_event: asyncio.Event) -> Callable[[], None]:
     return cleanup
 
 
-__all__ = ["Command", "run_until_stopped"]
+__all__ = [
+    "Command",
+    "consumer_readiness_message",
+    "run_until_stopped",
+]

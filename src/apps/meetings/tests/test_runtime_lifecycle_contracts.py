@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -15,7 +16,6 @@ from apps.meetings.models import (
     MeetingAccessPolicy,
     MeetingLifecycleState,
     MeetingRole,
-    MeetingRoomMembership,
     Participant,
     ParticipantConnection,
     ParticipantMediaHandle,
@@ -61,6 +61,20 @@ class MeetingRuntimeLifecycleContractTests(TestCase):
         session.lifecycle_state = MeetingLifecycleState.WAITING
         session.save(update_fields=["lifecycle_state", "updated_at"])
         return host, room, session
+
+    def test_forced_disconnect_routes_once_per_socket_generation(self):
+        """The Socket.IO manager can route revocation to the owning worker."""
+
+        server = SimpleNamespace(disconnect=AsyncMock())
+        with patch("conf.socketio.get_socket_server", return_value=server):
+            MeetingSocketEmitter.disconnect_sockets(
+                ("socket-owner", "socket-owner", "", None)
+            )
+
+        server.disconnect.assert_awaited_once_with(
+            "socket-owner",
+            namespace=MeetingSocketEmitter.namespace,
+        )
 
     def admission_post(self, *, profile, session, payload=None):
         """Post to the same endpoint used by the client Join button."""

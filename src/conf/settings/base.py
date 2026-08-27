@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from decouple import config, Csv
+from decouple import Csv, config
 
 
 def env_value(*names: str, default: str | None = None) -> str | None:
@@ -26,6 +27,21 @@ def env_bool(name: str, default: bool = False) -> bool:
     if raw_value is None:
         return default
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_positive_int(name: str, default: int) -> int:
+    """Parse an environment value as a strictly positive whole number."""
+
+    raw_value = os.getenv(name)
+    candidate = str(default if raw_value in (None, "") else raw_value).strip()
+    try:
+        value = Decimal(candidate)
+    except InvalidOperation as exc:
+        raise ValueError(f"{name} must be a positive whole number") from exc
+
+    if not value.is_finite() or value <= 0 or value != value.to_integral_value():
+        raise ValueError(f"{name} must be a positive whole number")
+    return int(value)
 
 
 def env_list(name: str, default: list[str] | None = None) -> list[str]:
@@ -125,12 +141,52 @@ TEMPLATES = [
     },
 ]
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / os.getenv("DJANGO_SQLITE_NAME", "meet.sqlite3"),
-    },
-}
+def database_settings() -> dict[str, object]:
+    """Build the PostgreSQL connection from environment-backed settings.
+
+    ``python-decouple`` gives real process environment variables precedence and
+    falls back to the repository's untracked ``.env`` file for local
+    development.  The password intentionally has no secret default.
+    """
+
+    options: dict[str, str] = {}
+    sslmode = config("DATABASE_SSLMODE", default="", cast=str).strip()
+    if sslmode:
+        options["sslmode"] = sslmode
+
+    application_name = config(
+        "DATABASE_APPLICATION_NAME",
+        default="synq-meet",
+        cast=str,
+    ).strip()
+    if application_name:
+        options["application_name"] = application_name
+
+    return {
+        "ENGINE": config(
+            "DATABASE_ENGINE",
+            default="django.db.backends.postgresql",
+            cast=str,
+        ),
+        "NAME": config("DATABASE_NAME", default="meet", cast=str),
+        "USER": config("DATABASE_USER", default="postgres", cast=str),
+        "PASSWORD": config("DATABASE_PASSWORD", default="", cast=str),
+        "HOST": config("DATABASE_HOST", default="127.0.0.1", cast=str),
+        "PORT": config("DATABASE_PORT", default=5432, cast=int),
+        # Django recommends disabling persistent connections under ASGI. A
+        # deployment can still opt in explicitly, or introduce a separate
+        # psycopg pool with lifecycle/size limits appropriate to its workers.
+        "CONN_MAX_AGE": config("DATABASE_CONN_MAX_AGE", default=0, cast=int),
+        "CONN_HEALTH_CHECKS": config(
+            "DATABASE_CONN_HEALTH_CHECKS",
+            default=True,
+            cast=bool,
+        ),
+        "OPTIONS": options,
+    }
+
+
+DATABASES = {"default": database_settings()}
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -197,6 +253,67 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 60 * 15
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+# Preserve the process-local LogVista root handler. Celery otherwise replaces
+# root handlers when a worker starts, producing mixed formats and duplicates.
+CELERY_WORKER_HIJACK_ROOT_LOGGER = False
+
+_MEETING_CELERY_SCHEDULES = (
+    (
+        "recover-stale-meeting-provisioning",
+        "apps.meetings.tasks.recover_stale_provisioning_sessions",
+        "MEETING_PROVISIONING_RECOVERY_SWEEP_SECONDS",
+        30,
+    ),
+    (
+        "mark-stale-meeting-connections",
+        "apps.meetings.tasks.mark_stale_connections",
+        "MEETING_CONNECTION_STALE_SWEEP_SECONDS",
+        30,
+    ),
+    (
+        "cleanup-finished-meeting-sessions",
+        "apps.meetings.tasks.cleanup_finished_sessions",
+        "MEETING_FINISHED_SESSION_CLEANUP_SWEEP_SECONDS",
+        300,
+    ),
+    (
+        "end-scheduled-meeting-sessions",
+        "apps.meetings.tasks.end_scheduled_sessions",
+        "MEETING_SCHEDULED_SESSION_END_SWEEP_SECONDS",
+        30,
+    ),
+    (
+        "expire-pending-meeting-join-requests",
+        "apps.meetings.tasks.expire_pending_join_requests",
+        "MEETING_JOIN_REQUEST_EXPIRY_SWEEP_SECONDS",
+        60,
+    ),
+    (
+        "send-due-meeting-invitation-reminders",
+        "apps.meetings.tasks.queue_due_meeting_invitation_emails",
+        "MEETING_INVITATION_REMINDER_SWEEP_SECONDS",
+        60,
+    ),
+)
+CELERY_BEAT_SCHEDULE = {
+    schedule_name: {
+        "task": task_name,
+        "schedule": float(interval_seconds),
+        # DatabaseScheduler persists this field on PeriodicTask and later
+        # exposes it to Celery as the standard ``expires`` task option.
+        "options": {"expire_seconds": interval_seconds},
+    }
+    for schedule_name, task_name, interval_seconds in (
+        (
+            schedule_name,
+            task_name,
+            env_positive_int(environment_name, default_seconds),
+        )
+        for schedule_name, task_name, environment_name, default_seconds in (
+            _MEETING_CELERY_SCHEDULES
+        )
+    )
+}
 
 SOCKET_IO_PATH = env_value("SOCKET_IO_PATH", "SOCKETIO_PATH", default="socket.io")
 SOCKET_IO_REDIS_URL = env_value("SOCKET_IO_REDIS_URL", "SOCKETIO_REDIS_URL", default=REDIS_URL)
@@ -251,6 +368,21 @@ JRTC_EVENT_PUBLISH_ADMISSION_TIMEOUT = float(
 )
 JRTC_EVENT_PUBLISH_TIMEOUT = float(os.getenv("JRTC_EVENT_PUBLISH_TIMEOUT", "5"))
 JRTC_EVENT_DRAIN_TIMEOUT = float(os.getenv("JRTC_EVENT_DRAIN_TIMEOUT", "10"))
+JRTC_EVENT_RECEIPT_RETENTION_DAYS = int(
+    os.getenv("JRTC_EVENT_RECEIPT_RETENTION_DAYS", "30")
+)
+JRTC_EVENT_OUTBOX_POLL_INTERVAL = float(
+    os.getenv("JRTC_EVENT_OUTBOX_POLL_INTERVAL", "1")
+)
+JRTC_EVENT_OUTBOX_RETRY_DELAY = float(
+    os.getenv("JRTC_EVENT_OUTBOX_RETRY_DELAY", "2")
+)
+JRTC_EVENT_OUTBOX_LEASE_TIMEOUT = float(
+    os.getenv("JRTC_EVENT_OUTBOX_LEASE_TIMEOUT", "30")
+)
+JRTC_EVENT_OUTBOX_BATCH_SIZE = int(
+    os.getenv("JRTC_EVENT_OUTBOX_BATCH_SIZE", "100")
+)
 JRTC_EVENT_CONSUMER_CONCURRENCY = int(
     os.getenv("JRTC_EVENT_CONSUMER_CONCURRENCY", "1")
 )
@@ -350,3 +482,15 @@ EMAIL_USE_TLS = config("DJANGO_EMAIL_USE_TLS", cast=bool, default=True)
 # Authentication
 EMAIL_HOST_USER = config("DJANGO_EMAIL_USER", cast=str)  # Your actual Gmail address
 EMAIL_HOST_PASSWORD = config("DJANGO_EMAIL_PASSWORD", cast=str)  # The generated App Password (no spaces)
+
+LOG_LEVEL = config("LOG_LEVEL", default="", cast=str).strip()
+LOG_FORMAT = config("LOG_FORMAT", default="", cast=str).strip().lower()
+LOG_SERVICE = config("LOGVISTA_SERVICE", default="Synq Meet", cast=str).strip()
+LOG_ENVIRONMENT = config("LOGVISTA_ENVIRONMENT", default="", cast=str).strip()
+LOG_SHOW_SOURCE = config("LOGVISTA_SHOW_SOURCE", default="", cast=str).strip()
+LOG_COLOR = config("LOGVISTA_COLOR", default="auto", cast=str).strip().lower()
+
+# Django invokes this only after the complete settings module has loaded. This
+# matters because production.py/local.py finalize DEBUG after importing base.py.
+LOGGING_CONFIG = "conf.logging.configure_logging"
+LOGGING = {"version": 1}

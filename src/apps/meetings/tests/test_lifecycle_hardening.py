@@ -76,6 +76,98 @@ class MeetingLifecycleHardeningTests(TestCase):
         )
         return profile, room, session
 
+    def test_participant_removal_disconnects_every_live_owner_socket(self):
+        """Revocation reaches workers that own process-local JRTC handles."""
+
+        profile, _room, session = self.make_session("removed-owner-routing")
+        participant = session.participants.get(profile=profile)
+        active_sockets = {"removed-owner-a", "removed-owner-b"}
+        for socket_id in active_sockets:
+            ParticipantConnection.objects.create(
+                session=session,
+                participant=participant,
+                profile=profile,
+                socket_id=socket_id,
+                status=RealtimeConnectionStatus.ACTIVE,
+            )
+
+        with (
+            patch("apps.meetings.services.lifecycle.dispatch_task"),
+            patch(
+                "apps.meetings.realtime.emitter.MeetingSocketEmitter."
+                "emit_participant_removed"
+            ),
+            patch(
+                "apps.meetings.realtime.emitter.MeetingSocketEmitter."
+                "emit_session_state"
+            ),
+            patch(
+                "apps.meetings.realtime.emitter.MeetingSocketEmitter."
+                "disconnect_sockets"
+            ) as disconnect_sockets,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            MeetingLifecycleService.remove_participant(
+                session=session,
+                actor_profile=profile,
+                participant=participant,
+                reason="removed",
+            )
+
+        self.assertEqual(
+            set(disconnect_sockets.call_args.args[0]),
+            active_sockets,
+        )
+        self.assertFalse(
+            participant.connections.exclude(
+                status=RealtimeConnectionStatus.DISCONNECTED,
+            ).exists()
+        )
+
+    def test_participant_leave_disconnects_sibling_owner_sockets(self):
+        """A voluntary leave invalidates handles on every connection worker."""
+
+        profile, _room, session = self.make_session("leaving-owner-routing")
+        participant = session.participants.get(profile=profile)
+        active_sockets = {"leaving-owner-a", "leaving-owner-b"}
+        for socket_id in active_sockets:
+            ParticipantConnection.objects.create(
+                session=session,
+                participant=participant,
+                profile=profile,
+                socket_id=socket_id,
+                status=RealtimeConnectionStatus.ACTIVE,
+            )
+
+        with (
+            patch("apps.meetings.services.lifecycle.dispatch_task"),
+            patch(
+                "apps.meetings.realtime.emitter.MeetingSocketEmitter."
+                "emit_session_state"
+            ),
+            patch(
+                "apps.meetings.realtime.emitter.MeetingSocketEmitter."
+                "disconnect_sockets"
+            ) as disconnect_sockets,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            MeetingLifecycleService.leave_participant(
+                session=session,
+                profile=profile,
+                socket_id="leaving-owner-a",
+                reason="left",
+            )
+
+        self.assertEqual(
+            set(disconnect_sockets.call_args.args[0]),
+            active_sockets,
+        )
+        self.assertFalse(
+            participant.connections.exclude(
+                status=RealtimeConnectionStatus.DISCONNECTED,
+            ).exists()
+        )
+
     def test_active_unrelated_connection_cannot_steal_media_ownership(self):
         profile, _room, session = self.make_session("media-owner-fence")
         participant = session.participants.get(profile=profile)
