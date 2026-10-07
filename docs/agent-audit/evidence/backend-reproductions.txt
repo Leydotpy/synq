@@ -1,0 +1,2 @@
+{"case": "final-three", "calls": [["complete_trickle", 0]]}
+{"case": "empty-not-completed", "calls": [["complete_trickle", 0]]}
