@@ -1,0 +1,356 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-10-07",
+  "repository": "Leydotpy/synq",
+  "scope": "/",
+  "audited_branch": "v4",
+  "audited_commit": "2d8682701300f27ab3771e9ea72413b3f7631a49",
+  "instruction_revision": "2026-10-07.1",
+  "contract_revision": "2026-10-07.1",
+  "source_requirements_sha256": "e180d504323da6cb86b3696d2fa2504a9bee04948be410313a552a580a6f9555",
+  "audit_deliverable": {
+    "status": "ready_for_review",
+    "scope": "AGENTS instructions, requirement audit and verification evidence only",
+    "application_changes_in_this_revision": false
+  },
+  "groups": [
+    {
+      "id": "S01",
+      "sections": [
+        0,
+        1,
+        2
+      ],
+      "title": "Ownership and active implementation paths",
+      "implementation_status": "policy",
+      "verification_status": "source_review",
+      "note": "Keep the existing application control plane and integration package. This audit does not request a second signaling stack.",
+      "evidence": [
+        "src/apps/meetings/jrtc/videoroom/adapter.py",
+        "src/apps/meetings/realtime/namespace.py"
+      ]
+    },
+    {
+      "id": "S02",
+      "sections": [
+        3,
+        4,
+        5,
+        6,
+        39
+      ],
+      "title": "Native async media orchestration",
+      "implementation_status": "missing",
+      "verification_status": "source_review",
+      "note": "Socket handlers still wrap complete synchronous media methods in sync_to_async; services call janus_runtime.run through call_plugin_method. Direct async orchestration and its regression checks are absent.",
+      "evidence": [
+        "src/apps/meetings/realtime/namespace.py#on_session_media_trickle",
+        "src/apps/meetings/services/signaling.py#def trickle",
+        "src/apps/meetings/services/janus.py#def call_plugin_method"
+      ]
+    },
+    {
+      "id": "S03",
+      "sections": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        40
+      ],
+      "title": "ORM boundaries and transactional safety",
+      "implementation_status": "partial",
+      "verification_status": "source_review",
+      "note": "Claim/network/finalize separation and ownership tests exist. Preserve them during the async rewrite; async relation-loading and the complete new race matrix are not established.",
+      "evidence": [
+        "src/apps/meetings/services/janus.py#def ensure_participant_media_plugin",
+        "src/apps/meetings/services/signaling.py#def _claim_media_command",
+        "src/apps/meetings/tests/test_jrtc_persistence_contracts.py"
+      ]
+    },
+    {
+      "id": "S04",
+      "sections": [
+        12,
+        13,
+        45
+      ],
+      "title": "Database connection and pool policy",
+      "implementation_status": "partial",
+      "verification_status": "external_not_verified",
+      "note": "CONN_MAX_AGE defaults to zero and psycopg pool capability is declared. Enabled deployment pooling, worker budgets and measured acquisition latency are not demonstrated.",
+      "evidence": [
+        "src/conf/settings/base.py#CONN_MAX_AGE",
+        "pyproject.toml"
+      ]
+    },
+    {
+      "id": "S05",
+      "sections": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        37,
+        38
+      ],
+      "title": "ICE payload validation and final-batch semantics",
+      "implementation_status": "partial",
+      "verification_status": "reproduced_gap",
+      "note": "Final candidates with completed=true are skipped; the service treats an empty incomplete batch as completion. Mixed invalid entries are skipped rather than atomically rejected. Namespace fallback is ambiguous, completed uses truthiness, no application batch limit was found, and usernameFragment is not forwarded. Normal non-final arrays do retain order.",
+      "evidence": [
+        "src/apps/meetings/services/signaling.py#def trickle",
+        "src/apps/meetings/services/signaling.py#def _serialize_trickle_candidates",
+        "src/apps/meetings/realtime/namespace.py#on_session_media_trickle",
+        "src/apps/meetings/tests/test_jrtc_signaling_contracts.py"
+      ]
+    },
+    {
+      "id": "S06",
+      "sections": [
+        22,
+        23,
+        24,
+        25,
+        26,
+        41
+      ],
+      "title": "Live binding and ephemeral ICE fast path",
+      "implementation_status": "missing",
+      "verification_status": "source_review",
+      "note": "Every trickle still resolves through the durable claim flow, claims a media command and writes last_event_at. The registry has local lookup/invocation fencing, but the application service does not use it as the requested healthy fast path.",
+      "evidence": [
+        "src/apps/meetings/services/signaling.py#def trickle",
+        "src/apps/meetings/services/janus.py#def ensure_participant_media_plugin",
+        "src/apps/meetings/jrtc/handles.py#async def invoke"
+      ]
+    },
+    {
+      "id": "S07",
+      "sections": [
+        27
+      ],
+      "title": "Reuse the VideoRoom management service",
+      "implementation_status": "missing",
+      "verification_status": "source_review",
+      "note": "VideoRoomAdapter.management_command still attaches and detaches a temporary plugin on each command. It does not consume VideoRoomService.",
+      "evidence": [
+        "src/apps/meetings/jrtc/videoroom/adapter.py#async def management_command"
+      ]
+    },
+    {
+      "id": "S08",
+      "sections": [
+        28,
+        29
+      ],
+      "title": "Separate command and broker event paths",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Runtime constructs the publisher/manager and an explicit Broka consumer processes application events. Production pressure isolation still requires the integrated load run.",
+      "evidence": [
+        "src/apps/meetings/jrtc/runtime.py#async def _start_owned",
+        "src/apps/meetings/jrtc/events/consumer.py",
+        "src/apps/meetings/jrtc/events/dispatcher.py",
+        "src/apps/meetings/tests/test_jrtc_event_plane.py"
+      ]
+    },
+    {
+      "id": "S09",
+      "sections": [
+        30,
+        31,
+        32,
+        42
+      ],
+      "title": "Event identity for sound and notification policy",
+      "implementation_status": "partial",
+      "verification_status": "source_review",
+      "note": "Semantic meeting events and domain object IDs exist. A complete live/replay/snapshot contract and dedicated coverage for all six sound categories are not demonstrated; participant cues currently depend on frontend snapshot differences.",
+      "evidence": [
+        "src/apps/meetings/realtime/events.py",
+        "src/apps/meetings/realtime/emitter.py",
+        "src/apps/meetings/tests/test_realtime_namespace.py"
+      ]
+    },
+    {
+      "id": "S10",
+      "sections": [
+        33,
+        34
+      ],
+      "title": "Recovery integration and generation invalidation",
+      "implementation_status": "partial",
+      "verification_status": "source_review",
+      "note": "Registry validation rejects stale bindings and JRTC owns session replacement. Synq runtime does not establish the requested proactive loss observation plus management-service invalidation. Do not replace JRTC manager recovery ownership to add notifications.",
+      "evidence": [
+        "src/apps/meetings/jrtc/runtime.py",
+        "src/apps/meetings/jrtc/handles.py#async def _get_locked"
+      ]
+    },
+    {
+      "id": "S11",
+      "sections": [
+        35
+      ],
+      "title": "Session-pool tuning policy",
+      "implementation_status": "policy",
+      "verification_status": "external_not_verified",
+      "note": "Retain the existing default until matched 1/2/4-session application workloads are recorded. No Synq performance results satisfy this gate.",
+      "evidence": [
+        "src/apps/meetings/jrtc/config.py"
+      ]
+    },
+    {
+      "id": "S12",
+      "sections": [
+        36
+      ],
+      "title": "Metadata-only hot-path logging",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Relevant signaling diagnostics use identities and error metadata rather than routine SDP/candidate dumps. Retain this behavior and add log-capture checks when changing error normalization.",
+      "evidence": [
+        "src/apps/meetings/services/signaling.py",
+        "src/apps/meetings/jrtc/videoroom/adapter.py"
+      ]
+    },
+    {
+      "id": "S13",
+      "sections": [
+        43,
+        44
+      ],
+      "title": "Application signaling and ICE benchmarks",
+      "implementation_status": "missing",
+      "verification_status": "external_not_verified",
+      "note": "No before/after application benchmark with DB query/write counts, thread crossings, browser ICE timing and TURN-only success is present in the inspected tree.",
+      "evidence": [
+        "src/apps/meetings/tests/test_jrtc_signaling_contracts.py"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "S-T01",
+      "title": "Fix the ICE wire contract",
+      "priority": "P0",
+      "dependencies": [],
+      "scope": "namespace.py; services/signaling.py; ICE contract tests",
+      "acceptance": "For publisher and subscriber: [A,B,C]+true forwards one ordered batch then one completion; []+false, mixed invalid entries, ambiguous singular/plural, non-boolean completed and oversized payloads reject before handle/DB side effects. Retain one-candidate legacy compatibility only at the boundary. Add an application limit of 32 and a separately documented byte limit; change limits only with evidence.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    },
+    {
+      "id": "S-T02",
+      "title": "Make media orchestration async",
+      "priority": "P1",
+      "dependencies": [
+        "S-T01"
+      ],
+      "scope": "realtime namespace; signaling and janus services; async boundary tests",
+      "acceptance": "Directly await adapter calls on the owner loop. Ordinary ORM execution uses async APIs with relations loaded explicitly. Transactions remain narrow synchronous helpers with no network I/O. Existing publish/disconnect and ownership tests still pass; realtime tests fail if janus_runtime.run is invoked.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    },
+    {
+      "id": "S-T03",
+      "title": "Add the healthy binding and ICE fast path",
+      "priority": "P1",
+      "dependencies": [
+        "S-T02"
+      ],
+      "scope": "handle registry; authorization and activity accounting",
+      "acceptance": "Validate active socket, participant, process owner, connection generation and live session/handle under an invocation fence. Healthy ICE adds zero handle-resolution claims/writes and zero per-batch activity writes; authentication reads may remain. Detach/handoff/revocation cannot bypass authorization. Demonstrate the miss/recovery path and bounded coalesced activity updates.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    },
+    {
+      "id": "S-T04",
+      "title": "Consume a session-owned VideoRoomService",
+      "priority": "P1",
+      "dependencies": [
+        "S-T02",
+        "V-T01"
+      ],
+      "scope": "VideoRoom adapter; runtime lifecycle; dependency lock",
+      "acceptance": "Cache by actual session object and generation, not just a reusable integer ID. Keep participant handles separate. Create a new service for a replacement session; do not mutate service.session. Close services before destroying their owning sessions. Prove repeated command reuse, replacement and cancellation-safe shutdown. Verify the selected package release actually contains the API.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    },
+    {
+      "id": "S-T05",
+      "title": "Complete event identity and loss observation",
+      "priority": "P1",
+      "dependencies": [
+        "S-T02",
+        "C-T02"
+      ],
+      "scope": "event schemas; runtime; registry; frontend contracts",
+      "acceptance": "Publish stable semantic event identity, actor, session and occurrence time; distinguish snapshots/replay from new events without a play_sound command. Reconcile admission decisions across coordinators. Observe loss without replacing the manager loss handler or creating a second recovery owner; fence old bindings immediately and reconcile durable state off the reader.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    },
+    {
+      "id": "S-T06",
+      "title": "Run integrated acceptance and measurements",
+      "priority": "P2",
+      "dependencies": [
+        "S-T01",
+        "S-T02",
+        "S-T03",
+        "S-T04",
+        "S-T05",
+        "F-T05"
+      ],
+      "scope": "test deployment; version lock; benchmark evidence",
+      "acceptance": "Run Python 3.14+ with the repository supported Django/Postgres/broker versions. Record query/write budgets, p50/p95/p99, lag, CPU/RSS, 1/2/4-session comparison and TURN-only browser success. Test rolling restarts and broker stalls. Retain rollback configuration and verify old and new client compatibility before enabling combined final batches.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    }
+  ],
+  "verification_limits": "Full Django tests were not run: this environment has Python 3.12.14, whereas Synq declares Python >=3.14, and Django/Broka dependencies are unavailable. A focused AST extraction executed the actual trickle method with infrastructure doubles; final-three and empty-incomplete both called only complete_trickle. This establishes control flow, not database or Janus integration.",
+  "cross_repository_dependencies": {
+    "synq": {
+      "repo": "synq",
+      "branch": "v4",
+      "sha": "2d8682701300f27ab3771e9ea72413b3f7631a49",
+      "tree": "f0f72982ff3da0c11c3d555b07836e5a171acede"
+    },
+    "jrtc": {
+      "repo": "jrtc",
+      "branch": "main",
+      "sha": "de64c1e02b550049c8253fdef7d47a87b765c9e8",
+      "tree": "20fad7a45b261dd2f77e9bfd847b0cae2a78c38d"
+    },
+    "jrtc-plugins": {
+      "repo": "jrtc-plugins",
+      "branch": "main",
+      "sha": "bec03a533ab3af33c1deef822e8249f123a007dc",
+      "tree": "49bf501508a0faa60c0007ee17edd63c29aae418"
+    },
+    "synq.js": {
+      "repo": "synq.js",
+      "branch": "codex/batched-ice-meeting-sounds",
+      "sha": "da471c92989ccf28a26de14d6ec4d1356c647bed",
+      "tree": "df332f1cbcfe6084f86e17a436f31054a88461d3"
+    }
+  }
+}
