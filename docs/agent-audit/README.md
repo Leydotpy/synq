@@ -1,5 +1,7 @@
 # Synq backend — AGENTS implementation audit
 
+**2026-10-08 implementation follow-up:** runtime changes are now proposed in the coordinated draft PRs. Read [IMPLEMENTATION.md](IMPLEMENTATION.md) and the updated work plan for current evidence and external gates. The audit below is the preserved 2026-10-07 baseline.
+
 Audit date: 2026-10-07. **Not fully implemented. The earlier JRTC migration is substantially present, but the supplied async/ICE performance phase is mostly outstanding. Final-batch handling is a release blocker for the audited frontend.**
 
 This PR improves instructions and adds an evidence/tracking pack. It does **not** change runtime application code, fix the listed defects, or declare the remaining implementation tasks complete. Review and merge the instruction update independently; select implementation concerns from WORK_PLAN.md afterward.

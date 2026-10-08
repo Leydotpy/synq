@@ -66,13 +66,20 @@ def record_session_event(
 ) -> MeetingEvent:
     """Persist a structured meeting event for observability and later debugging."""
 
-    return MeetingEvent.objects.create(
+    event = MeetingEvent.objects.create(
         session=session,
         actor_profile=actor_profile,
         actor_participant=actor_participant,
         event_type=event_type,
         payload=payload or {},
     )
+
+    if event_type in {MeetingEventType.PARTICIPANT_JOINED, MeetingEventType.PARTICIPANT_LEFT}:
+        def emit_presence():
+            from apps.meetings.realtime.emitter import MeetingSocketEmitter
+            MeetingSocketEmitter.emit_participant_presence(event=event)
+        transaction.on_commit(emit_presence)
+    return event
 
 
 def dispatch_task(task, *args):
@@ -692,8 +699,8 @@ class MeetingLifecycleService:
 
             from apps.meetings.realtime.emitter import MeetingSocketEmitter
 
-            MeetingSocketEmitter.emit_session_state(session=session)
             MeetingSocketEmitter.emit_join_request_reviewed(join_request=join_request, participant=participant)
+            MeetingSocketEmitter.emit_session_state(session=session)
             if participant is not None:
                 from apps.meetings.tasks import attach_participant_media_handles
 
@@ -1076,6 +1083,9 @@ class MeetingLifecycleService:
                     connection.participant.status = ParticipantStatus.DISCONNECTED
                     connection.participant.last_seen_at = timezone.now()
                     connection.participant.save(update_fields=["status", "last_seen_at", "updated_at"])
+                    record_session_event(session=connection.participant.session,
+                        event_type=MeetingEventType.PARTICIPANT_LEFT, actor_profile=connection.participant.profile,
+                        actor_participant=connection.participant, payload={"reason": "disconnected"})
             if connection.session:
                 MeetingLifecycleService.refresh_session_metrics(session=connection.session)
                 session = connection.session

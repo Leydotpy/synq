@@ -1,0 +1,43 @@
+{
+  "date": "2026-10-08",
+  "code_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+  "review_pr": "https://github.com/Leydotpy/synq/pull/2",
+  "live_environment_verified": false,
+  "runtime": {
+    "python": "3.14.8",
+    "django": "6.0.7",
+    "jrtc": "3.2.0",
+    "jrtc-video": "3.0.3",
+    "broka": "0.0.2",
+    "dispio": "0.0.2"
+  },
+  "frozen_install": "passed",
+  "required_and_new_tests": {
+    "passed": 91
+  },
+  "meeting_suite": {
+    "total": 166,
+    "passed": 159,
+    "failed": 7,
+    "failure_scope": "pre-existing missing startup files"
+  },
+  "migration_check": "no changes",
+  "healthy_final_ice": {
+    "roles": [
+      "publisher",
+      "subscriber"
+    ],
+    "service_reads": 4,
+    "writes": 0,
+    "excludes": "socket namespace authentication"
+  },
+  "new_lifecycle_tests": {
+    "transport": "double",
+    "service_and_plugin": "installed packages",
+    "orm": "real SQLite"
+  },
+  "dependency_commits": {
+    "jrtc": "b0998af03c0702302855cc7c52c3dd53ac7a32af",
+    "jrtc-video": "87bbb9b79870724a91fc98f8711c55f5cb4519e2"
+  }
+}

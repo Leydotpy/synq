@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 
-from asgiref.sync import async_to_sync
+from asgiref.sync import async_to_sync, sync_to_async
 from django.db.models import Q
 
 from apps.meetings.models import (
@@ -19,6 +19,7 @@ from apps.meetings.models import (
     RealtimeConnectionStatus,
 )
 from apps.meetings.realtime.events import MeetingSocketEvents
+from apps.meetings.realtime.context import event_context
 from apps.meetings.services.state import MeetingStateBuilder
 
 logger = logging.getLogger(__name__)
@@ -56,11 +57,29 @@ class MeetingSocketEmitter:
             )
 
     @staticmethod
+    async def aemit_session_state(*, session: MeetingSession) -> None:
+        from conf.socketio import get_socket_server
+        connections = ParticipantConnection.objects.filter(session=session,
+            status__in=[RealtimeConnectionStatus.CONNECTED, RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
+        ).select_related("profile")
+        snapshots = {}
+        async for connection in connections:
+            key = str(connection.profile_id)
+            if key not in snapshots:
+                snapshots[key] = await sync_to_async(MeetingStateBuilder.build)(session=session, authenticated_profile=connection.profile)
+            try:
+                await get_socket_server().emit(MeetingSocketEvents.SESSION_STATE, snapshots[key],
+                    room=connection.socket_id, namespace=MeetingSocketEmitter.namespace)
+            except Exception:
+                logger.exception("Unable to emit session state", extra={"session_id": str(session.pk)})
+
+    @staticmethod
     def emit_session_ended(*, session: MeetingSession, reason: str = "") -> None:
         """Notify every subscribed attendee that the meeting is terminal."""
 
         payload = {
             "session_id": str(session.pk),
+            "event_context": event_context("session-ended", session.pk, session.pk, session.ended_at),
             "reason": reason,
             "ended_at": session.ended_at.isoformat() if session.ended_at else None,
         }
@@ -95,14 +114,17 @@ class MeetingSocketEmitter:
     def emit_join_request_created(*, join_request: MeetingJoinRequest) -> None:
         """Broadcast a newly created join request to coordinators and the requester."""
 
+        payload = MeetingStateBuilder.serialize_join_request(join_request)
+        payload["event_context"] = event_context("join-request-created", join_request.pk, join_request.session_id,
+            join_request.created_at, actor_profile_id=join_request.profile_id)
         MeetingSocketEmitter._emit(
             event=MeetingSocketEvents.JOIN_REQUEST_CREATED,
-            payload=MeetingStateBuilder.serialize_join_request(join_request),
+            payload=payload,
             room=MeetingSocketEmitter.coordinator_room_name(join_request.session_id),
         )
         MeetingSocketEmitter._emit(
             event=MeetingSocketEvents.JOIN_REQUEST_CREATED,
-            payload=MeetingStateBuilder.serialize_join_request(join_request),
+            payload=payload,
             room=MeetingSocketEmitter.profile_room_name(join_request.profile_id),
         )
 
@@ -111,6 +133,8 @@ class MeetingSocketEmitter:
         """Broadcast a join-request review decision to the session and requester rooms."""
 
         payload = {
+            "event_context": event_context("join-request-reviewed", f"{join_request.pk}:{join_request.status}", join_request.session_id,
+                join_request.reviewed_at, actor_profile_id=join_request.reviewed_by_profile_id),
             "join_request": MeetingStateBuilder.serialize_join_request(join_request),
             "participant": MeetingStateBuilder.serialize_participant(participant),
         }
@@ -129,7 +153,9 @@ class MeetingSocketEmitter:
     def emit_participant_removed(*, session: MeetingSession, participant: Participant, reason: str = "") -> None:
         """Notify active participants and every socket owned by the removed profile."""
 
-        payload = {"participant_id": str(participant.pk), "reason": reason}
+        payload = {"participant_id": str(participant.pk), "reason": reason,
+            "event_context": event_context("participant-removed", f"{participant.pk}:{participant.left_at}", session.pk,
+                participant.left_at, actor_participant_id=participant.pk)}
         for socket_id in MeetingSocketEmitter.active_participant_socket_ids(
             session.pk,
         ):
@@ -149,6 +175,8 @@ class MeetingSocketEmitter:
         """Broadcast a new chat message only to DB-active participants."""
 
         payload = MeetingStateBuilder.serialize_message(message)
+        payload["event_context"] = event_context("message-created", message.pk, message.session_id,
+            message.created_at, actor_participant_id=message.participant_id)
         for socket_id in MeetingSocketEmitter.active_participant_socket_ids(
             message.session_id,
         ):
@@ -163,6 +191,8 @@ class MeetingSocketEmitter:
         """Broadcast a new reaction only to DB-active participants."""
 
         payload = MeetingStateBuilder.serialize_reaction(reaction)
+        payload["event_context"] = event_context("reaction-created", reaction.pk, reaction.session_id,
+            reaction.created_at, actor_participant_id=reaction.participant_id)
         for socket_id in MeetingSocketEmitter.active_participant_socket_ids(
             reaction.session_id,
         ):
@@ -171,6 +201,19 @@ class MeetingSocketEmitter:
                 payload=payload,
                 room=socket_id,
             )
+
+    @staticmethod
+    def emit_participant_presence(*, event) -> None:
+        """Publish a committed presence transition, never a snapshot difference."""
+        payload = {
+            "participant_id": str(event.actor_participant_id),
+            "status": "joined" if event.event_type == "participant_joined" else "left",
+            "event_context": event_context(event.event_type, event.pk, event.session_id,
+                event.created_at, actor_profile_id=event.actor_profile_id,
+                actor_participant_id=event.actor_participant_id),
+        }
+        for socket_id in MeetingSocketEmitter.active_participant_socket_ids(event.session_id):
+            MeetingSocketEmitter._emit(event=MeetingSocketEvents.PARTICIPANT_PRESENCE_CHANGED, payload=payload, room=socket_id)
 
     @staticmethod
     def emit_error(*, room: str, message: str, details: dict | None = None) -> None:

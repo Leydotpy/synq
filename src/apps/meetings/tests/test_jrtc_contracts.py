@@ -382,12 +382,12 @@ class CommandPlaneContractTests(SimpleTestCase):
             }
         )
 
-        await transport._resolve_ack(acknowledgement)
+        transport._resolve_ack(acknowledgement)
 
         self.assertFalse(future.done())
         self.assertIn("command-1", transport._transactions)
 
-        await transport._resolve_transaction(final_event)
+        transport._resolve_transaction(final_event)
 
         self.assertIs(await future, final_event)
         self.assertNotIn("command-1", transport._transactions)

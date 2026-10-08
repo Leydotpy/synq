@@ -17,8 +17,8 @@ dependencies = [
     "fastapi>=0.140.0",
     "gunicorn>=26.0.0",
     "aio-pika>=10.0.1,<11",
-    "jrtc[kafka]>=3.1,<4",
-    "jrtc-video>=3,<4",
+    "jrtc[kafka]>=3.2,<4",
+    "jrtc-video>=3.0.3,<4",
     "logvista>=0.1,<1",
     "python-decouple>=3.8",
     "python-socketio>=5.16.3",
@@ -34,3 +34,9 @@ dependencies = [
 # Synq's django-celery-beat release currently supports Django <6.1.  Keep the
 # application on its supported Django line until Broka corrects that metadata.
 override-dependencies = ["django>=6.0.7,<6.1"]
+
+# Review builds consume the exact implementation commits; switch to released
+# artifacts only after those releases are available and integration is verified.
+[tool.uv.sources]
+jrtc = { git = "https://github.com/Leydotpy/jrtc.git", rev = "b0998af03c0702302855cc7c52c3dd53ac7a32af" }
+jrtc-video = { git = "https://github.com/Leydotpy/jrtc-plugins.git", rev = "87bbb9b79870724a91fc98f8711c55f5cb4519e2", subdirectory = "jrtc-video" }

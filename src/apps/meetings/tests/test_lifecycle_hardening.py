@@ -5,7 +5,8 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, AsyncMock, patch
+from asgiref.sync import async_to_sync
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
@@ -32,7 +33,7 @@ from apps.meetings.models import (
 )
 from apps.meetings.services.janus import (
     build_room_payload,
-    ensure_participant_media_plugin,
+    aensure_participant_media_plugin,
     janus_runtime,
 )
 from apps.meetings.services.lifecycle import MeetingLifecycleService
@@ -405,13 +406,12 @@ class MeetingLifecycleHardeningTests(TestCase):
             recreated=True,
             replaced_stale=False,
         )
-        resolve_marker = object()
-        detach_marker = object()
-        resolve_call = Mock(return_value=resolve_marker)
-        detach_call = Mock(return_value=detach_marker)
+        resolve_call = AsyncMock(return_value=resolution)
+        detach_call = AsyncMock()
 
         with (
             patch.object(janus_runtime, "reset_after_fork"),
+            patch.object(janus_runtime, "require_owner_loop"),
             patch.object(janus_runtime, "_state", janus_runtime.RUNNING),
             patch.object(janus_runtime, "_owner_id", "runtime-test"),
             patch.object(
@@ -427,7 +427,7 @@ class MeetingLifecycleHardeningTests(TestCase):
             patch.object(
                 janus_runtime,
                 "run",
-                side_effect=[resolution, None],
+                side_effect=AssertionError("Realtime must not call runtime.run"),
             ),
             patch(
                 "apps.meetings.services.lifecycle.record_session_event",
@@ -435,7 +435,7 @@ class MeetingLifecycleHardeningTests(TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "event persistence failed"),
         ):
-            ensure_participant_media_plugin(media_handle, recreate=True)
+            async_to_sync(aensure_participant_media_plugin)(media_handle, recreate=True)
 
         media_handle.refresh_from_db()
         self.assertIsNone(media_handle.runtime_owner_id)
@@ -445,7 +445,7 @@ class MeetingLifecycleHardeningTests(TestCase):
             media_handle.lifecycle_state,
             JanusHandleLifecycleState.READY,
         )
-        detach_call.assert_called_once_with(str(media_handle.pk), expected=binding)
+        detach_call.assert_awaited_once_with(str(media_handle.pk), expected=binding)
 
     @override_settings(MEETING_CONNECTION_STALE_SECONDS=90)
     def test_stale_sweep_cas_does_not_overwrite_racing_heartbeat(self):

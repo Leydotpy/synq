@@ -6,7 +6,7 @@
   "audited_branch": "v4",
   "audited_commit": "2d8682701300f27ab3771e9ea72413b3f7631a49",
   "instruction_revision": "2026-10-07.1",
-  "contract_revision": "2026-10-07.1",
+  "contract_revision": "2026-10-08.1",
   "source_requirements_sha256": "e180d504323da6cb86b3696d2fa2504a9bee04948be410313a552a580a6f9555",
   "audit_deliverable": {
     "status": "ready_for_review",
@@ -243,10 +243,13 @@
       "dependencies": [],
       "scope": "namespace.py; services/signaling.py; ICE contract tests",
       "acceptance": "For publisher and subscriber: [A,B,C]+true forwards one ordered batch then one completion; []+false, mixed invalid entries, ambiguous singular/plural, non-boolean completed and oversized payloads reject before handle/DB side effects. Retain one-candidate legacy compatibility only at the boundary. Add an application limit of 32 and a separately documented byte limit; change limits only with evidence.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "ready_for_review",
+      "implementation_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08"
     },
     {
       "id": "S-T02",
@@ -257,10 +260,13 @@
       ],
       "scope": "realtime namespace; signaling and janus services; async boundary tests",
       "acceptance": "Directly await adapter calls on the owner loop. Ordinary ORM execution uses async APIs with relations loaded explicitly. Transactions remain narrow synchronous helpers with no network I/O. Existing publish/disconnect and ownership tests still pass; realtime tests fail if janus_runtime.run is invoked.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "ready_for_review",
+      "implementation_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08"
     },
     {
       "id": "S-T03",
@@ -271,10 +277,13 @@
       ],
       "scope": "handle registry; authorization and activity accounting",
       "acceptance": "Validate active socket, participant, process owner, connection generation and live session/handle under an invocation fence. Healthy ICE adds zero handle-resolution claims/writes and zero per-batch activity writes; authentication reads may remain. Detach/handoff/revocation cannot bypass authorization. Demonstrate the miss/recovery path and bounded coalesced activity updates.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "ready_for_review",
+      "implementation_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08"
     },
     {
       "id": "S-T04",
@@ -286,10 +295,13 @@
       ],
       "scope": "VideoRoom adapter; runtime lifecycle; dependency lock",
       "acceptance": "Cache by actual session object and generation, not just a reusable integer ID. Keep participant handles separate. Create a new service for a replacement session; do not mutate service.session. Close services before destroying their owning sessions. Prove repeated command reuse, replacement and cancellation-safe shutdown. Verify the selected package release actually contains the API.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "ready_for_review",
+      "implementation_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08"
     },
     {
       "id": "S-T05",
@@ -301,10 +313,13 @@
       ],
       "scope": "event schemas; runtime; registry; frontend contracts",
       "acceptance": "Publish stable semantic event identity, actor, session and occurrence time; distinguish snapshots/replay from new events without a play_sound command. Reconcile admission decisions across coordinators. Observe loss without replacing the manager loss handler or creating a second recovery owner; fence old bindings immediately and reconcile durable state off the reader.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "ready_for_review",
+      "implementation_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08"
     },
     {
       "id": "S-T06",
@@ -320,10 +335,14 @@
       ],
       "scope": "test deployment; version lock; benchmark evidence",
       "acceptance": "Run Python 3.14+ with the repository supported Django/Postgres/broker versions. Record query/write budgets, p50/p95/p99, lag, CPU/RSS, 1/2/4-session comparison and TURN-only browser success. Test rolling restarts and broker stalls. Retain rollback configuration and verify old and new client compatibility before enabling combined final batches.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "blocked",
+      "implementation_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08",
+      "blocker": "Live deployment/browser/Janus/broker measurements and maintainer release verification are unavailable; local tests and synthetic evidence are recorded separately."
     }
   ],
   "verification_limits": "Full Django tests were not run: this environment has Python 3.12.14, whereas Synq declares Python >=3.14, and Django/Broka dependencies are unavailable. A focused AST extraction executed the actual trickle method with infrastructure doubles; final-three and empty-incomplete both called only complete_trickle. This establishes control flow, not database or Janus integration.",
@@ -352,5 +371,132 @@
       "sha": "da471c92989ccf28a26de14d6ec4d1356c647bed",
       "tree": "df332f1cbcfe6084f86e17a436f31054a88461d3"
     }
+  },
+  "implementation_revision": {
+    "date": "2026-10-08",
+    "branch": "codex/implement-agent-plan-2026-10-08",
+    "code_commit": "eaa2a3f8ec5b4fbc70e488b971c531ed2be44fb0",
+    "report": "docs/agent-audit/IMPLEMENTATION.md",
+    "pull_request": "https://github.com/Leydotpy/synq/pull/2",
+    "historical_groups_preserved": true,
+    "groups": [
+      {
+        "id": "S01",
+        "implementation_status": "policy",
+        "verification_status": "source_review",
+        "note": "Unchanged baseline obligation; see the historical audit and current implementation report for limits.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S02",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Native async realtime media; owner-loop tests prohibit runtime.run.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S03",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Narrow DB claim/finalize helpers and compensation tests pass; PostgreSQL locking remains external.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S04",
+        "implementation_status": "partial",
+        "verification_status": "external_not_verified",
+        "note": "Unchanged baseline obligation; see the historical audit and current implementation report for limits.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S05",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Strict 32-entry/64-KiB boundary; ordered final batch, completion and invalid-input regressions pass.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S06",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Both healthy final ICE roles use four service reads and zero writes; revocation and lost-binding tests pass.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S07",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Installed service reuse/replacement and cancellation-safe runtime shutdown verified with frozen package pins.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S08",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Direct command ACK and durable receipt/outbox regressions pass; terminal pruning preserves unfinished delivery.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S09",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Stable live semantic context and committed presence events; snapshot markers and admission echo reconciliation tested locally.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S10",
+        "implementation_status": "present",
+        "verification_status": "runtime_subset_passed",
+        "note": "Separate bounded loss observers coalesce work; actual generation fences and conditional projection cleanup preserve replacements.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S11",
+        "implementation_status": "policy",
+        "verification_status": "external_not_verified",
+        "note": "Unchanged baseline obligation; see the historical audit and current implementation report for limits.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S12",
+        "implementation_status": "present",
+        "verification_status": "source_review",
+        "note": "Unchanged baseline obligation; see the historical audit and current implementation report for limits.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      },
+      {
+        "id": "S13",
+        "implementation_status": "partial",
+        "verification_status": "external_not_verified",
+        "note": "Real ORM query/write counts recorded; live latency, resources, pool comparison and TURN-only measurements remain blocked.",
+        "evidence": [
+          "docs/agent-audit/IMPLEMENTATION.md"
+        ]
+      }
+    ]
   }
 }

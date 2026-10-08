@@ -1,17 +1,19 @@
 # Synq backend — concern-by-concern work plan
 
+Implementation update 2026-10-08: local implementations and evidence are ready for review; the final live acceptance task remains blocked. See [IMPLEMENTATION.md](IMPLEMENTATION.md). The audit-only statement below describes the historical documentation change.
+
 The audit/instruction change is ready for review. The implementation tasks below are **not started by this documentation change**. Existing code is credited in requirements.csv; tasks describe the remaining corrections or verification, not a request to repeat completed features.
 
 Task IDs are unique across the four repositories: S=Synq, F=frontend, C=core, V=VideoRoom. A dependency in another repository refers to that repository's WORK_PLAN.md. Dependencies gate integration/release; isolated test preparation may proceed earlier. No task requires automatic delegation to other agents.
 
 | Task | Priority | Dependencies | State |
 | --- | --- | --- | --- |
-| S-T01 — Fix the ICE wire contract | P0 | None | not_started |
-| S-T02 — Make media orchestration async | P1 | S-T01 | not_started |
-| S-T03 — Add the healthy binding and ICE fast path | P1 | S-T02 | not_started |
-| S-T04 — Consume a session-owned VideoRoomService | P1 | S-T02, V-T01 | not_started |
-| S-T05 — Complete event identity and loss observation | P1 | S-T02, C-T02 | not_started |
-| S-T06 — Run integrated acceptance and measurements | P2 | S-T01, S-T02, S-T03, S-T04, S-T05, F-T05 | not_started |
+| S-T01 — Fix the ICE wire contract | P0 | None | ready_for_review |
+| S-T02 — Make media orchestration async | P1 | S-T01 | ready_for_review |
+| S-T03 — Add the healthy binding and ICE fast path | P1 | S-T02 | ready_for_review |
+| S-T04 — Consume a session-owned VideoRoomService | P1 | S-T02, V-T01 | ready_for_review |
+| S-T05 — Complete event identity and loss observation | P1 | S-T02, C-T02 | ready_for_review |
+| S-T06 — Run integrated acceptance and measurements | P2 | S-T01, S-T02, S-T03, S-T04, S-T05, F-T05 | blocked |
 
 ## S-T01 — Fix the ICE wire contract
 
