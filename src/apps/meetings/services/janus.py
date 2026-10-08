@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Awaitable, Iterable, Mapping
 from typing import Any
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -383,7 +384,14 @@ def release_local_media_plugins_for_connection(connection_id: Any) -> int:
     return len(bindings)
 
 
-def ensure_participant_media_plugin(
+def ensure_participant_media_plugin(media_handle: Any, *, recreate: bool = True) -> BoundVideoRoomHandle:
+    """Synchronous worker compatibility; realtime callers use the async entry point."""
+    if janus_runtime.state != janus_runtime.RUNNING:
+        janus_runtime.ensure_background()
+    return janus_runtime.run(aensure_participant_media_plugin(media_handle, recreate=recreate))
+
+
+async def aensure_participant_media_plugin(
     media_handle: Any,
     *,
     recreate: bool = True,
@@ -398,8 +406,7 @@ def ensure_participant_media_plugin(
     """
 
     janus_runtime.reset_after_fork()
-    if janus_runtime.state != janus_runtime.RUNNING:
-        janus_runtime.ensure_background()
+    janus_runtime.require_owner_loop()
     runtime_owner_id = janus_runtime.owner_id
     expected_connection_id = media_handle.connection_id
     claim_id = uuid.uuid4()
@@ -409,174 +416,179 @@ def ensure_participant_media_plugin(
     resolution = None
     binding: BoundVideoRoomHandle | None = None
     stale = False
+    final_lifecycle_state = None
 
     try:
-        # Phase 1: make a short durable process/generation claim.
-        with transaction.atomic():
-            locked_handle = (
-                media_handle.__class__.objects.select_for_update(of=("self",))
-                .select_related(
-                    "participant__profile",
-                    "participant__session",
-                    "connection",
+        def claim_resolution():
+            nonlocal owner_claimed, previous_lifecycle_state
+            # Phase 1: make a short durable process/generation claim.
+            with transaction.atomic():
+                locked_handle = (
+                    media_handle.__class__.objects.select_for_update(of=("self",))
+                    .select_related(
+                        "participant__profile",
+                        "participant__session",
+                        "connection",
+                    )
+                    .get(pk=media_handle.pk)
                 )
-                .get(pk=media_handle.pk)
-            )
-            if locked_handle.connection_id != expected_connection_id:
-                raise JrtcHandleOwnershipError(
-                    "The media connection generation changed before handle resolution."
-                )
-            if locked_handle.lifecycle_state == "detaching":
-                raise JrtcHandleUnavailable(
-                    "The prior connection generation is still being released."
-                )
-            if expected_connection_id is not None and (
-                locked_handle.connection is None
-                or str(locked_handle.connection.status)
-                not in {"connected", "subscribed", "active"}
-            ):
-                raise JrtcHandleOwnershipError(
-                    "The media connection generation is no longer active."
-                )
-            persisted_owner_id = locked_handle.runtime_owner_id or None
-            if persisted_owner_id not in (None, runtime_owner_id):
-                raise JrtcHandleOwnershipError(
-                    f"The media handle belongs to runtime {persisted_owner_id!r}."
-                )
-            if locked_handle.runtime_claim_id is not None:
-                raise JrtcHandleUnavailable(
-                    "Another JRTC handle resolution is already in progress."
-                )
+                if locked_handle.connection_id != expected_connection_id:
+                    raise JrtcHandleOwnershipError(
+                        "The media connection generation changed before handle resolution."
+                    )
+                if locked_handle.lifecycle_state == "detaching":
+                    raise JrtcHandleUnavailable(
+                        "The prior connection generation is still being released."
+                    )
+                if expected_connection_id is not None and (
+                    locked_handle.connection is None
+                    or str(locked_handle.connection.status)
+                    not in {"connected", "subscribed", "active"}
+                ):
+                    raise JrtcHandleOwnershipError(
+                        "The media connection generation is no longer active."
+                    )
+                persisted_owner_id = locked_handle.runtime_owner_id or None
+                if persisted_owner_id not in (None, runtime_owner_id):
+                    raise JrtcHandleOwnershipError(
+                        f"The media handle belongs to runtime {persisted_owner_id!r}."
+                    )
+                if locked_handle.runtime_claim_id is not None:
+                    raise JrtcHandleUnavailable(
+                        "Another JRTC handle resolution is already in progress."
+                    )
 
-            owner_claimed = persisted_owner_id is None
-            previous_lifecycle_state = str(locked_handle.lifecycle_state)
-            locked_handle.runtime_owner_id = runtime_owner_id
-            locked_handle.runtime_claim_id = claim_id
-            locked_handle.save(
-                update_fields=["runtime_owner_id", "runtime_claim_id", "updated_at"]
-            )
-            spec = HandleBindingSpec(
-                model_id=str(locked_handle.pk),
-                session_key=_session_key(locked_handle),
-                persisted_session_id=locked_handle.janus_session_id,
-                persisted_handle_id=locked_handle.janus_handle_id,
-                persisted_owner_id=runtime_owner_id,
-                connection_id=(
-                    None
-                    if expected_connection_id is None
-                    else str(expected_connection_id)
-                ),
-                opaque_id=locked_handle.opaque_id or None,
-            )
+                owner_claimed = persisted_owner_id is None
+                previous_lifecycle_state = str(locked_handle.lifecycle_state)
+                locked_handle.runtime_owner_id = runtime_owner_id
+                locked_handle.runtime_claim_id = claim_id
+                locked_handle.save(
+                    update_fields=["runtime_owner_id", "runtime_claim_id", "updated_at"]
+                )
+                spec = HandleBindingSpec(
+                    model_id=str(locked_handle.pk),
+                    session_key=_session_key(locked_handle),
+                    persisted_session_id=locked_handle.janus_session_id,
+                    persisted_handle_id=locked_handle.janus_handle_id,
+                    persisted_owner_id=runtime_owner_id,
+                    connection_id=(
+                        None
+                        if expected_connection_id is None
+                        else str(expected_connection_id)
+                    ),
+                    opaque_id=locked_handle.opaque_id or None,
+                )
+            return spec
+
+        spec = await sync_to_async(claim_resolution)()
 
         # Phase 2: attach/validate on the process-owned event loop, with no DB
         # transaction held open during Janus network I/O.
-        resolution = janus_runtime.run(
-            janus_runtime.adapter.resolve_handle(spec, recreate=recreate)
-        )
+        resolution = await janus_runtime.adapter.resolve_handle(spec, recreate=recreate)
         binding = resolution.binding
         stale = resolution.replaced_stale
         observed_at = timezone.now()
 
-        # Phase 3: finalize only if this owner and connection still hold claim.
-        with transaction.atomic():
-            locked_handle = (
-                media_handle.__class__.objects.select_for_update(of=("self",))
-                .select_related(
-                    "participant__profile",
-                    "participant__session",
-                    "connection",
-                )
-                .get(pk=media_handle.pk)
-            )
-            if (
-                locked_handle.connection_id != expected_connection_id
-                or locked_handle.runtime_owner_id != runtime_owner_id
-                or locked_handle.runtime_claim_id != claim_id
-                or (
-                    expected_connection_id is not None
-                    and (
-                        locked_handle.connection is None
-                        or str(locked_handle.connection.status)
-                        not in {"connected", "subscribed", "active"}
+        def persist_resolution():
+            nonlocal lost_claim, final_lifecycle_state
+            # Phase 3: finalize only if this owner and connection still hold claim.
+            with transaction.atomic():
+                locked_handle = (
+                    media_handle.__class__.objects.select_for_update(of=("self",))
+                    .select_related(
+                        "participant__profile",
+                        "participant__session",
+                        "connection",
                     )
+                    .get(pk=media_handle.pk)
                 )
-            ):
-                lost_claim = True
-                raise JrtcHandleOwnershipError(
-                    "The JRTC handle claim changed before persistence completed."
-                )
-
-            locked_handle.janus_session_id = binding.session_id
-            locked_handle.janus_handle_id = binding.handle_id
-            locked_handle.runtime_owner_id = binding.owner_id
-            locked_handle.runtime_claim_id = None
-            final_lifecycle_state = (
-                "attached"
-                if resolution.recreated
-                or stale
-                or previous_lifecycle_state
-                in {None, "attaching", "detaching", "detached", "failed"}
-                else locked_handle.lifecycle_state
-            )
-            locked_handle.lifecycle_state = final_lifecycle_state
-            locked_handle.last_event_at = observed_at
-            update_fields = [
-                "janus_session_id",
-                "janus_handle_id",
-                "runtime_owner_id",
-                "runtime_claim_id",
-                "lifecycle_state",
-                "last_event_at",
-                "updated_at",
-            ]
-            if stale:
-                locked_handle.selected_streams = []
-                locked_handle.janus_state = {}
-                update_fields.extend(["selected_streams", "janus_state"])
-            locked_handle.save(update_fields=update_fields)
-
-            if stale:
-                locked_handle.streams.all().delete()
-                if str(locked_handle.handle_type) == "publisher":
-                    participant = locked_handle.participant
-                    participant.janus_publisher_id = None
-                    participant.janus_private_id = None
-                    participant.save(
-                        update_fields=[
-                            "janus_publisher_id",
-                            "janus_private_id",
-                            "updated_at",
-                        ]
+                if (
+                    locked_handle.connection_id != expected_connection_id
+                    or locked_handle.runtime_owner_id != runtime_owner_id
+                    or locked_handle.runtime_claim_id != claim_id
+                    or (
+                        expected_connection_id is not None
+                        and (
+                            locked_handle.connection is None
+                            or str(locked_handle.connection.status)
+                            not in {"connected", "subscribed", "active"}
+                        )
+                    )
+                ):
+                    lost_claim = True
+                    raise JrtcHandleOwnershipError(
+                        "The JRTC handle claim changed before persistence completed."
                     )
 
-            if resolution.recreated:
-                from apps.meetings.models import MeetingEventType
-                from apps.meetings.services.lifecycle import record_session_event
-
-                record_session_event(
-                    session=locked_handle.participant.session,
-                    event_type=MeetingEventType.JANUS_HANDLE_ATTACHED,
-                    actor_profile=locked_handle.participant.profile,
-                    actor_participant=locked_handle.participant,
-                    payload={
-                        "handle_id": str(locked_handle.pk),
-                        "handle_type": str(locked_handle.handle_type),
-                        "janus_session_id": str(binding.session_id),
-                        "janus_handle_id": str(binding.handle_id),
-                        "runtime_owner_id": binding.owner_id,
-                    },
+                locked_handle.janus_session_id = binding.session_id
+                locked_handle.janus_handle_id = binding.handle_id
+                locked_handle.runtime_owner_id = binding.owner_id
+                locked_handle.runtime_claim_id = None
+                final_lifecycle_state = (
+                    "attached"
+                    if resolution.recreated
+                    or stale
+                    or previous_lifecycle_state
+                    in {None, "attaching", "detaching", "detached", "failed"}
+                    else locked_handle.lifecycle_state
                 )
+                locked_handle.lifecycle_state = final_lifecycle_state
+                locked_handle.last_event_at = observed_at
+                update_fields = [
+                    "janus_session_id",
+                    "janus_handle_id",
+                    "runtime_owner_id",
+                    "runtime_claim_id",
+                    "lifecycle_state",
+                    "last_event_at",
+                    "updated_at",
+                ]
+                if stale:
+                    locked_handle.selected_streams = []
+                    locked_handle.janus_state = {}
+                    update_fields.extend(["selected_streams", "janus_state"])
+                locked_handle.save(update_fields=update_fields)
+
+                if stale:
+                    locked_handle.streams.all().delete()
+                    if str(locked_handle.handle_type) == "publisher":
+                        participant = locked_handle.participant
+                        participant.janus_publisher_id = None
+                        participant.janus_private_id = None
+                        participant.save(
+                            update_fields=[
+                                "janus_publisher_id",
+                                "janus_private_id",
+                                "updated_at",
+                            ]
+                        )
+
+                if resolution.recreated:
+                    from apps.meetings.models import MeetingEventType
+                    from apps.meetings.services.lifecycle import record_session_event
+
+                    record_session_event(
+                        session=locked_handle.participant.session,
+                        event_type=MeetingEventType.JANUS_HANDLE_ATTACHED,
+                        actor_profile=locked_handle.participant.profile,
+                        actor_participant=locked_handle.participant,
+                        payload={
+                            "handle_id": str(locked_handle.pk),
+                            "handle_type": str(locked_handle.handle_type),
+                            "janus_session_id": str(binding.session_id),
+                            "janus_handle_id": str(binding.handle_id),
+                            "runtime_owner_id": binding.owner_id,
+                        },
+                    )
+
+        await sync_to_async(persist_resolution)()
     except BaseException:
         if resolution is not None and (
             resolution.recreated or owner_claimed or lost_claim
         ):
             try:
-                janus_runtime.run(
-                    janus_runtime.registry.detach(
-                        str(media_handle.pk),
-                        expected=resolution.binding,
-                    )
+                await janus_runtime.registry.detach(
+                    str(media_handle.pk), expected=resolution.binding
                 )
             except Exception:
                 logger.exception(
@@ -591,13 +603,15 @@ def ensure_participant_media_plugin(
                 }
                 if owner_claimed:
                     cleanup_values["runtime_owner_id"] = None
-                with transaction.atomic():
-                    media_handle.__class__.objects.select_for_update().filter(
-                        pk=media_handle.pk,
-                        connection_id=expected_connection_id,
-                        runtime_owner_id=runtime_owner_id,
-                        runtime_claim_id=claim_id,
-                    ).update(**cleanup_values)
+                def release_claim():
+                    with transaction.atomic():
+                        media_handle.__class__.objects.select_for_update().filter(
+                            pk=media_handle.pk,
+                            connection_id=expected_connection_id,
+                            runtime_owner_id=runtime_owner_id,
+                            runtime_claim_id=claim_id,
+                        ).update(**cleanup_values)
+                await sync_to_async(release_claim)()
             except Exception:
                 logger.exception("Could not release a failed JRTC handle claim")
         raise
@@ -665,6 +679,13 @@ def call_plugin_method(
         ) from exc
 
 
+def call_plugin_trickle(bound_handle, candidates, *, completed: bool):
+    """Keep final candidates and completion inside one registry invocation."""
+    return janus_runtime.run(
+        janus_runtime.adapter.trickle_batch(bound_handle, candidates, completed=completed)
+    )
+
+
 __all__ = [
     "JanusProcessRuntime",
     "NativeJanusIdVideoRoomPlugin",
@@ -693,3 +714,22 @@ __all__ = [
     "serialize_janus_response",
     "video_room_reply_data",
 ]
+
+async def acall_plugin_method(bound_handle, method_name, *args, **kwargs):
+    janus_runtime.require_owner_loop()
+    if not isinstance(bound_handle, BoundVideoRoomHandle):
+        raise JanusGatewayError("The supplied VideoRoom handle is not registry-owned.")
+    try:
+        return await janus_runtime.adapter.invoke(bound_handle, method_name, *args, **kwargs)
+    except Exception as exc:
+        raise JanusGatewayError(f"Unable to execute Janus VideoRoom method {method_name!r}.") from exc
+
+
+async def acall_video_room_management_method(instance, method_name, *args, **kwargs):
+    janus_runtime.require_owner_loop()
+    try:
+        return await janus_runtime.adapter.management_command(
+            session_key=_session_key(instance), method_name=method_name, args=args, kwargs=kwargs,
+        )
+    except Exception as exc:
+        raise JanusGatewayError(f"Unable to execute Janus VideoRoom management method {method_name!r}.") from exc

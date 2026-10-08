@@ -390,4 +390,8 @@ class MeetingSessionEndedRealtimeTests(MeetingLifecycleTestMixin, TestCase):
         }
         for item in emit.call_args_list:
             self.assertEqual(item.kwargs["event"], MeetingSocketEvents.SESSION_ENDED)
-            self.assertEqual(item.kwargs["payload"], expected_payload)
+            context = item.kwargs["payload"]["event_context"]
+            self.assertEqual(context["kind"], "live")
+            self.assertEqual(context["event_id"], f"session-ended:{session.pk}")
+            self.assertEqual(context["occurred_at"], session.ended_at.isoformat())
+            self.assertEqual({key: value for key, value in item.kwargs["payload"].items() if key != "event_context"}, expected_payload)

@@ -3,12 +3,13 @@
 Commands execute directly on live process-local plugins and return typed
 ``VideoRoomReply`` values through JRTC's transaction Futures.  No command is
 implemented as broker RPC.  The adapter also owns strict ID validation,
-short-lived management handles, stale-binding recovery, and exception
+session-owned management services, stale-binding recovery, and exception
 translation.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Sequence
 from typing import Any, Protocol
@@ -24,6 +25,7 @@ from jrtc_video import (
     SubscriberUpdateRequest,
     VideoRoomError,
     VideoRoomPlugin,
+    VideoRoomService,
     VideoRoomProtocolError as PackageVideoRoomProtocolError,
 )
 
@@ -48,6 +50,8 @@ class RuntimeProtocol(Protocol):
 
     def session(self, *, key: str | int | None = None) -> Any: ...
 
+    def observe_session(self, session: Any) -> None: ...
+
 
 class VideoRoomAdapter:
     """Resolve live handles and issue direct typed VideoRoom commands."""
@@ -55,6 +59,9 @@ class VideoRoomAdapter:
     def __init__(self, runtime: RuntimeProtocol, registry: JrtcHandleRegistry) -> None:
         self.runtime = runtime
         self.registry = registry
+        self._services: dict[tuple[int, object], VideoRoomService] = {}
+        self._service_lock = asyncio.Lock()
+        self._closing = False
 
     def get_session(self, key: str | int | None = None) -> Any:
         """Return the process-local ready session selected for ``key``."""
@@ -65,6 +72,7 @@ class VideoRoomAdapter:
             raise JrtcSessionUnavailable("No process-local Janus session is available.") from exc
         if session is None or not bool(getattr(session, "ready", False)):
             raise JrtcSessionUnavailable("The selected Janus session is not active.")
+        self.runtime.observe_session(session)
         return session
 
     async def resolve_handle(
@@ -101,52 +109,48 @@ class VideoRoomAdapter:
         args: Sequence[Any] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Invoke one command through a fresh attach/invoke/detach handle.
-
-        Once Janus has returned a successful command response, a best-effort
-        detach failure is logged and does not make callers repeat a state-
-        changing room operation.
-        """
-
+        """Reuse the package-owned control service on its actual session."""
         session = self.get_session(session_key)
-        plugin = VideoRoomPlugin(session=session)
-        attached = False
-        command_succeeded = False
+        key = (id(session), getattr(session, "generation", None))
         try:
-            await plugin.attach()
-            attached = True
-            method = getattr(plugin, method_name, None)
-            if not callable(method):
-                raise VideoRoomProtocolError(
-                    f"VideoRoomPlugin does not expose command {method_name!r}."
-                )
-            result = await method(*tuple(args), **dict(kwargs or {}))
-            command_succeeded = True
-            return result
+            async with self._service_lock:
+                if self._closing:
+                    raise JrtcSessionUnavailable("VideoRoom services are closing.")
+                for old_key, old in tuple(self._services.items()):
+                    if (old.session is session and old_key != key) or not old.session.ready:
+                        await old.aclose(graceful=False)
+                        self._services.pop(old_key, None)
+                service = self._services.get(key)
+                if service is None:
+                    service = VideoRoomService(session)
+                    self._services[key] = service
+            return await service.management_command(method_name, args=args, kwargs=kwargs)
         except PackageVideoRoomProtocolError as exc:
             raise VideoRoomProtocolError(str(exc)) from exc
-        except VideoRoomProtocolError:
-            raise
         except (VideoRoomError, JanusException, TimeoutError, RuntimeError) as exc:
             raise VideoRoomCommandError(
                 f"VideoRoom management command {method_name!r} failed."
             ) from exc
-        finally:
-            if attached:
-                try:
-                    await plugin.detach()
-                except Exception:
-                    if command_succeeded:
-                        logger.warning(
-                            "VideoRoom command %s succeeded but temporary handle detach failed",
-                            method_name,
-                            exc_info=True,
-                        )
-                    else:
-                        logger.debug(
-                            "Temporary VideoRoom handle cleanup also failed",
-                            exc_info=True,
-                        )
+
+    async def prune_lost_services(self) -> None:
+        async with self._service_lock:
+            for key, service in tuple(self._services.items()):
+                if not service.session.ready or key != (id(service.session), getattr(service.session, "generation", None)):
+                    await service.aclose(graceful=False)
+                    self._services.pop(key, None)
+
+    async def aclose(self) -> None:
+        """Close control services while their owning sessions still exist."""
+        self._closing = True
+        async with self._service_lock:
+            results = await asyncio.gather(
+                *(service.aclose(graceful=False) for service in self._services.values()),
+                return_exceptions=True,
+            )
+            self._services = {key: service for key, service in self._services.items() if not service.closed}
+        failures = [value for value in results if isinstance(value, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("VideoRoom service shutdown failed", failures)
 
     async def invoke(
         self,
@@ -235,6 +239,27 @@ class VideoRoomAdapter:
         candidates: TrickleCandidate | Sequence[TrickleCandidate],
     ) -> Any:
         return await self.invoke(binding, "trickle", candidates)
+
+    async def trickle_batch(
+        self,
+        binding: BoundVideoRoomHandle,
+        candidates: Sequence[TrickleCandidate],
+        *,
+        completed: bool,
+        authorize=None,
+    ) -> None:
+        """One authorization fence covers candidates and explicit completion."""
+        async def operation(plugin: VideoRoomPlugin) -> None:
+            if authorize is not None:
+                await authorize()
+            if candidates:
+                await plugin.trickle(candidates)
+            if completed:
+                if candidates and authorize is not None:
+                    await authorize()
+                await plugin.complete_trickle()
+
+        await self.registry.invoke(binding, operation)
 
     async def complete_trickle(self, binding: BoundVideoRoomHandle) -> Any:
         return await self.invoke(binding, "complete_trickle")

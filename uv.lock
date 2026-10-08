@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.14"
 
 [manifest]
@@ -617,18 +617,14 @@ wheels = [
 
 [[package]]
 name = "jrtc"
-version = "3.1.1"
-source = { registry = "https://pypi.org/simple" }
+version = "3.2.0"
+source = { git = "https://github.com/Leydotpy/jrtc.git?rev=b0998af03c0702302855cc7c52c3dd53ac7a32af#b0998af03c0702302855cc7c52c3dd53ac7a32af" }
 dependencies = [
     { name = "broka" },
     { name = "dispio" },
     { name = "logvista" },
     { name = "pydantic" },
     { name = "websockets" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/47/28/71282de77e9c65e2afb39af95393f10a1124e998bc6d349e8472673295cb/jrtc-3.1.1.tar.gz", hash = "sha256:98438cf798ce0be3abff2a1512cdeedfaefa397ed29d7282c1d5690def047c60", size = 81433, upload-time = "2026-08-15T15:12:01.06Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/31/a3/45c54c11ebf76d24fc36b391416d1d18efc7b1c5a8d58689895ab86eb7e4/jrtc-3.1.1-py3-none-any.whl", hash = "sha256:bc270a05970efe96040d371e1562b8576c6968faeff08a55be49f25eaba2ca0e", size = 77979, upload-time = "2026-08-15T15:11:59.62Z" },
 ]
 
 [package.optional-dependencies]
@@ -638,16 +634,12 @@ kafka = [
 
 [[package]]
 name = "jrtc-video"
-version = "3.0.1"
-source = { registry = "https://pypi.org/simple" }
+version = "3.0.3"
+source = { git = "https://github.com/Leydotpy/jrtc-plugins.git?subdirectory=jrtc-video&rev=87bbb9b79870724a91fc98f8711c55f5cb4519e2#87bbb9b79870724a91fc98f8711c55f5cb4519e2" }
 dependencies = [
     { name = "jrtc" },
     { name = "logvista" },
     { name = "pydantic" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/a3/9584752cee44ae4f8a615b3291ba91945a1a015792c78e14757a3361a052/jrtc_video-3.0.1.tar.gz", hash = "sha256:9d812ebb1eae51a46c5956347c8598357463bf0fa053d869a50ff7668ee7c944", size = 18078, upload-time = "2026-08-15T15:48:21.113Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cc/6f/51ca205ce9c0df9f16ed9d0d145d040c180d1135116d9baa42c7dc5137c5/jrtc_video-3.0.1-py3-none-any.whl", hash = "sha256:932744c4cdce77add1a5dd77c384eb9c71c5dd2952c6f746af370caa3a902608", size = 15154, upload-time = "2026-08-15T15:48:19.776Z" },
 ]
 
 [[package]]
@@ -1154,8 +1146,8 @@ requires-dist = [
     { name = "djangorestframework", specifier = ">=3.17.1" },
     { name = "fastapi", specifier = ">=0.140.0" },
     { name = "gunicorn", specifier = ">=26.0.0" },
-    { name = "jrtc", extras = ["kafka"], specifier = ">=3.1,<4" },
-    { name = "jrtc-video", specifier = ">=3,<4" },
+    { name = "jrtc", extras = ["kafka"], git = "https://github.com/Leydotpy/jrtc.git?rev=b0998af03c0702302855cc7c52c3dd53ac7a32af" },
+    { name = "jrtc-video", git = "https://github.com/Leydotpy/jrtc-plugins.git?subdirectory=jrtc-video&rev=87bbb9b79870724a91fc98f8711c55f5cb4519e2" },
     { name = "logvista", specifier = ">=0.1,<1" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.4" },
     { name = "python-decouple", specifier = ">=3.8" },

@@ -7,6 +7,7 @@ import logging
 from asgiref.sync import sync_to_async
 from socketio import AsyncNamespace
 
+from apps.meetings.jrtc.ice import normalize_ice_request
 from apps.meetings.models import (
     MeetingJoinRequest,
     MeetingSession,
@@ -197,9 +198,9 @@ class MeetingNamespace(AsyncNamespace):
     async def on_session_media_publish(self, sid: str, data: dict) -> dict | None:
         """Publish or reconfigure the local participant's Janus publisher handle from a browser offer."""
 
-        participant = await sync_to_async(self._get_participant_for_session_socket)(data["session_id"], sid)
-        connection = await sync_to_async(self._get_connection_by_socket)(sid)
-        return await sync_to_async(MeetingMediaSignalService.publish_offer)(
+        participant = await self._aget_participant_for_session_socket(data["session_id"], sid)
+        connection = await self._aget_connection_by_socket(sid)
+        return await MeetingMediaSignalService.publish_offer(
             participant=participant,
             connection=connection,
             offer=data["offer"],
@@ -209,9 +210,9 @@ class MeetingNamespace(AsyncNamespace):
     async def on_session_media_unpublish(self, sid: str, data: dict) -> dict | None:
         """Unpublish all currently active local tracks for the authenticated participant."""
 
-        participant = await sync_to_async(self._get_participant_for_session_socket)(data["session_id"], sid)
-        connection = await sync_to_async(self._get_connection_by_socket)(sid)
-        return await sync_to_async(MeetingMediaSignalService.unpublish)(
+        participant = await self._aget_participant_for_session_socket(data["session_id"], sid)
+        connection = await self._aget_connection_by_socket(sid)
+        return await MeetingMediaSignalService.unpublish(
             participant=participant,
             connection=connection,
         )
@@ -219,9 +220,9 @@ class MeetingNamespace(AsyncNamespace):
     async def on_session_media_sync_subscriptions(self, sid: str, data: dict) -> dict | None:
         """Join or update the participant subscriber handle to mirror active remote publishers."""
 
-        participant = await sync_to_async(self._get_participant_for_session_socket)(data["session_id"], sid)
-        connection = await sync_to_async(self._get_connection_by_socket)(sid)
-        return await sync_to_async(MeetingMediaSignalService.sync_subscriptions)(
+        participant = await self._aget_participant_for_session_socket(data["session_id"], sid)
+        connection = await self._aget_connection_by_socket(sid)
+        return await MeetingMediaSignalService.sync_subscriptions(
             participant=participant,
             connection=connection,
         )
@@ -229,9 +230,9 @@ class MeetingNamespace(AsyncNamespace):
     async def on_session_media_start_subscriber(self, sid: str, data: dict) -> dict | None:
         """Complete the subscriber Janus negotiation with the browser's SDP answer."""
 
-        participant = await sync_to_async(self._get_participant_for_session_socket)(data["session_id"], sid)
-        connection = await sync_to_async(self._get_connection_by_socket)(sid)
-        return await sync_to_async(MeetingMediaSignalService.start_subscriber)(
+        participant = await self._aget_participant_for_session_socket(data["session_id"], sid)
+        connection = await self._aget_connection_by_socket(sid)
+        return await MeetingMediaSignalService.start_subscriber(
             participant=participant,
             connection=connection,
             answer=data["answer"],
@@ -240,14 +241,15 @@ class MeetingNamespace(AsyncNamespace):
     async def on_session_media_trickle(self, sid: str, data: dict) -> dict | None:
         """Forward browser ICE candidates to the backend-owned Janus publisher or subscriber handle."""
 
-        participant = await sync_to_async(self._get_participant_for_session_socket)(data["session_id"], sid)
-        connection = await sync_to_async(self._get_connection_by_socket)(sid)
-        return await sync_to_async(MeetingMediaSignalService.trickle)(
+        batch = normalize_ice_request(data)
+        participant = await self._aget_participant_for_session_socket(data["session_id"], sid)
+        connection = await self._aget_connection_by_socket(sid)
+        return await MeetingMediaSignalService.trickle(
             participant=participant,
             connection=connection,
             handle_type=data["handle_type"],
-            candidates=data.get("candidates") or ([] if data.get("completed") else [data.get("candidate", {})]),
-            completed=bool(data.get("completed", False)),
+            candidates=[item.model_dump(by_alias=True, exclude_none=True) for item in batch.candidates],
+            completed=batch.completed,
         )
 
     async def _get_profile(self, sid: str):
@@ -307,3 +309,37 @@ class MeetingNamespace(AsyncNamespace):
         from apps.meetings.models import ParticipantConnection
 
         return ParticipantConnection.objects.select_related("participant", "session").filter(socket_id=sid).first()
+
+    async def _aget_participant_for_session_socket(self, session_id: str, sid: str) -> Participant:
+        """Load an admitted, currently connected participant for this socket."""
+
+        from apps.meetings.models import (
+            ParticipantConnection,
+            ParticipantStatus,
+            RealtimeConnectionStatus,
+        )
+
+        connection = await self._aget_connection_by_socket(sid)
+        if connection is None:
+            raise ValueError("Socket connection is no longer active.")
+        active_connection_states = {
+            RealtimeConnectionStatus.CONNECTED,
+            RealtimeConnectionStatus.SUBSCRIBED,
+            RealtimeConnectionStatus.ACTIVE,
+        }
+        admitted_participant_states = {
+            ParticipantStatus.ADMITTED,
+            ParticipantStatus.ACTIVE,
+        }
+        if (
+            connection.status in active_connection_states
+            and connection.participant
+            and connection.participant.status in admitted_participant_states
+            and str(connection.participant.session_id) == str(session_id)
+        ):
+            return connection.participant
+        raise ValueError("Socket is not bound to an active admitted participant in this session.")
+
+    async def _aget_connection_by_socket(self, sid: str):
+        from apps.meetings.models import ParticipantConnection
+        return await ParticipantConnection.objects.select_related("participant__profile", "participant__session__room", "session").filter(socket_id=sid).afirst()

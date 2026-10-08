@@ -64,6 +64,7 @@ class BoundVideoRoomHandle:
     owner_id: str
     connection_id: str | None = None
     active: bool = True
+    session_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +107,7 @@ class JrtcHandleRegistry:
         if not binding.active:
             return False
         session = binding.plugin.session
-        if not bool(getattr(session, "ready", False)):
+        if not bool(getattr(session, "ready", False)) or (binding.session_generation is not None and binding.session_generation != getattr(session, "generation", None)):
             return False
         try:
             if require_janus_id(session.id, name="session_id") != binding.session_id:
@@ -221,6 +222,7 @@ class JrtcHandleRegistry:
             plugin=plugin,
             owner_id=self.owner_id,
             connection_id=connection_id,
+            session_generation=getattr(session, "generation", None),
         )
         previous: BoundVideoRoomHandle | None = None
         async with self._lock:

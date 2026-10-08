@@ -13,6 +13,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from typing import Any
 
+from asgiref.sync import sync_to_async
 from django.conf import settings as django_settings
 from jrtc import JanusSessionManager
 from jrtc.conf import Janus
@@ -60,6 +61,12 @@ class JanusProcessRuntime:
         self._owner_id = new_runtime_owner_id()
         self._registry = JrtcHandleRegistry(self._owner_id)
         self._adapter = VideoRoomAdapter(self, self._registry)
+        self._loss_observers = {}
+        self._loss_wakeup = asyncio.Event()
+        self._loss_task = None
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._observed_losses = 0
+        self._loss_reconciliation_failures = 0
 
     @property
     def manager(self) -> JanusSessionManager | None:
@@ -110,6 +117,8 @@ class JanusProcessRuntime:
                 bool(getattr(session, "ready", False)) for session in sessions
             ),
             "active_handle_count": self._registry.active_count,
+            "observed_session_losses": self._observed_losses,
+            "loss_reconciliation_failures": self._loss_reconciliation_failures,
             "stale_handle_invalidations": self._registry.stale_invalidations,
             "publisher_running": bool(
                 publisher is not None and getattr(publisher, "running", False)
@@ -250,14 +259,48 @@ class JanusProcessRuntime:
         publisher: JanusEventPublisher | None,
         config: JrtcEventConfig | None,
     ) -> None:
-        """Stop event production, drain publication, then clear local handles."""
+        """Finish ordered cleanup even if the lifespan caller is cancelled."""
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(
+                self._stop_owned_resources(manager, publisher, config),
+                name="synq-jrtc-shutdown",
+            )
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(self._shutdown_task)
+                break
+            except asyncio.CancelledError:
+                if self._shutdown_task.cancelled():
+                    raise
+                cancelled = True
+            except BaseException as exc:
+                if cancelled:
+                    raise asyncio.CancelledError() from exc
+                raise
+        if cancelled:
+            raise asyncio.CancelledError()
 
+    async def _stop_owned_resources(
+        self,
+        manager: JanusSessionManager | None,
+        publisher: JanusEventPublisher | None,
+        config: JrtcEventConfig | None,
+    ) -> None:
+        """Close services, stop producers, drain publication, clear bindings."""
+
+        await self._stop_loss_observation()
         first_error: BaseException | None = None
+        try:
+            await self._adapter.aclose()
+        except BaseException as exc:
+            first_error = exc
+            logger.exception("Could not completely close VideoRoom management services")
         if manager is not None:
             try:
                 await manager.stop()
             except BaseException as exc:
-                first_error = exc
+                first_error = first_error or exc
                 logger.exception("Could not completely stop the JRTC session manager")
         if publisher is not None:
             try:
@@ -437,6 +480,66 @@ class JanusProcessRuntime:
         thread.join(timeout=float(django_settings.JANUS_SHUTDOWN_TIMEOUT) + 2.0)
         if thread.is_alive():
             logger.warning("JRTC background runtime did not stop before its deadline")
+
+    def observe_session(self, session) -> None:
+        """One removable observer per owned session; no new recovery owner."""
+        self.require_owner_loop()
+        for old, unsubscribe in tuple(self._loss_observers.items()):
+            if old is not session and self._manager is not None and old not in self._manager.sessions:
+                unsubscribe()
+                self._loss_observers.pop(old, None)
+        if session in self._loss_observers:
+            return
+        if len(self._loss_observers) >= 64:
+            raise JrtcRuntimeUnavailable("Application session observer capacity exceeded.")
+        self._loss_observers[session] = session.add_loss_observer(self._observe_loss)
+        if self._loss_task is None:
+            self._loss_task = asyncio.create_task(self._reconcile_losses(), name="synq-jrtc-loss-reconciliation")
+
+    def _observe_loss(self, _loss) -> None:
+        # Core has synchronously fenced its plugins before calling this hook.
+        # Event.set is constant-space coalescing, including a burst of losses.
+        self._observed_losses += 1
+        self._loss_wakeup.set()
+
+    async def _reconcile_losses(self) -> None:
+        from apps.meetings.jrtc.loss import clear_lost_projection
+        from apps.meetings.models import ParticipantMediaHandle
+        while True:
+            await self._loss_wakeup.wait()
+            self._loss_wakeup.clear()
+            try:
+                await self._adapter.prune_lost_services()
+                handles = ParticipantMediaHandle.objects.filter(runtime_owner_id=self.owner_id,
+                    runtime_claim_id__isnull=True).exclude(janus_session_id__isnull=True)
+                async for snapshot in handles.aiterator(chunk_size=128):
+                    binding = await self.registry.get(str(snapshot.pk))
+                    if binding is not None:
+                        continue
+                    await sync_to_async(clear_lost_projection)(snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._loss_reconciliation_failures += 1
+                logger.exception("JRTC loss projection reconciliation failed")
+                # A single owned worker retries; no task or queue growth.
+                await asyncio.sleep(1)
+                self._loss_wakeup.set()
+
+    async def _stop_loss_observation(self) -> None:
+        for unsubscribe in self._loss_observers.values():
+            unsubscribe()
+        self._loss_observers.clear()
+        if self._loss_task is not None:
+            self._loss_task.cancel()
+            await asyncio.gather(self._loss_task, return_exceptions=True)
+            self._loss_task = None
+        self._loss_wakeup.clear()
+
+    def require_owner_loop(self) -> None:
+        """Reject realtime calls before startup or from a different loop."""
+        if self.state != self.RUNNING or asyncio.get_running_loop() is not self._loop:
+            raise JrtcRuntimeUnavailable("JRTC commands must run on the started process owner loop.")
 
     def session(self, *, key: str | int | None = None) -> Any:
         """Return a ready session pinned by a stable domain key."""

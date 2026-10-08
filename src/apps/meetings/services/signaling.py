@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, Iterable, Optional, NotRequired, Sequence, TypedDict
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -28,6 +29,7 @@ from jrtc_video import (
 )
 
 from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
+from apps.meetings.jrtc.ice import normalize_ice_request
 from apps.meetings.jrtc.ids import (
     janus_event_to_wire,
     janus_id_from_wire,
@@ -45,13 +47,15 @@ from apps.meetings.models import (
     ParticipantConnection,
     ParticipantMediaHandle,
     ParticipantStream,
+    ParticipantStatus,
     RealtimeConnectionStatus,
 )
 from apps.meetings.realtime.emitter import MeetingSocketEmitter
 from apps.meetings.services.janus import (
-    call_plugin_method,
-    call_video_room_management_method,
-    ensure_participant_media_plugin,
+    acall_plugin_method,
+    acall_video_room_management_method,
+    aensure_participant_media_plugin,
+    janus_runtime,
     janus_room_id_for_session,
     participant_media_plugin_is_locally_owned,
     release_local_participant_media_plugin,
@@ -209,31 +213,7 @@ def _release_media_command_claim(claim: _MediaCommandClaim) -> None:
     ).update(runtime_claim_id=None, updated_at=timezone.now())
 
 
-def _abort_stateful_media_command(
-    claim: _MediaCommandClaim,
-    *,
-    handle_type: str,
-) -> None:
-    """Detach an applied command whose durable result could not be committed."""
-
-    snapshot = SimpleNamespace(
-        pk=claim.model_id,
-        runtime_owner_id=claim.runtime_owner_id,
-    )
-    try:
-        release_local_participant_media_plugin(
-            snapshot,
-            expected_owner_id=claim.runtime_owner_id,
-            expected_session_id=claim.janus_session_id,
-            expected_handle_id=claim.janus_handle_id,
-        )
-    except Exception:
-        logger.exception(
-            "JRTC handle error!",
-            "Could not detach a JRTC handle after command persistence failed",
-            extra={"media_handle_id": str(claim.model_id)},
-        )
-
+def _rollback_media_command(claim, *, handle_type):
     observed_at = timezone.now()
     try:
         with transaction.atomic():
@@ -287,8 +267,20 @@ def _abort_stateful_media_command(
         )
 
 
-@contextmanager
-def _media_command_claim(
+async def _abort_stateful_media_command(claim, *, handle_type):
+    try:
+        if claim.runtime_owner_id == janus_runtime.owner_id:
+            await janus_runtime.registry.invalidate(str(claim.model_id), close_local=True,
+                expected_session_id=claim.janus_session_id, expected_handle_id=claim.janus_handle_id)
+    except Exception:
+        logger.exception("Could not detach after media persistence failed", extra={"media_handle_id": str(claim.model_id)})
+    await sync_to_async(_rollback_media_command)(claim, handle_type=handle_type)
+
+
+
+
+@asynccontextmanager
+async def _media_command_claim(
     media_handle: ParticipantMediaHandle,
     bound_handle: Any | None = None,
     *,
@@ -296,18 +288,18 @@ def _media_command_claim(
 ):
     """Always release a command claim unless its successful write cleared it."""
 
-    claim = _claim_media_command(media_handle, bound_handle)
+    claim = await sync_to_async(_claim_media_command)(media_handle, bound_handle)
     try:
         yield claim
     except BaseException:
         if compensate_on_error and claim.command_applied:
-            _abort_stateful_media_command(
+            await _abort_stateful_media_command(
                 claim,
                 handle_type=claim.handle_type,
             )
         raise
     finally:
-        _release_media_command_claim(claim)
+        await sync_to_async(_release_media_command_claim)(claim)
 
 
 def _require_internal_janus_id(value: Any, *, kind: str) -> int:
@@ -510,7 +502,7 @@ def _merge_publisher_payloads(
     return merged_payloads
 
 
-def _serialize_handle_streams(media_handle: ParticipantMediaHandle) -> list[dict[str, Any]]:
+async def _serialize_handle_streams(media_handle: ParticipantMediaHandle) -> list[dict[str, Any]]:
     """Serialize current inbound or outbound stream rows for signaling acknowledgements."""
 
     return [
@@ -531,7 +523,7 @@ def _serialize_handle_streams(media_handle: ParticipantMediaHandle) -> list[dict
             "metadata": stream.metadata,
             "source_participant_id": str(stream.source_participant_id) if stream.source_participant_id else None,
         }
-        for stream in media_handle.streams.order_by("direction", "media_kind", "janus_mid")
+        async for stream in media_handle.streams.order_by("direction", "media_kind", "janus_mid")
     ]
 
 
@@ -555,7 +547,7 @@ def _resolve_media_kind(media_type: str | None, description: str | None = None) 
     return MediaKind.VIDEO
 
 
-def _get_or_create_media_handle(
+def _prepare_media_handle(
     *,
     participant: Participant,
     handle_type: str,
@@ -743,36 +735,40 @@ def _get_or_create_media_handle(
         if updates:
             media_handle.save(update_fields=[*dict.fromkeys(updates), "updated_at"])
 
-    cleanup_required = handoff_performed or recover_detaching
-    cleanup_error: Exception | None = None
-    if cleanup_required:
-        try:
-            # DETACHING prevents any resolver from installing a new binding,
-            # so every process-local binding for this key belongs to the
-            # superseded generation and can be invalidated unconditionally.
-            release_unclaimed_local_participant_media_plugin(media_handle)
-        except Exception as exc:
-            cleanup_error = exc
+    return media_handle, expected_connection, handoff_performed or recover_detaching
 
-        expected_connection_id = (
-            None if expected_connection is None else expected_connection.pk
+def _finish_media_handle_handoff(media_handle, expected_connection_id):
+    with transaction.atomic():
+        media_handle = ParticipantMediaHandle.objects.select_for_update().get(
+            pk=media_handle.pk
         )
-        with transaction.atomic():
-            media_handle = ParticipantMediaHandle.objects.select_for_update().get(
-                pk=media_handle.pk
+        if (
+            media_handle.connection_id != expected_connection_id
+            or media_handle.runtime_owner_id is not None
+            or media_handle.lifecycle_state != JanusHandleLifecycleState.DETACHING
+        ):
+            raise JrtcHandleOwnershipError(
+                "The media handle changed during connection handoff cleanup."
             )
-            if (
-                media_handle.connection_id != expected_connection_id
-                or media_handle.runtime_owner_id is not None
-                or media_handle.lifecycle_state != JanusHandleLifecycleState.DETACHING
-            ):
-                raise JrtcHandleOwnershipError(
-                    "The media handle changed during connection handoff cleanup."
-                )
-            media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHING
-            media_handle.save(update_fields=["lifecycle_state", "updated_at"])
-        if cleanup_error is not None:
-            raise cleanup_error
+        media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHING
+        media_handle.save(update_fields=["lifecycle_state", "updated_at"])
+    return media_handle
+
+def _get_or_create_media_handle(**kwargs):
+    """Synchronous handoff helper retained for worker callers."""
+    media_handle, expected_connection, cleanup_required = _prepare_media_handle(**kwargs)
+    if cleanup_required:
+        release_unclaimed_local_participant_media_plugin(media_handle)
+        media_handle = _finish_media_handle_handoff(media_handle, None if expected_connection is None else expected_connection.pk)
+    return media_handle
+
+
+async def _aget_or_create_media_handle(**kwargs):
+    janus_runtime.require_owner_loop()
+    media_handle, expected_connection, cleanup_required = await sync_to_async(_prepare_media_handle)(**kwargs)
+    if cleanup_required:
+        await janus_runtime.registry.invalidate(str(media_handle.pk), close_local=True)
+        media_handle = await sync_to_async(_finish_media_handle_handoff)(media_handle, None if expected_connection is None else expected_connection.pk)
     return media_handle
 
 
@@ -1150,90 +1146,29 @@ def _preserve_feed_wide_targets(
     return normalized_targets
 
 
-def _serialize_trickle_candidate(
-    payload: IceCandidate,
-) -> TrickleCandidate:
-    """Validate and serialize a single ICE trickle candidate."""
-
-    candidate = payload.get("candidate")
-
-    if not isinstance(candidate, str):
-        raise VideoRoomProtocolError(
-            "ICE candidate must provide a 'candidate' string."
-        )
-
-    sdp_mid = payload.get("sdpMid")
-    if sdp_mid is not None and not isinstance(sdp_mid, str):
-        raise VideoRoomProtocolError(
-            "'sdpMid' must be a string or None."
-        )
-
-    sdp_mline_index = payload.get("sdpMLineIndex")
-    if (
-        sdp_mline_index is not None
-        and not isinstance(sdp_mline_index, int)
-    ):
-        raise VideoRoomProtocolError(
-            "'sdpMLineIndex' must be an integer or None."
-        )
-
-    return TrickleCandidate(
-        candidate=candidate,
-        sdpMid=sdp_mid,
-        sdpMLineIndex=sdp_mline_index,
-    )
+def _serialize_trickle_candidate(payload: IceCandidate) -> TrickleCandidate:
+    return normalize_ice_request({"candidate": payload}).candidates[0]
 
 
-def _serialize_trickle_candidates(
-    candidates: IceCandidate | IceCandidates,
-) -> TrickleCandidate | list[TrickleCandidate]:
-    """
-    Validate and serialize ICE trickle candidates.
-
-    A malformed standalone candidate is rejected immediately.
-
-    For candidate batches, malformed entries are skipped so valid
-    candidates in the same batch can still be processed.
-    """
-
-    if isinstance(candidates, dict):
-        return _serialize_trickle_candidate(candidates)
-
-    payloads = list(candidates)
-    serialized: list[TrickleCandidate] = []
-
-    for index, payload in enumerate(payloads):
-        try:
-            candidate = _serialize_trickle_candidate(payload)
-        except VideoRoomProtocolError as exc:
-            logger.warning(
-                "ICE Warning!",
-                "Skipping malformed ICE candidate",
-                context={
-                    "candidate_index": index,
-                    "reason": str(exc),
-                }
-            )
-            continue
-
-        serialized.append(candidate)
-
-    if payloads and not serialized:
-        raise VideoRoomProtocolError(
-            "ICE candidate batch contained no valid candidates."
-        )
-
-    return serialized
+def _serialize_trickle_candidates(candidates: IceCandidates) -> list[TrickleCandidate]:
+    return list(normalize_ice_request({"candidates": list(candidates)}).candidates)
 
 
 class MeetingMediaSignalService:
     """Own the Janus-backed signaling flows used by the browser client."""
 
     @staticmethod
-    def sync_publishers(*, session: MeetingSession, emit_state: bool = True) -> dict[str, Any]:
+    def sync_publishers(*, session: MeetingSession, emit_state: bool = True):
+        """Celery compatibility. ASGI uses async_sync_publishers directly."""
+        if janus_runtime.state != janus_runtime.RUNNING:
+            janus_runtime.ensure_background()
+        return janus_runtime.run(MeetingMediaSignalService.async_sync_publishers(session=session, emit_state=emit_state))
+
+    @staticmethod
+    async def async_sync_publishers(*, session: MeetingSession, emit_state: bool = True) -> dict[str, Any]:
         """Synchronize Janus publisher state into participants and outbound stream rows."""
 
-        response = call_video_room_management_method(
+        response = await acall_video_room_management_method(
             session,
             "list_participants",
             _janus_room_id(session),
@@ -1244,21 +1179,21 @@ class MeetingMediaSignalService:
             publisher_payloads,
             authoritative=True,
         )
-        serialized_publishers = _reconcile_publisher_payloads(
+        serialized_publishers = await sync_to_async(transaction.atomic(_reconcile_publisher_payloads))(
             session,
             merged_publishers,
         )
         session_state = session.janus_state if isinstance(session.janus_state, dict) else {}
         session.janus_state = {**session_state, "participants": serialized_publishers}
         session.last_synced_at = timezone.now()
-        session.save(update_fields=["janus_state", "last_synced_at", "updated_at"])
-        MeetingLifecycleService.refresh_session_metrics(session=session)
+        await session.asave(update_fields=["janus_state", "last_synced_at", "updated_at"])
+        await sync_to_async(transaction.atomic(MeetingLifecycleService.refresh_session_metrics))(session=session)
         if emit_state:
-            MeetingSocketEmitter.emit_session_state(session=session)
+            await MeetingSocketEmitter.aemit_session_state(session=session)
         return {"publishers": serialized_publishers}
 
     @staticmethod
-    def publish_offer(
+    async def publish_offer(
         *,
         participant: Participant,
         connection: ParticipantConnection | None,
@@ -1272,14 +1207,14 @@ class MeetingMediaSignalService:
 
         track_descriptors = list(tracks or [])
         _ensure_publish_permissions(participant, track_descriptors)
-        media_handle = _get_or_create_media_handle(
+        media_handle = await _aget_or_create_media_handle(
             participant=participant,
             handle_type=JanusHandleType.PUBLISHER,
             connection=connection,
             allow_ownership_handoff=True,
         )
-        bound_handle = ensure_participant_media_plugin(media_handle)
-        participant.refresh_from_db(
+        bound_handle = await aensure_participant_media_plugin(media_handle)
+        await participant.arefresh_from_db(
             fields=["janus_publisher_id", "janus_private_id"],
         )
         publisher_id = (
@@ -1293,7 +1228,7 @@ class MeetingMediaSignalService:
         descriptions = _build_stream_descriptions(track_descriptors)
         offer_jsep = _build_jsep(offer, jsep_type="offer")
 
-        claim = _claim_media_command(media_handle, bound_handle)
+        claim = await sync_to_async(_claim_media_command)(media_handle, bound_handle)
         command_completed = False
         try:
             method_name = "configure"
@@ -1303,7 +1238,7 @@ class MeetingMediaSignalService:
             command_completed = True
             if publisher_id is None:
                 method_name = "join_and_configure"
-                response = call_plugin_method(
+                response = await acall_plugin_method(
                     bound_handle,
                     "join_and_configure",
                     PublisherJoinAndConfigureRequest(
@@ -1317,14 +1252,14 @@ class MeetingMediaSignalService:
                 )
             elif media_handle.lifecycle_state == JanusHandleLifecycleState.ATTACHED:
                 method_name = "publish"
-                response = call_plugin_method(
+                response = await acall_plugin_method(
                     bound_handle,
                     "publish",
                     offer_jsep,
                     body=PublisherPublishRequest(descriptions=descriptions),
                 )
             else:
-                response = call_plugin_method(
+                response = await acall_plugin_method(
                     bound_handle,
                     "configure_publisher",
                     PublisherConfigureRequest(descriptions=descriptions),
@@ -1336,94 +1271,97 @@ class MeetingMediaSignalService:
             serialized_answer = _serialize_jsep(getattr(response, "jsep", None))
             now = timezone.now()
 
-            with transaction.atomic():
-                media_handle = _lock_media_command_result(claim)
-                participant = (
-                    Participant.objects.select_for_update()
-                    .select_related("session")
-                    .get(pk=participant.pk)
-                )
-                media_handle.lifecycle_state = JanusHandleLifecycleState.JOINING
-                media_handle.jsep_offer = offer
-                media_handle.jsep_answer = (
-                    serialized_answer or media_handle.jsep_answer
-                )
-                media_handle.selected_streams = track_descriptors
-                media_handle.janus_state = serialized_response
-                media_handle.last_event_at = now
-                media_handle.runtime_claim_id = None
-                media_handle.save(
-                    update_fields=[
-                        "lifecycle_state",
-                        "jsep_offer",
-                        "jsep_answer",
-                        "selected_streams",
-                        "janus_state",
-                        "last_event_at",
-                        "runtime_claim_id",
-                        "updated_at",
-                    ]
-                )
-                if plugin_data is not None:
-                    plugin_payload = _serialize_model(plugin_data)
-                    raw_publisher_id = plugin_payload.get("id")
-                    if raw_publisher_id is not None:
-                        participant.janus_publisher_id = _require_internal_janus_id(
-                            raw_publisher_id,
-                            kind="Janus publisher ID",
-                        )
-                    raw_private_id = plugin_payload.get("private_id")
-                    if raw_private_id is not None:
-                        participant.janus_private_id = _require_internal_janus_id(
-                            raw_private_id,
-                            kind="Janus private ID",
-                        )
-                    participant.janus_state = janus_event_to_wire(plugin_payload)
-                participant.last_seen_at = now
-                participant.save(
-                    update_fields=[
-                        "janus_publisher_id",
-                        "janus_private_id",
-                        "janus_state",
-                        "last_seen_at",
-                        "updated_at",
-                    ]
-                )
+            def persist_result():
+                nonlocal media_handle, participant
+                with transaction.atomic():
+                    media_handle = _lock_media_command_result(claim)
+                    participant = (
+                        Participant.objects.select_for_update()
+                        .select_related("session")
+                        .get(pk=participant.pk)
+                    )
+                    media_handle.lifecycle_state = JanusHandleLifecycleState.JOINING
+                    media_handle.jsep_offer = offer
+                    media_handle.jsep_answer = (
+                        serialized_answer or media_handle.jsep_answer
+                    )
+                    media_handle.selected_streams = track_descriptors
+                    media_handle.janus_state = serialized_response
+                    media_handle.last_event_at = now
+                    media_handle.runtime_claim_id = None
+                    media_handle.save(
+                        update_fields=[
+                            "lifecycle_state",
+                            "jsep_offer",
+                            "jsep_answer",
+                            "selected_streams",
+                            "janus_state",
+                            "last_event_at",
+                            "runtime_claim_id",
+                            "updated_at",
+                        ]
+                    )
+                    if plugin_data is not None:
+                        plugin_payload = _serialize_model(plugin_data)
+                        raw_publisher_id = plugin_payload.get("id")
+                        if raw_publisher_id is not None:
+                            participant.janus_publisher_id = _require_internal_janus_id(
+                                raw_publisher_id,
+                                kind="Janus publisher ID",
+                            )
+                        raw_private_id = plugin_payload.get("private_id")
+                        if raw_private_id is not None:
+                            participant.janus_private_id = _require_internal_janus_id(
+                                raw_private_id,
+                                kind="Janus private ID",
+                            )
+                        participant.janus_state = janus_event_to_wire(plugin_payload)
+                    participant.last_seen_at = now
+                    participant.save(
+                        update_fields=[
+                            "janus_publisher_id",
+                            "janus_private_id",
+                            "janus_state",
+                            "last_seen_at",
+                            "updated_at",
+                        ]
+                    )
 
-                if reply_publishers:
-                    merged_publishers = _merge_publisher_payloads(
-                        participant.session,
-                        reply_publishers,
-                        authoritative=False,
-                    )
-                    serialized_publishers = _reconcile_publisher_payloads(
-                        participant.session,
-                        merged_publishers,
-                        prune_missing=False,
-                    )
-                    participant.session.janus_state = {
-                        **(
-                            participant.session.janus_state
-                            if isinstance(participant.session.janus_state, dict)
-                            else {}
-                        ),
-                        "participants": serialized_publishers,
-                    }
-                    participant.session.last_synced_at = now
-                    participant.session.save(
-                        update_fields=["janus_state", "last_synced_at", "updated_at"],
-                    )
+                    if reply_publishers:
+                        merged_publishers = _merge_publisher_payloads(
+                            participant.session,
+                            reply_publishers,
+                            authoritative=False,
+                        )
+                        serialized_publishers = _reconcile_publisher_payloads(
+                            participant.session,
+                            merged_publishers,
+                            prune_missing=False,
+                        )
+                        participant.session.janus_state = {
+                            **(
+                                participant.session.janus_state
+                                if isinstance(participant.session.janus_state, dict)
+                                else {}
+                            ),
+                            "participants": serialized_publishers,
+                        }
+                        participant.session.last_synced_at = now
+                        participant.session.save(
+                            update_fields=["janus_state", "last_synced_at", "updated_at"],
+                        )
+            await sync_to_async(persist_result)()
         except BaseException:
             if command_completed:
-                _abort_stateful_media_command(
+                await _abort_stateful_media_command(
                     claim,
                     handle_type=JanusHandleType.PUBLISHER,
                 )
-            _release_media_command_claim(claim)
+            await sync_to_async(_release_media_command_claim)(claim)
             raise
 
         try:
-            MeetingMediaSignalService.sync_publishers(
+            await MeetingMediaSignalService.async_sync_publishers(
                 session=participant.session,
                 emit_state=False,
             )
@@ -1439,23 +1377,23 @@ class MeetingMediaSignalService:
                 },
                 exc_info=True,
             )
-        MeetingSocketEmitter.emit_session_state(session=participant.session)
-        media_handle.refresh_from_db()
+        await MeetingSocketEmitter.aemit_session_state(session=participant.session)
+        await media_handle.arefresh_from_db()
         return {
             "action": method_name,
             "participant_id": str(participant.pk),
             "handle_type": JanusHandleType.PUBLISHER,
             "lifecycle_state": media_handle.lifecycle_state,
             "jsep": serialized_answer,
-            "streams": _serialize_handle_streams(media_handle),
+            "streams": await _serialize_handle_streams(media_handle),
             "selected_streams": media_handle.selected_streams,
         }
 
     @staticmethod
-    def unpublish(*, participant: Participant, connection: ParticipantConnection | None = None) -> dict[str, Any]:
+    async def unpublish(*, participant: Participant, connection: ParticipantConnection | None = None) -> dict[str, Any]:
         """Stop the participant publisher handle without detaching it from the room."""
 
-        media_handle = _get_or_create_media_handle(
+        media_handle = await _aget_or_create_media_handle(
             participant=participant,
             handle_type=JanusHandleType.PUBLISHER,
             connection=connection,
@@ -1466,74 +1404,77 @@ class MeetingMediaSignalService:
                 media_handle.janus_handle_id,
                 kind="Janus handle ID",
             )
-            bound_handle = ensure_participant_media_plugin(
+            bound_handle = await aensure_participant_media_plugin(
                 media_handle,
                 recreate=False,
             )
-        claim = _claim_media_command(media_handle, bound_handle)
+        claim = await sync_to_async(_claim_media_command)(media_handle, bound_handle)
         command_completed = False
         try:
             if bound_handle is not None:
                 command_completed = True
-                call_plugin_method(bound_handle, "unpublish")
-            with transaction.atomic():
-                media_handle = _lock_media_command_result(claim)
-                media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHED
-                media_handle.selected_streams = []
-                media_handle.last_event_at = timezone.now()
-                media_handle.runtime_claim_id = None
-                media_handle.save(
-                    update_fields=[
-                        "lifecycle_state",
-                        "selected_streams",
-                        "last_event_at",
-                        "runtime_claim_id",
-                        "updated_at",
-                    ]
-                )
-                media_handle.streams.filter(direction=MediaDirection.OUTBOUND).delete()
+                await acall_plugin_method(bound_handle, "unpublish")
+            def persist_result():
+                nonlocal media_handle
+                with transaction.atomic():
+                    media_handle = _lock_media_command_result(claim)
+                    media_handle.lifecycle_state = JanusHandleLifecycleState.ATTACHED
+                    media_handle.selected_streams = []
+                    media_handle.last_event_at = timezone.now()
+                    media_handle.runtime_claim_id = None
+                    media_handle.save(
+                        update_fields=[
+                            "lifecycle_state",
+                            "selected_streams",
+                            "last_event_at",
+                            "runtime_claim_id",
+                            "updated_at",
+                        ]
+                    )
+                    media_handle.streams.filter(direction=MediaDirection.OUTBOUND).delete()
+            await sync_to_async(persist_result)()
         except BaseException:
             if command_completed:
-                _abort_stateful_media_command(
+                await _abort_stateful_media_command(
                     claim,
                     handle_type=JanusHandleType.PUBLISHER,
                 )
-            _release_media_command_claim(claim)
+            await sync_to_async(_release_media_command_claim)(claim)
             raise
-        MeetingLifecycleService.refresh_session_metrics(session=participant.session)
-        MeetingSocketEmitter.emit_session_state(session=participant.session)
+        await sync_to_async(transaction.atomic(MeetingLifecycleService.refresh_session_metrics))(session=participant.session)
+        await MeetingSocketEmitter.aemit_session_state(session=participant.session)
         return {
             "action": "unpublish",
             "participant_id": str(participant.pk),
             "handle_type": JanusHandleType.PUBLISHER,
             "lifecycle_state": media_handle.lifecycle_state,
             "jsep": None,
-            "streams": _serialize_handle_streams(media_handle),
+            "streams": await _serialize_handle_streams(media_handle),
             "selected_streams": [],
         }
 
     @staticmethod
-    def sync_subscriptions(
+    async def sync_subscriptions(
         *,
         participant: Participant,
         connection: ParticipantConnection | None,
     ) -> dict[str, Any]:
         """Join or update the participant subscriber handle so it mirrors all remote publishers."""
 
-        media_handle = _get_or_create_media_handle(
+        media_handle = await _aget_or_create_media_handle(
             participant=participant,
             handle_type=JanusHandleType.SUBSCRIBER,
             connection=connection,
             allow_ownership_handoff=True,
         )
-        bound_handle = ensure_participant_media_plugin(
+        bound_handle = await aensure_participant_media_plugin(
             media_handle,
             recreate=True,
         )
-        participant.refresh_from_db(
+        await participant.arefresh_from_db(
             fields=["janus_publisher_id", "janus_private_id"],
         )
-        publisher_response = call_video_room_management_method(
+        publisher_response = await acall_video_room_management_method(
             participant.session,
             "list_participants",
             _janus_room_id(participant.session),
@@ -1547,7 +1488,7 @@ class MeetingMediaSignalService:
             publisher_payloads,
             authoritative=True,
         )
-        serialized_publishers = _reconcile_publisher_payloads(
+        serialized_publishers = await sync_to_async(transaction.atomic(_reconcile_publisher_payloads))(
             participant.session,
             merged_publishers,
         )
@@ -1577,7 +1518,7 @@ class MeetingMediaSignalService:
         }
         subscriber_joined = _subscriber_is_joined(media_handle, current_targets)
 
-        with _media_command_claim(media_handle, bound_handle) as claim:
+        async with _media_command_claim(media_handle, bound_handle) as claim:
             action = "noop"
             response = None
             jsep_payload = None
@@ -1591,7 +1532,7 @@ class MeetingMediaSignalService:
                 pass
             elif not subscriber_joined:
                 claim.command_applied = True
-                response = call_plugin_method(
+                response = await acall_plugin_method(
                     bound_handle,
                     "join_subscriber",
                     SubscriberJoinRequest(
@@ -1653,7 +1594,7 @@ class MeetingMediaSignalService:
                     )
                 if subscribe_targets or unsubscribe_targets:
                     claim.command_applied = True
-                    response = call_plugin_method(
+                    response = await acall_plugin_method(
                         bound_handle,
                         "update_subscription",
                         SubscriberUpdateRequest(
@@ -1679,26 +1620,29 @@ class MeetingMediaSignalService:
                 if jsep_payload or action == "join":
                     next_lifecycle_state = JanusHandleLifecycleState.JOINING
 
-            with transaction.atomic():
-                media_handle = _lock_media_command_result(claim)
-                media_handle.selected_streams = serialized_targets
-                media_handle.janus_state = next_janus_state
-                media_handle.jsep_offer = next_jsep_offer
-                media_handle.lifecycle_state = next_lifecycle_state
-                media_handle.last_event_at = next_last_event_at
-                media_handle.runtime_claim_id = None
-                media_handle.save(
-                    update_fields=[
-                        "selected_streams",
-                        "janus_state",
-                        "jsep_offer",
-                        "lifecycle_state",
-                        "last_event_at",
-                        "runtime_claim_id",
-                        "updated_at",
-                    ]
-                )
-                _reconcile_subscriber_streams(media_handle, stream_payloads)
+            def persist_result():
+                nonlocal media_handle
+                with transaction.atomic():
+                    media_handle = _lock_media_command_result(claim)
+                    media_handle.selected_streams = serialized_targets
+                    media_handle.janus_state = next_janus_state
+                    media_handle.jsep_offer = next_jsep_offer
+                    media_handle.lifecycle_state = next_lifecycle_state
+                    media_handle.last_event_at = next_last_event_at
+                    media_handle.runtime_claim_id = None
+                    media_handle.save(
+                        update_fields=[
+                            "selected_streams",
+                            "janus_state",
+                            "jsep_offer",
+                            "lifecycle_state",
+                            "last_event_at",
+                            "runtime_claim_id",
+                            "updated_at",
+                        ]
+                    )
+                    _reconcile_subscriber_streams(media_handle, stream_payloads)
+            await sync_to_async(persist_result)()
 
         session_state = (
             participant.session.janus_state
@@ -1710,22 +1654,22 @@ class MeetingMediaSignalService:
             "participants": serialized_publishers,
         }
         participant.session.last_synced_at = timezone.now()
-        participant.session.save(update_fields=["janus_state", "last_synced_at", "updated_at"])
-        MeetingLifecycleService.refresh_session_metrics(session=participant.session)
-        MeetingSocketEmitter.emit_session_state(session=participant.session)
-        media_handle.refresh_from_db()
+        await participant.session.asave(update_fields=["janus_state", "last_synced_at", "updated_at"])
+        await sync_to_async(transaction.atomic(MeetingLifecycleService.refresh_session_metrics))(session=participant.session)
+        await MeetingSocketEmitter.aemit_session_state(session=participant.session)
+        await media_handle.arefresh_from_db()
         return {
             "action": action,
             "participant_id": str(participant.pk),
             "handle_type": JanusHandleType.SUBSCRIBER,
             "lifecycle_state": media_handle.lifecycle_state,
             "jsep": jsep_payload,
-            "streams": _serialize_handle_streams(media_handle),
+            "streams": await _serialize_handle_streams(media_handle),
             "selected_streams": media_handle.selected_streams,
         }
 
     @staticmethod
-    def start_subscriber(
+    async def start_subscriber(
         *,
         participant: Participant,
         connection: ParticipantConnection | None,
@@ -1736,18 +1680,18 @@ class MeetingMediaSignalService:
         if not answer.get("sdp"):
             raise MeetingDomainError("A subscriber SDP answer is required.")
 
-        media_handle = _get_or_create_media_handle(
+        media_handle = await _aget_or_create_media_handle(
             participant=participant,
             handle_type=JanusHandleType.SUBSCRIBER,
             connection=connection,
         )
-        bound_handle = ensure_participant_media_plugin(
+        bound_handle = await aensure_participant_media_plugin(
             media_handle,
             recreate=False,
         )
-        with _media_command_claim(media_handle, bound_handle) as claim:
+        async with _media_command_claim(media_handle, bound_handle) as claim:
             claim.command_applied = True
-            response = call_plugin_method(
+            response = await acall_plugin_method(
                 bound_handle,
                 "start",
                 answer=_build_jsep(answer, jsep_type="answer"),
@@ -1756,88 +1700,84 @@ class MeetingMediaSignalService:
                 serialize_janus_response(response),
                 joined=True,
             )
-            with transaction.atomic():
-                media_handle = _lock_media_command_result(claim)
-                media_handle.jsep_answer = answer
-                media_handle.janus_state = next_janus_state
-                media_handle.lifecycle_state = JanusHandleLifecycleState.READY
-                media_handle.last_event_at = timezone.now()
-                media_handle.runtime_claim_id = None
-                media_handle.save(
-                    update_fields=[
-                        "jsep_answer",
-                        "janus_state",
-                        "lifecycle_state",
-                        "last_event_at",
-                        "runtime_claim_id",
-                        "updated_at",
-                    ]
-                )
-        MeetingSocketEmitter.emit_session_state(session=participant.session)
+            def persist_result():
+                nonlocal media_handle
+                with transaction.atomic():
+                    media_handle = _lock_media_command_result(claim)
+                    media_handle.jsep_answer = answer
+                    media_handle.janus_state = next_janus_state
+                    media_handle.lifecycle_state = JanusHandleLifecycleState.READY
+                    media_handle.last_event_at = timezone.now()
+                    media_handle.runtime_claim_id = None
+                    media_handle.save(
+                        update_fields=[
+                            "jsep_answer",
+                            "janus_state",
+                            "lifecycle_state",
+                            "last_event_at",
+                            "runtime_claim_id",
+                            "updated_at",
+                        ]
+                    )
+            await sync_to_async(persist_result)()
+        await MeetingSocketEmitter.aemit_session_state(session=participant.session)
         return {
             "action": "start",
             "participant_id": str(participant.pk),
             "handle_type": JanusHandleType.SUBSCRIBER,
             "lifecycle_state": media_handle.lifecycle_state,
             "jsep": None,
-            "streams": _serialize_handle_streams(media_handle),
+            "streams": await _serialize_handle_streams(media_handle),
             "selected_streams": media_handle.selected_streams,
         }
 
     @staticmethod
-    def trickle(
-        *,
-        participant: Participant,
-        connection: ParticipantConnection | None,
-        handle_type: str,
-        candidates: Optional[Sequence[dict[str, Any]] | dict[str, Any]] = None,
-        completed: bool = False,
-    ) -> dict[str, Any]:
-        """Forward browser ICE candidates to the Janus publisher or subscriber handle."""
-
+    async def trickle(*, participant: Participant, connection: ParticipantConnection | None,
+        handle_type: str, candidates=None, completed: bool = False) -> dict[str, Any]:
+        """Authorize a healthy live binding without a durable ICE claim or write."""
         if handle_type not in {JanusHandleType.PUBLISHER, JanusHandleType.SUBSCRIBER}:
             raise MeetingDomainError("Unsupported Janus handle type for ICE trickle.")
+        batch = normalize_ice_request({"candidates": candidates if candidates is not None else [], "completed": completed})
+        janus_runtime.require_owner_loop()
+        if connection is None:
+            raise JrtcHandleOwnershipError("ICE requires an active socket connection.")
+        media_handle = await ParticipantMediaHandle.objects.select_related("participant__session", "connection").filter(
+            participant_id=participant.pk, handle_type=handle_type, connection_id=connection.pk,
+        ).afirst()
+        binding = None if media_handle is None else await janus_runtime.registry.get(str(media_handle.pk))
+        if binding is None:
+            # Misses keep the durable owner/connection reconciliation. Continuity
+            # ICE never reconstructs a lost plugin from persisted Janus IDs.
+            media_handle = await _aget_or_create_media_handle(participant=participant,
+                handle_type=handle_type, connection=connection)
+            binding = await aensure_participant_media_plugin(media_handle, recreate=False)
+        if binding.owner_id != janus_runtime.owner_id or binding.connection_id != str(connection.pk):
+            raise JrtcHandleOwnershipError("The ICE binding belongs to another connection generation.")
 
-        media_handle = _get_or_create_media_handle(
-            participant=participant,
-            handle_type=handle_type,
-            connection=connection,
-        )
-        bound_handle = ensure_participant_media_plugin(
-            media_handle,
-            recreate=False,
-        )
-        serialized_candidates = _serialize_trickle_candidates(list(candidates or []))
-        with _media_command_claim(
-            media_handle,
-            bound_handle,
-            compensate_on_error=False,
-        ) as claim:
-            if completed or not serialized_candidates:
-                call_plugin_method(bound_handle, "complete_trickle")
-            else:
-                call_plugin_method(bound_handle, "trickle", serialized_candidates)
-            claim.command_applied = True
-            with transaction.atomic():
-                media_handle = _lock_media_command_result(claim)
-                media_handle.last_event_at = timezone.now()
-                media_handle.runtime_claim_id = None
-                media_handle.save(
-                    update_fields=[
-                        "last_event_at",
-                        "runtime_claim_id",
-                        "updated_at",
-                    ]
-                )
-        return {
-            "action": "trickle",
-            "participant_id": str(participant.pk),
-            "handle_type": handle_type,
-            "lifecycle_state": media_handle.lifecycle_state,
-            "jsep": None,
-            "streams": _serialize_handle_streams(media_handle),
-            "selected_streams": media_handle.selected_streams,
-        }
+        async def authorize():
+            # This read is inside the registry invocation fence, including on
+            # completion after a candidate ACK. Revocation is never inferred
+            # from a local cache hit. Existing disconnect/handoff invalidation
+            # uses the same fence; state commands retain their durable claims.
+            allowed = await ParticipantMediaHandle.objects.filter(pk=media_handle.pk,
+                participant_id=participant.pk, participant__status__in=[ParticipantStatus.ADMITTED, ParticipantStatus.ACTIVE],
+                participant__session_id=participant.session_id,
+                connection_id=connection.pk, connection__socket_id=connection.socket_id,
+                connection__participant_id=participant.pk, connection__session_id=participant.session_id,
+                connection__status__in=[RealtimeConnectionStatus.CONNECTED, RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
+                runtime_owner_id=binding.owner_id, runtime_claim_id__isnull=True,
+                janus_session_id=binding.session_id, janus_handle_id=binding.handle_id,
+            ).exclude(lifecycle_state__in=[JanusHandleLifecycleState.DETACHING, JanusHandleLifecycleState.DETACHED, JanusHandleLifecycleState.FAILED]).aexists()
+            if not allowed or not janus_runtime.registry._binding_is_live(binding):
+                raise JrtcHandleOwnershipError("The ICE connection or handle generation is no longer authorized.")
+
+        await janus_runtime.adapter.trickle_batch(binding, batch.candidates,
+            completed=batch.completed, authorize=authorize)
+        # Connection heartbeat already coalesces durable activity. ICE itself
+        # performs no per-batch last_event_at or last_seen_at persistence.
+        return {"action": "trickle", "participant_id": str(participant.pk), "handle_type": handle_type,
+            "lifecycle_state": media_handle.lifecycle_state, "jsep": None,
+            "streams": await _serialize_handle_streams(media_handle), "selected_streams": media_handle.selected_streams}
 
     @staticmethod
     def handle_callback_snapshot(instance: Any, normalized_event: dict[str, Any]) -> None:

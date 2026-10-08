@@ -9,6 +9,7 @@ class MeetingSocketEvents:
     JANUS_EVENT = "janus_event"
     JOIN_REQUEST_CREATED = "join_request_created"
     JOIN_REQUEST_REVIEWED = "join_request_reviewed"
+    PARTICIPANT_PRESENCE_CHANGED = "participant_presence_changed"
     PARTICIPANT_REMOVED = "participant_removed"
     CHAT_MESSAGE_CREATED = "chat_message_created"
     REACTION_CREATED = "reaction_created"

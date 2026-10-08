@@ -146,6 +146,7 @@ class MeetingStateBuilder:
         messages.reverse()
         reactions.reverse()
         return {
+            "event_context": {"kind": "snapshot", "session_id": str(hydrated_session.pk)},
             "room": MeetingStateBuilder.serialize_room(hydrated_session),
             "session": MeetingStateBuilder.serialize_session(hydrated_session),
             "counts": {
