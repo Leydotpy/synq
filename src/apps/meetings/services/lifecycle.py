@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 from kombu.exceptions import OperationalError as BrokerOperationalError
 
@@ -34,6 +35,7 @@ from apps.meetings.models import (
     RealtimeConnectionStatus,
 )
 from apps.meetings.services.permissions import MeetingPermissionService
+from apps.meetings.services.gateway_tickets import advance_epoch
 from apps.meetings.services.invitations import MeetingInvitationService
 from core.utils import generate_short_code
 
@@ -531,6 +533,7 @@ class MeetingLifecycleService:
                 or profile.handle
             )
             participant.apply_membership_defaults()
+            advance_epoch(participant)
             participant.left_at = None
             if bound_connection:
                 participant.mark_joined()
@@ -635,6 +638,7 @@ class MeetingLifecycleService:
                 participant.display_name = participant.display_name or join_request.profile.display_name or join_request.profile.handle
                 participant.left_at = None
                 participant.apply_membership_defaults()
+                advance_epoch(participant)
                 if join_request.connection:
                     participant.mark_joined()
                 else:
@@ -686,6 +690,14 @@ class MeetingLifecycleService:
                     reason=reason,
                 )
                 join_request.save(update_fields=["status", "reviewed_by_profile", "reviewed_at", "resolution_reason", "updated_at"])
+                # A gateway lobby identity may already exist; rejection revokes it
+                # in the same decision transaction, independently of delivery.
+                session.participants.filter(
+                    join_request=join_request, status=ParticipantStatus.WAITING,
+                ).update(
+                    authorization_epoch=F("authorization_epoch") + 1,
+                    status=ParticipantStatus.LEFT, left_at=timezone.now(),
+                )
                 record_session_event(
                     session=session,
                     event_type=MeetingEventType.JOIN_REQUEST_REVIEWED,
@@ -730,6 +742,14 @@ class MeetingLifecycleService:
             MeetingPermissionService.require_session_permission(session=session, profile_or_user=actor_profile, permission_field="can_manage_media")
         allowed_fields = permission_sensitive_fields | media_sensitive_fields | {"raised_hand_at"}
         with transaction.atomic():
+            session = MeetingSession.objects.select_for_update().select_related("room").get(pk=session.pk)
+            participant = Participant.objects.select_for_update().get(pk=participant.pk, session=session)
+            changed_permissions = any(
+                key in permission_sensitive_fields | media_sensitive_fields and getattr(participant, key) != value
+                for key, value in updates.items()
+            )
+            if changed_permissions:
+                advance_epoch(participant)
             for field_name, value in updates.items():
                 if field_name in allowed_fields:
                     setattr(participant, field_name, value)
@@ -755,6 +775,10 @@ class MeetingLifecycleService:
         cleanup_snapshot: dict[str, object]
         cleanup_socket_ids: tuple[str, ...]
         with transaction.atomic():
+            session = MeetingSession.objects.select_for_update().select_related("room").get(pk=session.pk)
+            participant = Participant.objects.select_for_update().get(pk=participant.pk, session=session)
+            if participant.status != ParticipantStatus.REMOVED:
+                advance_epoch(participant)
             participant.mark_left(status=ParticipantStatus.REMOVED)
             participant.save()
             active_connections = participant.connections.filter(
@@ -842,6 +866,7 @@ class MeetingLifecycleService:
             )
             now = timezone.now()
             if changed:
+                advance_epoch(participant)
                 participant.mark_left(status=ParticipantStatus.LEFT)
                 participant.save()
                 active_connections = participant.connections.filter(
@@ -1147,6 +1172,7 @@ class MeetingLifecycleService:
                 status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED],
             ).update(
                 status=ParticipantStatus.LEFT,
+                authorization_epoch=F("authorization_epoch") + 1,
                 left_at=now,
                 last_seen_at=now,
                 updated_at=now,

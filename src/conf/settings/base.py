@@ -494,3 +494,12 @@ LOG_COLOR = config("LOGVISTA_COLOR", default="auto", cast=str).strip().lower()
 # matters because production.py/local.py finalize DEBUG after importing base.py.
 LOGGING_CONFIG = "conf.logging.configure_logging"
 LOGGING = {"version": 1}
+
+# Additive gateway control-plane rehearsal; legacy transport remains selected.
+GATEWAY_TICKETS_ENABLED = config("GATEWAY_TICKETS_ENABLED", default=False, cast=bool)
+GATEWAY_TICKET_ISSUER = config("GATEWAY_TICKET_ISSUER", default="", cast=str)
+GATEWAY_TICKET_KEY_ID = config("GATEWAY_TICKET_KEY_ID", default="", cast=str)
+GATEWAY_TICKET_PRIVATE_KEY_FILE = config("GATEWAY_TICKET_PRIVATE_KEY_FILE", default="", cast=str)
+GATEWAY_TICKET_TTL_SECONDS = config("GATEWAY_TICKET_TTL_SECONDS", default=60, cast=int)
+# Dedicated credential, not the external meeting-provider service token.
+GATEWAY_AUTHORITY_TOKEN = config("GATEWAY_AUTHORITY_TOKEN", default="", cast=str)

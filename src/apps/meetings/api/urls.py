@@ -2,6 +2,8 @@
 
 from django.urls import path
 
+from apps.meetings.api.gateway import GatewayAuthorityView, GatewayTicketView
+
 from apps.meetings.api.views import (
     MeetingAdmissionView,
     MeetingJoinRequestCreateView,
@@ -20,6 +22,8 @@ from apps.meetings.api.views import (
 app_name = "meetings-api"
 
 urlpatterns = [
+    path("internal/gateway/authority/", GatewayAuthorityView.as_view(), name="gateway-authority"),
+    path("sessions/<uuid:session_id>/gateway/tickets/", GatewayTicketView.as_view(), name="gateway-ticket"),
     path("internal/service-sessions/", MeetingServiceSessionCreateView.as_view(), name="service-session-create"),
     path("rooms/", MeetingRoomListCreateView.as_view(), name="room-list"),
     path("rooms/<slug:slug>/", MeetingRoomDetailView.as_view(), name="room-detail"),

@@ -498,5 +498,20 @@
         ]
       }
     ]
+  },
+  "gateway_followup": {
+    "date": "2026-10-29",
+    "baseline_commit": "602eb4237c2e83cfd5b75d362c6a5cd643c70c53",
+    "branch": "codex/gateway-control-plane",
+    "tasks": [
+      {
+        "id": "SG-03",
+        "status": "ready_for_review",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-control-plane.md",
+        "notes": "129 SQLite tests: 127 passed, 2 PostgreSQL-only races skipped. PostgreSQL CI pending; no live media or deployment."
+      }
+    ]
   }
 }

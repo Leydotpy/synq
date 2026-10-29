@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from django.contrib.auth.hashers import check_password, make_password
@@ -660,6 +661,9 @@ class Participant(UUIDTimestampedModel):
 
     objects = ParticipantQuerySet.as_manager()
 
+    # Django permission version, independent of observed connection/media state.
+    authorization_epoch = models.PositiveBigIntegerField(default=0)
+
     # Room whose durable permissions and defaults this presence belongs to.
     room = models.ForeignKey(MeetingRoom, on_delete=models.CASCADE, related_name="participants")
     # Live session in which this logical participant is or was present.
@@ -821,6 +825,26 @@ class Participant(UUIDTimestampedModel):
         """
 
         return self.textroom_mediahandle_record
+
+
+class GatewayGrant(UUIDTimestampedModel):
+    """One current gateway connection generation for an existing participant."""
+
+    participant = models.OneToOneField(Participant, on_delete=models.CASCADE, related_name="gateway_grant")
+    participant_session_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    generation = models.PositiveBigIntegerField(default=1)
+    issue_window_at = models.DateTimeField(default=timezone.now)
+    issue_count = models.PositiveIntegerField(default=0)
+
+
+class GatewayTicket(UUIDTimestampedModel):
+    """Bounded-lived issuance/replay receipt; never stores the signed credential."""
+
+    grant = models.ForeignKey(GatewayGrant, on_delete=models.CASCADE, related_name="tickets")
+    purpose = models.CharField(max_length=16)
+    claims = models.JSONField()
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
 
 
 class ParticipantConnection(UUIDTimestampedModel):
