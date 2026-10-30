@@ -519,7 +519,8 @@
         "implementation": "present",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-control-plane.md",
-        "notes": "149 local SQLite tests: 145 passed, 4 PostgreSQL-only races skipped. PostgreSQL CI pending. Admission decisions and durable outbox intents only; delivery and exclusive owner routing are SG-06/07. No media cutover or deployment."
+        "notes": "149 PostgreSQL tests passed, zero skips, in GitHub Actions run 41013971484 (including replay, admission retry and revocation races). Four real Django/gateway authority and outbox-contract checks passed in gateway Actions run 41014052042. Broker delivery and owner routing remain SG-06/07; no media cutover or deployment.",
+        "implementation_commit": "8000bc062579b760fb373387d5945243a568ea59"
       }
     ]
   }

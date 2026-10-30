@@ -170,3 +170,11 @@ against this checkout: actual signed-ticket verification, replay and revocation,
 lobby approval and bound refresh, and SG-05 admit/deny/permissions/disconnect
 outbox payloads validated against the SG-01 gateway schemas. This verifies the
 Django authority handoff and command data, not Broka delivery or live Janus media.
+
+Published SG-05 implementation: `8000bc062579b760fb373387d5945243a568ea59`. PostgreSQL 16 CI
+[run 41013971484](https://github.com/Leydotpy/synq/actions/runs/41013971484)
+passed all 149 tests with zero skips, including simultaneous decision retries and
+approval/removal races. Migration drift check passed. Gateway compatibility
+[run 41014052042](https://github.com/Leydotpy/jrtc-signalling/actions/runs/41014052042)
+passed all five jobs, including four handoff/contract tests, 273 gateway tests
+on each supported Python version, and container smoke checks.
