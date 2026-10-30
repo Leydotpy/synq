@@ -503,3 +503,4 @@ GATEWAY_TICKET_PRIVATE_KEY_FILE = config("GATEWAY_TICKET_PRIVATE_KEY_FILE", defa
 GATEWAY_TICKET_TTL_SECONDS = config("GATEWAY_TICKET_TTL_SECONDS", default=60, cast=int)
 # Dedicated credential, not the external meeting-provider service token.
 GATEWAY_AUTHORITY_TOKEN = config("GATEWAY_AUTHORITY_TOKEN", default="", cast=str)
+GATEWAY_ADMISSION_ENABLED = config("GATEWAY_ADMISSION_ENABLED", default=False, cast=bool)

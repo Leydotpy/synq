@@ -36,6 +36,7 @@ from apps.meetings.models import (
 )
 from apps.meetings.services.permissions import MeetingPermissionService
 from apps.meetings.services.gateway_tickets import advance_epoch
+from apps.meetings.services.gateway_outbox import enabled as gateway_admission_enabled, record_authorization_intent
 from apps.meetings.services.invitations import MeetingInvitationService
 from core.utils import generate_short_code
 
@@ -542,6 +543,7 @@ class MeetingLifecycleService:
                 participant.joined_at = participant.joined_at or now
                 participant.last_seen_at = now
             participant.save()
+            record_authorization_intent(session=session, participant=participant, action="participant.admit", actor_profile=profile)
             if bound_connection:
                 bound_connection.participant = participant
                 bound_connection.status = RealtimeConnectionStatus.ACTIVE
@@ -646,6 +648,7 @@ class MeetingLifecycleService:
                     participant.joined_at = participant.joined_at or timezone.now()
                     participant.last_seen_at = timezone.now()
                 participant.save()
+                record_authorization_intent(session=session, participant=participant, action="participant.admit", actor_profile=reviewer_profile)
                 if join_request.connection:
                     join_request.connection.session = session
                     join_request.connection.participant = participant
@@ -698,6 +701,9 @@ class MeetingLifecycleService:
                     authorization_epoch=F("authorization_epoch") + 1,
                     status=ParticipantStatus.LEFT, left_at=timezone.now(),
                 )
+                if gateway_admission_enabled(session):
+                    for denied in session.participants.filter(join_request=join_request, status=ParticipantStatus.LEFT):
+                        record_authorization_intent(session=session, participant=denied, action="participant.deny", actor_profile=reviewer_profile, reason_code="denied")
                 record_session_event(
                     session=session,
                     event_type=MeetingEventType.JOIN_REQUEST_REVIEWED,
@@ -755,6 +761,8 @@ class MeetingLifecycleService:
                     setattr(participant, field_name, value)
             participant.last_seen_at = timezone.now()
             participant.save()
+            if changed_permissions:
+                record_authorization_intent(session=session, participant=participant, action="participant.permissions.update", actor_profile=actor_profile)
             record_session_event(
                 session=session,
                 event_type=MeetingEventType.PARTICIPANT_UPDATED,
@@ -781,6 +789,7 @@ class MeetingLifecycleService:
                 advance_epoch(participant)
             participant.mark_left(status=ParticipantStatus.REMOVED)
             participant.save()
+            record_authorization_intent(session=session, participant=participant, action="participant.disconnect", actor_profile=actor_profile, reason_code="revoked")
             active_connections = participant.connections.filter(
                 status__in=[RealtimeConnectionStatus.CONNECTED, RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
             )
@@ -869,6 +878,7 @@ class MeetingLifecycleService:
                 advance_epoch(participant)
                 participant.mark_left(status=ParticipantStatus.LEFT)
                 participant.save()
+                record_authorization_intent(session=session, participant=participant, action="participant.disconnect", actor_profile=profile, reason_code="normal")
                 active_connections = participant.connections.filter(
                     session=session,
                     status__in=ACTIVE_CONNECTION_STATUSES,
@@ -1168,6 +1178,7 @@ class MeetingLifecycleService:
             session.lifecycle_state = MeetingLifecycleState.ENDED
             session.ended_at = now
             session.save(update_fields=["lifecycle_state", "ended_at", "updated_at"])
+            gateway_ending = list(session.participants.exclude(status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED]).values_list("pk", flat=True)) if gateway_admission_enabled(session) else []
             session.participants.exclude(
                 status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED],
             ).update(
@@ -1177,6 +1188,8 @@ class MeetingLifecycleService:
                 last_seen_at=now,
                 updated_at=now,
             )
+            for ended_participant in session.participants.filter(pk__in=gateway_ending):
+                record_authorization_intent(session=session, participant=ended_participant, action="participant.disconnect", actor_profile=actor_profile, reason_code="meeting_ended")
             session.join_requests.filter(status=MeetingJoinRequestStatus.PENDING).update(
                 status=MeetingJoinRequestStatus.CANCELLED,
                 reviewed_at=now,

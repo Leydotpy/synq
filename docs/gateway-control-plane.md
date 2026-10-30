@@ -95,3 +95,78 @@ race tests skipped on SQLite. The PostgreSQL workflow runs the same tests with
 real row locks; its result is tracked in the gateway task report. Migration drift,
 focused Ruff checks and cross-repository ticket schema validation also run.
 No live Janus, browser, deployment or production identity-provider check is claimed.
+
+## SG-05 admission and durable permission intents
+
+The new HTTPS endpoints additionally require `GATEWAY_ADMISSION_ENABLED=true` and
+the room's server-managed `feature_flags.gateway_control_plane=true`. Both are
+off by default. This selects control-plane rehearsal, **not** a runtime owner;
+legacy Janus ownership/dispatch is unchanged until SG-07's explicit fencing.
+
+POST `/api/v1/meetings/sessions/{id}/gateway/join-intents/` using the existing
+authenticated user. Optional fields are display_name, passcode, invite_token.
+Role/profile/participant/connection IDs are forbidden. Django reuses its room
+passcode, invitation, membership, capacity and direct-entry policy. It creates or
+reuses a pending request and WAITING participant. Repeating an unresolved intent
+does not duplicate events or change permission epochs. If Django's direct-entry
+policy authorizes this identity, it commits ADMITTED and an outbox record.
+No gateway connection event can perform either decision.
+
+POST `/api/v1/meetings/sessions/{id}/gateway/join-intents/{request_id}/decision/`:
+
+```json
+{"decision_id": "client-generated-uuid", "approve": true, "expected_epoch": 0}
+```
+
+The actor comes exclusively from the authenticated profile. An active durable
+membership with can_manage_waiting_room is required and locked during review;
+this includes hosts/co-hosts and explicitly delegated moderators. Requested roles
+are never authority. The subject's current membership supplies role defaults.
+The request must belong to the meeting, remain pending, and match the participant's
+current epoch. Boolean/integer values are strict. Stale/conflicting decisions
+return 409. Inactive users, expired requests, removed participants and ended
+meetings cannot be admitted.
+
+Keep the same decision_id, action and expected_epoch when retrying a lost response.
+The principal-bound GatewayAdmissionDecision receipt makes retries idempotent.
+A key cannot be moved to another actor/request/action. A new key cannot reverse
+an already resolved request. A retry after a later removal returns the current
+participant status/epoch with superseded=true; it does not restore the old grant.
+The same meeting lock serializes approve/revoke, and the newer epoch wins.
+Denial revokes the lobby grant and marks the request rejected. Opening the room
+later does not bypass that denial. Explicit re-entry after a terminal departure
+is reserved for the SG-14 reconnect/rejoin policy.
+
+Approval sets ADMITTED without setting joined_at, creating a media handle, emitting
+PARTICIPANT_JOINED or queueing Janus work. Connected/publishing state is a later
+gateway observation/projector concern. Responses expose admission_status,
+participant_status, authorization_epoch and enforcement_status. Pending means
+the decision is durable, not that media has connected or removal has been enforced.
+Waiting-room projections should reconcile these authoritative records; SG-11 owns
+the SSE projector. Existing snapshots/legacy notifications remain compatible.
+
+Migration 0015 adds the decision receipt and GatewayAuthorizationOutbox, unique
+per participant/authorization_epoch. Admission, denial, permission changes,
+removal, voluntary leave and meeting end record intents in the same transaction
+for selected rooms. Outbox failure rolls back the decision. There is no broker
+network I/O or on-commit-only delivery gap. Records contain typed command data,
+actor, participant, meeting and epoch; no JWT, SDP, ICE or raw passcode is stored.
+
+These rows are **permission intents**, not complete wire commands: SG-06 must
+resolve the current participant binding and SG-07 owner lease, revalidate the
+epoch, add the v1 command ID/trace/time/expiry/owner fence, publish durably and
+track outcomes. No owner identity is invented here. All rows remain pending;
+no dispatcher or physical-enforcement success is claimed by SG-05. Disabling
+the feature stops new rehearsal decisions; retain pending rows and migrations
+for reconciliation rather than discarding authorization history.
+
+Local SG-03/05 plus required legacy regression suites: 149 tests, 145 passed and
+four PostgreSQL-only races skipped on SQLite. PostgreSQL CI runs all 149 including
+concurrent decision retries and approval/removal races; the final run/commit are
+recorded in the gateway SG-05 report. Migration drift and focused Ruff checks pass.
+
+The gateway's `scripts/check_django_authority.py` also passed four local checks
+against this checkout: actual signed-ticket verification, replay and revocation,
+lobby approval and bound refresh, and SG-05 admit/deny/permissions/disconnect
+outbox payloads validated against the SG-01 gateway schemas. This verifies the
+Django authority handoff and command data, not Broka delivery or live Janus media.

@@ -19,6 +19,7 @@ from rest_framework import (
 )
 from rest_framework.parsers import JSONParser
 
+from apps.meetings.services.gateway_admission import request_intent, review_intent
 from apps.meetings.services.gateway_tickets import (
     GatewayDenied,
     check_ticket,
@@ -147,3 +148,55 @@ class GatewayAuthorityView(GatewayAPIView):
         payload = AuthorityRequest(data=request.data)
         payload.is_valid(raise_exception=True)
         return response.Response(check_ticket(**payload.validated_data))
+
+
+class JoinIntentRequest(StrictSerializer):
+    display_name = serializers.CharField(
+        max_length=255, allow_blank=True, required=False
+    )
+    passcode = serializers.CharField(max_length=128, required=False, write_only=True)
+    invite_token = serializers.CharField(
+        max_length=2048, required=False, write_only=True
+    )
+
+
+class AdmissionDecisionRequest(StrictSerializer):
+    decision_id = serializers.UUIDField()
+    approve = serializers.BooleanField()
+    expected_epoch = serializers.IntegerField(min_value=0, max_value=2**53 - 1)
+
+    def to_internal_value(self, data):
+        if (
+            not isinstance(data, dict)
+            or type(data.get("approve")) is not bool
+            or type(data.get("expected_epoch")) is not int
+        ):
+            raise exceptions.ValidationError({"non_field_errors": ["Invalid request."]})
+        return super().to_internal_value(data)
+
+
+class GatewayJoinIntentView(CurrentProfileMixin, GatewayAPIView):
+    def post(self, request, session_id):
+        payload = JoinIntentRequest(data=request.data)
+        payload.is_valid(raise_exception=True)
+        return response.Response(
+            request_intent(
+                session_id=session_id,
+                profile_id=self.get_profile().pk,
+                **payload.validated_data,
+            )
+        )
+
+
+class GatewayAdmissionDecisionView(CurrentProfileMixin, GatewayAPIView):
+    def post(self, request, session_id, join_request_id):
+        payload = AdmissionDecisionRequest(data=request.data)
+        payload.is_valid(raise_exception=True)
+        return response.Response(
+            review_intent(
+                session_id=session_id,
+                join_request_id=join_request_id,
+                actor_profile_id=self.get_profile().pk,
+                **payload.validated_data,
+            )
+        )

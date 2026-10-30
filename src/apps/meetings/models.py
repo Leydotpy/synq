@@ -847,6 +847,35 @@ class GatewayTicket(UUIDTimestampedModel):
     consumed_at = models.DateTimeField(null=True, blank=True)
 
 
+class GatewayAdmissionDecision(UUIDTimestampedModel):
+    """Idempotent, principal-bound review receipt; observations cannot create one."""
+
+    join_request = models.OneToOneField(MeetingJoinRequest, on_delete=models.CASCADE, related_name="gateway_decision")
+    actor_profile = models.ForeignKey(Profile, on_delete=models.PROTECT, related_name="gateway_decisions")
+    participant = models.ForeignKey(Participant, on_delete=models.PROTECT, related_name="gateway_decisions")
+    approve = models.BooleanField()
+    expected_epoch = models.PositiveBigIntegerField()
+    authorization_epoch = models.PositiveBigIntegerField()
+
+
+class GatewayAuthorizationOutbox(UUIDTimestampedModel):
+    """Committed permission intent, awaiting SG-06 delivery and SG-07 owner routing."""
+
+    session = models.ForeignKey(MeetingSession, on_delete=models.CASCADE, related_name="gateway_outbox")
+    participant = models.ForeignKey(Participant, on_delete=models.CASCADE, related_name="gateway_outbox")
+    actor_id = models.CharField(max_length=128)
+    authorization_epoch = models.PositiveBigIntegerField()
+    action = models.CharField(max_length=64, choices=[
+        (name, name) for name in ("participant.admit", "participant.deny", "participant.disconnect", "participant.permissions.update")
+    ])
+    data = models.JSONField()
+    status = models.CharField(max_length=16, default="pending", choices=[("pending", "Pending")])
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("participant", "authorization_epoch"), name="gateway_outbox_part_epoch_uniq")]
+        indexes = [models.Index(fields=("status", "created_at"), name="gateway_outbox_pending_idx")]
+
+
 class ParticipantConnection(UUIDTimestampedModel):
     """Socket.IO connection metadata used to map profiles to realtime sessions."""
 

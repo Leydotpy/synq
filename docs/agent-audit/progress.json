@@ -500,7 +500,7 @@
     ]
   },
   "gateway_followup": {
-    "date": "2026-10-29",
+    "date": "2026-10-30",
     "baseline_commit": "602eb4237c2e83cfd5b75d362c6a5cd643c70c53",
     "branch": "codex/gateway-control-plane",
     "tasks": [
@@ -510,7 +510,16 @@
         "implementation": "present",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-control-plane.md",
-        "notes": "129 SQLite tests: 127 passed, 2 PostgreSQL-only races skipped. PostgreSQL CI pending; no live media or deployment."
+        "notes": "129 PostgreSQL tests passed, zero skips; GitHub Actions run 40834852074. No live media or deployment.",
+        "implementation_commit": "0426eee3497f35cdd37f9725a352c9fef11014f2"
+      },
+      {
+        "id": "SG-05",
+        "status": "ready_for_review",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-control-plane.md",
+        "notes": "149 local SQLite tests: 145 passed, 4 PostgreSQL-only races skipped. PostgreSQL CI pending. Admission decisions and durable outbox intents only; delivery and exclusive owner routing are SG-06/07. No media cutover or deployment."
       }
     ]
   }

@@ -30,6 +30,7 @@ jobs:
           uv run --frozen python src/manage.py test
           apps.meetings.tests.test_gateway_tickets
           apps.meetings.tests.test_gateway_ticket_races
+          apps.meetings.tests.test_gateway_admission
           apps.meetings.tests.test_admission_and_invites
           apps.meetings.tests.test_lifecycle_hardening
           apps.meetings.tests.test_jrtc_signaling_contracts
