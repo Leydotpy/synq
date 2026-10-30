@@ -528,7 +528,8 @@
         "implementation": "present",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-control-plane.md",
-        "notes": "169 SQLite tests: 162 passed, six PostgreSQL races and one real Redis integration skipped pending CI. Gateway consumer CI 41072340216 passed. Signed immutable commands, retry/lease/expiry and authenticated outcomes; live owner allocation/enforcement remains SG-07."
+        "notes": "169 PostgreSQL 16/Redis 7.4 tests passed, zero skips, in Actions 41074432251. Includes concurrent claims, revocation races, actual broker timeout/retry and signed gateway outcomes through the real Django ASGI authority endpoint. Gateway CI 41072340216 passed 313 tests per supported Python version. Live owner allocation/enforcement remains SG-07; no cutover or deployment.",
+        "implementation_commit": "088fd3adee2a20e9a0b3cbeae0477930f4f35939"
       }
     ]
   }

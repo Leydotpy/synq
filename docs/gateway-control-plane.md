@@ -267,12 +267,22 @@ through restart, with bounded capacity and retry; see the gateway COMMAND_PLANE.
 for retention and operation details. No approximate MAXLEN trimming may delete
 unacknowledged critical work. Compact only acknowledged stream history.
 
-Local verification: 169 tests run, 162 passed and seven real PostgreSQL/Redis checks
-skipped pending CI. Migration drift checks and focused Ruff checks passed. Gateway
-CI run 41072340216 passes all five jobs and all 313 tests on Python 3.12/3.13/3.14,
-including actual Redis delivery/reclaim/restart; four existing Django authority
-handoff checks and container checks also pass. The final SG-06 report records
-PostgreSQL/Redis cross-repository evidence after publication.
+Published SG-06 implementation: `088fd3adee2a20e9a0b3cbeae0477930f4f35939`.
+[Synq CI 41074432251](https://github.com/Leydotpy/synq/actions/runs/41074432251)
+passed all 169 tests with PostgreSQL 16 and Redis 7.4, with zero skips. This includes
+concurrent dispatcher claims, outcome/revocation races and an actual broker pause
+that makes publication time out. The retained command then travels through Broka
+to the gateway's durable inbox, uses the real Django ASGI authority endpoint
+(in-process transport), and returns signed accepted/failed outcomes to PostgreSQL.
+The default no-owner result remains failed; admission does not become presence.
+
+Locally, 169 tests ran with SQLite: 162 passed and seven PostgreSQL/Redis checks
+were skipped. Migration drift and focused Ruff checks passed. [Gateway CI
+41072340216](https://github.com/Leydotpy/jrtc-signalling/actions/runs/41072340216)
+passed all five jobs: 313 tests on each of Python 3.12/3.13/3.14, including actual
+Redis delivery/reclaim/restart; lint/types/schema/package checks; existing Django
+authority handoff checks; and container configuration/startup/shutdown checks.
+The gateway SG-06 report records the implementation and compatibility evidence.
 
 Rollback: disable new command/admission routing, preserve committed history,
 leases, inbox/outbox and keys for reconciliation, and keep the legacy path running.
