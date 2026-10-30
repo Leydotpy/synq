@@ -178,3 +178,102 @@ approval/removal races. Migration drift check passed. Gateway compatibility
 [run 41014052042](https://github.com/Leydotpy/jrtc-signalling/actions/runs/41014052042)
 passed all five jobs, including four handoff/contract tests, 273 gateway tests
 on each supported Python version, and container smoke checks.
+
+
+## SG-06: durable command delivery and outcomes
+
+`GATEWAY_COMMANDS_ENABLED` defaults false. Set `GATEWAY_BUS_CONFIG_FILE` to a
+protected JSON file only in a gateway rehearsal environment. Both the existing
+admission flag and the room's `gateway_control_plane` flag remain required.
+Run `uv run --frozen python src/manage.py run_gateway_commands` as a separate
+worker. `--once` runs one bounded dispatch sweep. The existing JRTC event worker,
+Django ASGI and Celery ownership are unchanged.
+
+The configuration uses the gateway package's framework-independent signed bus
+codec and Broka Redis Streams adapter, pinned in pyproject.toml/uv.lock. The
+selected JRTC broker must be Redis Streams. Configuration example:
+
+```json
+{
+  "redis_url_file": "/run/secrets/django-gateway-redis-url",
+  "producer_id": "django-control",
+  "signing_key_id": "django-2026-10",
+  "private_key_file": "/run/secrets/django-bus-signing.pem",
+  "trusted_keys": {
+    "gateway-a-2026-10": {
+      "producer_id": "gateway-a",
+      "public_key_file": "/run/secrets/gateway-a-signing-public.pem"
+    }
+  }
+}
+```
+
+These are dedicated Ed25519 PEM keys, separate from ticket signing and the service
+RPC token. Each gateway key pins one producer/owner identity. Use separate Redis
+ACL users, TLS (`rediss://`) outside loopback, persistent Redis storage and
+`maxmemory-policy noeviction`. Django writes owner-specific command streams and
+reads the outcome stream; gateway identities have the reverse permissions only
+for their owner queue. Never grant browser users broker access.
+
+Migration 0016 adds immutable GatewayCommand requests, an authenticated outcome
+inbox, digest-only quarantine, dispatcher leases/retry state, a meeting-wide
+permission epoch and GatewayCommandRoute. The route is the SG-07 owner lease
+publication boundary. SG-06 neither allocates a lease nor fabricates an owner.
+No production route should be inserted manually to bypass SG-07 fencing.
+
+The dispatcher commits an immutable command before publication, then performs
+network work outside database transactions. It rechecks the current permission
+epoch and participant binding, targets the current unexpired owner generation,
+and leases each row for ten seconds. Duplicate publishers cannot claim it at
+once. Retries preserve the command ID, payload, target and expiry. An owner or
+binding change fails the existing request; it does not silently replay an
+uncertain mutation under a new ID. Command TTL is at most 60 seconds, intent age
+at most 300 seconds, backoff at most 30 seconds and attempts at most ten. Terminal
+failed/timed_out rows are the durable dead-letter record for operator review;
+reconciliation is required before any new enforcement request.
+
+An authenticated HTTPS endpoint at
+`POST /api/v1/meetings/internal/gateway/commands/authorize/` accepts
+`{"command": <exact stored envelope>}` with the existing dedicated service token.
+It checks the committed request, current permission/binding and unexpired route.
+An authenticated broker packet alone never grants permission. The gateway's
+current default enforcer reports failed/owner_lost until SG-07 supplies actual
+fenced runtime ownership; SG-06 does not claim media enforcement.
+
+Admit, deny, disconnect and permission updates retain the SG-05 transactional
+outbox. Meeting termination now also writes one meeting-wide command with null
+participant/session identities and a separate meeting epoch. End-session retries
+do not create another command. A rollback cannot leave a published command for
+an uncommitted decision.
+
+Only signed, correctly correlated command outcomes update enforcement status.
+Their owner, generation, epoch, request, meeting and trace must match; event IDs
+are deduplicated and conflicting receipts reject. A delayed accepted event cannot
+roll back a terminal result. Old-epoch/owner outcomes cannot restore admission or
+update media presence. Database failure leaves the broker message unacknowledged.
+
+Admission responses now include `enforcement_request_id`, `enforcement_status`
+and `enforcement_reason`. Poll
+`GET /api/v1/meetings/sessions/{session_id}/gateway/commands/{request_id}/` as the
+subject or a current waiting-room moderator. It reports pending/accepted/applied/
+failed/timed_out/superseded, reason and attempts; no signed payload or credentials.
+Only applied confirms enforcement. Accepted and publication are separate from
+application. Permission revocation remains Django-owned immediately.
+
+The gateway uses a persistent SQLite inbox and outcome outbox. Interrupted reserved
+commands are never re-executed: their outcome is uncertain until reconciliation.
+Its broker work runs off the media path. Pending/dead outcome rows remain durable
+through restart, with bounded capacity and retry; see the gateway COMMAND_PLANE.md
+for retention and operation details. No approximate MAXLEN trimming may delete
+unacknowledged critical work. Compact only acknowledged stream history.
+
+Local verification: 169 tests run, 162 passed and seven real PostgreSQL/Redis checks
+skipped pending CI. Migration drift checks and focused Ruff checks passed. Gateway
+CI run 41072340216 passes all five jobs and all 313 tests on Python 3.12/3.13/3.14,
+including actual Redis delivery/reclaim/restart; four existing Django authority
+handoff checks and container checks also pass. The final SG-06 report records
+PostgreSQL/Redis cross-repository evidence after publication.
+
+Rollback: disable new command/admission routing, preserve committed history,
+leases, inbox/outbox and keys for reconciliation, and keep the legacy path running.
+This task does not merge, deploy or transfer Janus ownership.

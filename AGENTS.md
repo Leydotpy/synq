@@ -12,8 +12,8 @@ This file governs work in this repository. The current task is an evidence-backe
 Audited target: `Leydotpy/synq` at `v4`, commit `2d8682701300f27ab3771e9ea72413b3f7631a49`. Work from the requested branch/current authorized successor; never silently switch to the default branch. Evidence for an older commit must be rechecked before marking a current task complete.
 
 2026-10-29 additive scope: the user authorized the dedicated signalling gateway
-plan in `Leydotpy/jrtc-signalling/docs/implementation`. SG-03/05 add Django's
-ticket and admission authority on `codex/gateway-control-plane`, based on `v4`
+plan in `Leydotpy/jrtc-signalling/docs/implementation`. SG-03/05/06 add Django's
+ticket/admission authority and durable command delivery on `codex/gateway-control-plane`, based on `v4`
 at `602eb4237c2e83cfd5b75d362c6a5cd643c70c53`. The earlier in-process architecture
 is retained for compatibility. No transport cutover, merge or deployment is
 authorized by this implementation. See [gateway control plane](docs/gateway-control-plane.md).

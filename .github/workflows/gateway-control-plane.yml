@@ -7,6 +7,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
+      redis:
+        image: redis:7.4
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
       postgres:
         image: postgres:16
         env:
@@ -18,6 +24,7 @@ jobs:
           --health-timeout 5s --health-retries 10
     env:
       UV_PYTHON: "3.14"
+      GATEWAY_TEST_REDIS_URL: redis://127.0.0.1:6379/15
       GATEWAY_TEST_DB_PASSWORD: test-only-password
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -31,6 +38,8 @@ jobs:
           apps.meetings.tests.test_gateway_tickets
           apps.meetings.tests.test_gateway_ticket_races
           apps.meetings.tests.test_gateway_admission
+          apps.meetings.tests.test_gateway_commands
+          apps.meetings.tests.test_gateway_command_streams
           apps.meetings.tests.test_admission_and_invites
           apps.meetings.tests.test_lifecycle_hardening
           apps.meetings.tests.test_jrtc_signaling_contracts

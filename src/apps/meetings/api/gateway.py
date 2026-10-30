@@ -200,3 +200,59 @@ class GatewayAdmissionDecisionView(CurrentProfileMixin, GatewayAPIView):
                 **payload.validated_data,
             )
         )
+
+
+class CommandAuthorizationRequest(StrictSerializer):
+    command = serializers.DictField()
+
+
+class GatewayCommandAuthorityView(GatewayAPIView):
+    authentication_classes = [GatewayServiceAuthentication]
+
+    def post(self, request):
+        from apps.meetings.services.gateway_commands import authorize_command
+
+        if not settings.GATEWAY_COMMANDS_ENABLED:
+            raise GatewayDenied("UNAVAILABLE", 404)
+        payload = CommandAuthorizationRequest(data=request.data)
+        payload.is_valid(raise_exception=True)
+        return response.Response(
+            {"authorized": authorize_command(payload.validated_data["command"])}
+        )
+
+
+class GatewayCommandStatusView(CurrentProfileMixin, GatewayAPIView):
+    def get(self, request, session_id, request_id):
+        from apps.meetings.models import GatewayAuthorizationOutbox, GatewayCommand
+        from apps.meetings.services.gateway_outbox import enabled
+
+        profile = self.get_profile()
+        row = (
+            GatewayAuthorizationOutbox.objects.select_related(
+                "session__room", "participant"
+            )
+            .filter(pk=request_id, session_id=session_id)
+            .first()
+        )
+        if row is None or not enabled(row.session):
+            raise GatewayDenied("UNAVAILABLE", 404)
+        if not profile.is_active or not profile.user.is_active:
+            raise GatewayDenied()
+        own = row.participant is not None and row.participant.profile_id == profile.pk
+        moderator = row.session.room.memberships.filter(
+            profile=profile, is_active=True, can_manage_waiting_room=True
+        ).exists()
+        if not own and not moderator:
+            raise GatewayDenied()
+        command = GatewayCommand.objects.filter(outbox=row).first()
+        return response.Response(
+            {
+                "request_id": str(row.pk),
+                "command_id": str(command.pk) if command else None,
+                "action": row.action,
+                "authorization_epoch": row.authorization_epoch,
+                "enforcement_status": row.status,
+                "reason_code": row.last_error or None,
+                "delivery_attempts": row.delivery_attempts,
+            }
+        )

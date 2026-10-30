@@ -27,6 +27,7 @@ dependencies = [
     "uvicorn>=0.51.0",
     "psycopg[binary,pool]>=3.3.4",
     "PyJWT[crypto]>=2.10.1,<3",
+    "jrtc-signalling[bus]>=0.1,<0.2",
 ]
 
 [tool.uv]
@@ -41,3 +42,5 @@ override-dependencies = ["django>=6.0.7,<6.1"]
 [tool.uv.sources]
 jrtc = { git = "https://github.com/Leydotpy/jrtc.git", rev = "b0998af03c0702302855cc7c52c3dd53ac7a32af" }
 jrtc-video = { git = "https://github.com/Leydotpy/jrtc-plugins.git", rev = "87bbb9b79870724a91fc98f8711c55f5cb4519e2", subdirectory = "jrtc-video" }
+
+jrtc-signalling = { git = "https://github.com/Leydotpy/jrtc-signalling.git", rev = "f8242ac5369ea4c92157e38482f81c5ed8a43a56" }

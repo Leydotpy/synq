@@ -504,3 +504,7 @@ GATEWAY_TICKET_TTL_SECONDS = config("GATEWAY_TICKET_TTL_SECONDS", default=60, ca
 # Dedicated credential, not the external meeting-provider service token.
 GATEWAY_AUTHORITY_TOKEN = config("GATEWAY_AUTHORITY_TOKEN", default="", cast=str)
 GATEWAY_ADMISSION_ENABLED = config("GATEWAY_ADMISSION_ENABLED", default=False, cast=bool)
+
+# Dedicated signed gateway command delivery; the legacy event consumer is unchanged.
+GATEWAY_COMMANDS_ENABLED = config("GATEWAY_COMMANDS_ENABLED", default=False, cast=bool)
+GATEWAY_BUS_CONFIG_FILE = config("GATEWAY_BUS_CONFIG_FILE", default="", cast=str)

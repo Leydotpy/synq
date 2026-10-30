@@ -73,3 +73,21 @@ def record_authorization_intent(
         },
     )
     return record
+
+
+def record_meeting_termination(*, session, actor_profile=None):
+    if not enabled(session):
+        return None
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("Authorization intent requires a decision transaction.")
+    record, _ = GatewayAuthorizationOutbox.objects.get_or_create(
+        session=session,
+        participant=None,
+        authorization_epoch=session.authorization_epoch,
+        defaults={
+            "actor_id": str(actor_profile.pk) if actor_profile else "system",
+            "action": "meeting.terminate",
+            "data": {"reason_code": "meeting_ended"},
+        },
+    )
+    return record

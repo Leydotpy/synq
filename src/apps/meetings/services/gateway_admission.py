@@ -82,7 +82,9 @@ def _snapshot(participant, intent=None, decision=None):
     outbox = participant.gateway_outbox.filter(
         authorization_epoch=participant.authorization_epoch
     ).first()
-    result["enforcement_status"] = "pending" if outbox else "not_requested"
+    result["enforcement_status"] = outbox.status if outbox else "not_requested"
+    result["enforcement_reason"] = (outbox.last_error or None) if outbox else None
+    result["enforcement_request_id"] = str(outbox.pk) if outbox else None
     return result
 
 

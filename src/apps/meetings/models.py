@@ -441,6 +441,7 @@ class MeetingSession(UUIDTimestampedModel):
     """Live occurrence of a room that tracks Janus provisioning, state sync, and cleanup."""
 
     objects = MeetingSessionQuerySet.as_manager()
+    authorization_epoch = models.PositiveBigIntegerField(default=0)
 
     # Persistent room definition from which this live session was created.
     room = models.ForeignKey(MeetingRoom, on_delete=models.CASCADE, related_name="sessions")
@@ -862,18 +863,59 @@ class GatewayAuthorizationOutbox(UUIDTimestampedModel):
     """Committed permission intent, awaiting SG-06 delivery and SG-07 owner routing."""
 
     session = models.ForeignKey(MeetingSession, on_delete=models.CASCADE, related_name="gateway_outbox")
-    participant = models.ForeignKey(Participant, on_delete=models.CASCADE, related_name="gateway_outbox")
+    participant = models.ForeignKey(Participant, on_delete=models.CASCADE, related_name="gateway_outbox", null=True, blank=True)
     actor_id = models.CharField(max_length=128)
     authorization_epoch = models.PositiveBigIntegerField()
     action = models.CharField(max_length=64, choices=[
-        (name, name) for name in ("participant.admit", "participant.deny", "participant.disconnect", "participant.permissions.update")
+        (name, name) for name in ("participant.admit", "participant.deny", "participant.disconnect", "participant.permissions.update", "meeting.terminate")
     ])
     data = models.JSONField()
-    status = models.CharField(max_length=16, default="pending", choices=[("pending", "Pending")])
+    status = models.CharField(max_length=16, default="pending", choices=[(s, s) for s in ("pending", "accepted", "applied", "failed", "timed_out", "superseded")])
+    delivery_attempts = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    lease_id = models.UUIDField(null=True, blank=True)
+    lease_until = models.DateTimeField(null=True, blank=True)
+    last_error = models.CharField(max_length=64, blank=True)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=("participant", "authorization_epoch"), name="gateway_outbox_part_epoch_uniq")]
+        constraints = [
+            models.UniqueConstraint(fields=("participant", "authorization_epoch"), name="gateway_outbox_part_epoch_uniq"),
+            models.UniqueConstraint(fields=("session", "authorization_epoch"), condition=models.Q(participant__isnull=True), name="gateway_outbox_meeting_epoch"),
+        ]
         indexes = [models.Index(fields=("status", "created_at"), name="gateway_outbox_pending_idx")]
+
+
+class GatewayCommandRoute(UUIDTimestampedModel):
+    """SG-07 lease publication boundary; SG-06 never invents or allocates an owner."""
+
+    session = models.OneToOneField(MeetingSession, on_delete=models.CASCADE, related_name="gateway_route")
+    owner_id = models.CharField(max_length=64)
+    owner_generation = models.PositiveBigIntegerField()
+    lease_expires_at = models.DateTimeField()
+
+
+class GatewayCommand(UUIDTimestampedModel):
+    """Immutable wire request. Retries keep its identity, target, epoch and expiry."""
+
+    outbox = models.OneToOneField(GatewayAuthorizationOutbox, on_delete=models.CASCADE, related_name="command")
+    envelope = models.JSONField()
+    status = models.CharField(max_length=16, default="pending")
+    published_at = models.DateTimeField(null=True, blank=True)
+    terminal_at = models.DateTimeField(null=True, blank=True)
+
+
+class GatewayCommandOutcome(UUIDTimestampedModel):
+    """Authenticated outcome inbox; never changes permission or media presence."""
+
+    command = models.ForeignKey(GatewayCommand, on_delete=models.CASCADE, related_name="outcomes")
+    digest = models.CharField(max_length=64)
+    status = models.CharField(max_length=16)
+    reason_code = models.CharField(max_length=64)
+
+
+class GatewayCommandQuarantine(UUIDTimestampedModel):
+    digest = models.CharField(max_length=64, unique=True)
+    reason_code = models.CharField(max_length=64)
 
 
 class ParticipantConnection(UUIDTimestampedModel):

@@ -36,7 +36,7 @@ from apps.meetings.models import (
 )
 from apps.meetings.services.permissions import MeetingPermissionService
 from apps.meetings.services.gateway_tickets import advance_epoch
-from apps.meetings.services.gateway_outbox import enabled as gateway_admission_enabled, record_authorization_intent
+from apps.meetings.services.gateway_outbox import enabled as gateway_admission_enabled, record_authorization_intent, record_meeting_termination
 from apps.meetings.services.invitations import MeetingInvitationService
 from core.utils import generate_short_code
 
@@ -1177,7 +1177,9 @@ class MeetingLifecycleService:
             now = timezone.now()
             session.lifecycle_state = MeetingLifecycleState.ENDED
             session.ended_at = now
-            session.save(update_fields=["lifecycle_state", "ended_at", "updated_at"])
+            advance_epoch(session)
+            session.save(update_fields=["lifecycle_state", "ended_at", "authorization_epoch", "updated_at"])
+            record_meeting_termination(session=session, actor_profile=actor_profile)
             gateway_ending = list(session.participants.exclude(status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED]).values_list("pk", flat=True)) if gateway_admission_enabled(session) else []
             session.participants.exclude(
                 status__in=[ParticipantStatus.LEFT, ParticipantStatus.REMOVED],
