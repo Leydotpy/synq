@@ -329,7 +329,25 @@ SG-08/10/11/13/17. No session is served by both paths, and no production routing
 or deployment changes here. See the gateway `docs/RUNTIME_OWNERSHIP.md` for the
 explicit deferred-path manifest, API configuration and disposal rules.
 
-Local verification: 182 tests ran, 174 passed and eight PostgreSQL/Redis checks
-were skipped. The ownership suite passed twelve SQLite tests and deferred one
-competing-owner test to PostgreSQL CI. Existing admission, outbox, ICE and runtime
-regressions passed. Published CI evidence is recorded in the final SG-07 report.
+Published implementation: `ea002b1bc29b69681cdea1cd7364d7fa1c9613bf`.
+[Synq CI 41876688346](https://github.com/Leydotpy/synq/actions/runs/41876688346)
+passed all 182 tests on PostgreSQL 16 and Redis 7.4, with zero skips. Competing
+claims produce exactly one owner, and the real gateway OwnershipClient exercises
+claim/renew/release over the Django ASGI HTTP endpoint. Release still works after
+rollout flags are disabled; stale renewal and retired claims fail. Existing
+admission, command delivery, broker retry, ICE and runtime regressions passed.
+Migration drift checks also passed.
+
+Local verification ran the same 182 tests with SQLite: 174 passed and eight
+PostgreSQL/Redis checks skipped. Focused Ruff checks passed. The gateway's five
+cross-repository authority/ownership checks passed locally on Python 3.14.9.
+[Gateway CI 41191969654](https://github.com/Leydotpy/jrtc-signalling/actions/runs/41191969654)
+passed its Python 3.12/3.13/3.14, container and isolated Janus checks. Its two real
+Janus tests cover management-handle reuse, concurrent attachment, disposal and
+fresh handles after server recovery. The gateway SG-07 report records the final
+ASGI lifespan integration gate and pinned cross-repository check.
+
+Rollback: disable runtime routing for new sessions, drain existing owners and
+preserve route/history rows until exact-owner release or reconciliation. Existing
+sessions keep their persisted cohort; start a new legacy session after draining.
+No merge, production deployment or live browser media cutover is part of SG-07.
