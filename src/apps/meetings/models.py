@@ -222,6 +222,11 @@ class JrtcBrowserOutboxStatus(models.TextChoices):
 
 
 class MeetingSessionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if "signalling_backend" in kwargs:
+            raise ValueError("A meeting's signalling backend is immutable.")
+        return super().update(**kwargs)
+
     """Reusable queryset helpers for meeting sessions."""
 
     def live(self) -> "MeetingSessionQuerySet":
@@ -442,6 +447,20 @@ class MeetingSession(UUIDTimestampedModel):
 
     objects = MeetingSessionQuerySet.as_manager()
     authorization_epoch = models.PositiveBigIntegerField(default=0)
+
+    # Chosen at creation; disabling rollout flags never transfers ownership.
+    signalling_backend = models.CharField(
+        max_length=16, default="legacy", choices=[("legacy", "Legacy"), ("gateway", "Gateway")],
+        editable=False,
+    )
+
+    def save(self, *args, **kwargs):
+        fields = kwargs.get("update_fields")
+        if not self._state.adding and (fields is None or "signalling_backend" in fields):
+            previous = type(self).objects.filter(pk=self.pk).values_list("signalling_backend", flat=True).first()
+            if previous is not None and previous != self.signalling_backend:
+                raise ValueError("A meeting's signalling backend is immutable.")
+        return super().save(*args, **kwargs)
 
     # Persistent room definition from which this live session was created.
     room = models.ForeignKey(MeetingRoom, on_delete=models.CASCADE, related_name="sessions")
@@ -892,6 +911,20 @@ class GatewayCommandRoute(UUIDTimestampedModel):
     owner_id = models.CharField(max_length=64)
     owner_generation = models.PositiveBigIntegerField()
     lease_expires_at = models.DateTimeField()
+    owner_incarnation = models.UUIDField(null=True, editable=False)
+    released = models.BooleanField(default=False)
+
+
+class GatewayOwnerGeneration(UUIDTimestampedModel):
+    """Keep retired incarnations from being resurrected by a replayed claim."""
+
+    session = models.ForeignKey(MeetingSession, on_delete=models.CASCADE)
+    incarnation = models.UUIDField()
+    owner_id = models.CharField(max_length=64)
+    generation = models.PositiveBigIntegerField()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("session", "incarnation"), name="gateway_owner_incarnation_once")]
 
 
 class GatewayCommand(UUIDTimestampedModel):

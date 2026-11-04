@@ -179,10 +179,14 @@ class MeetingLifecycleService:
             session = locked_room.sessions.live().order_by("-created_at").first()
             created = session is None
             if created:
+                from apps.meetings.services.gateway_ownership import selected_backend
+
+                backend = selected_backend(locked_room)
                 session = MeetingSession.objects.create(
                     room=locked_room,
                     started_by_profile=started_by_profile,
-                    lifecycle_state=MeetingLifecycleState.PROVISIONING,
+                    lifecycle_state=(MeetingLifecycleState.WAITING if backend == "gateway" else MeetingLifecycleState.PROVISIONING),
+                    signalling_backend=backend,
                     started_at=timezone.now(),
                     janus_room_secret=generate_short_code(16),
                     janus_room_pin=generate_short_code(8),
@@ -197,7 +201,10 @@ class MeetingLifecycleService:
                     display_name=started_by_profile.display_name or started_by_profile.handle,
                 )
                 participant.apply_membership_defaults()
-                participant.mark_joined()
+                if backend == "gateway":
+                    participant.status = ParticipantStatus.ADMITTED
+                else:
+                    participant.mark_joined()
                 participant.save()
                 record_session_event(
                     session=session,
@@ -214,6 +221,9 @@ class MeetingLifecycleService:
             """Queue asynchronous Janus work once the transaction commits successfully."""
 
             from apps.meetings.tasks import attach_participant_media_handles, provision_janus_room_for_session
+
+            if session.signalling_backend == "gateway":
+                return
 
             if session.lifecycle_state == MeetingLifecycleState.PROVISIONING and not session.janus_room_id:
                 dispatch_task(provision_janus_room_for_session, str(session.pk))

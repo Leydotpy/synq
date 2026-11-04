@@ -32,6 +32,7 @@ from apps.meetings.jrtc.handles import (
 )
 from apps.meetings.jrtc.ids import janus_event_to_wire, require_janus_id, thaw_json
 from apps.meetings.jrtc.runtime import JanusProcessRuntime, janus_runtime
+from apps.meetings.services.gateway_ownership import require_legacy, require_legacy_key
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +123,14 @@ def resolve_maybe_awaitable(result: Any) -> Any:
 def resolve_janus_session(instance: Any | None = None, *_args: Any, **_kwargs: Any) -> Any:
     """Historical dotted-path helper returning a ready local JRTC session."""
 
+    require_legacy_key(_session_key(instance))
     return janus_runtime.session(key=_session_key(instance))
 
 
 def resolve_owned_janus_session(instance: Any | None = None) -> Any | None:
     """Return an already-running local session without creating worker ownership."""
 
+    require_legacy_key(_session_key(instance))
     janus_runtime.reset_after_fork()
     if janus_runtime.state != janus_runtime.RUNNING:
         return None
@@ -386,6 +389,7 @@ def release_local_media_plugins_for_connection(connection_id: Any) -> int:
 
 def ensure_participant_media_plugin(media_handle: Any, *, recreate: bool = True) -> BoundVideoRoomHandle:
     """Synchronous worker compatibility; realtime callers use the async entry point."""
+    require_legacy_key(_session_key(media_handle))
     if janus_runtime.state != janus_runtime.RUNNING:
         janus_runtime.ensure_background()
     return janus_runtime.run(aensure_participant_media_plugin(media_handle, recreate=recreate))
@@ -432,6 +436,7 @@ async def aensure_participant_media_plugin(
                     )
                     .get(pk=media_handle.pk)
                 )
+                require_legacy(locked_handle.participant.session)
                 if locked_handle.connection_id != expected_connection_id:
                     raise JrtcHandleOwnershipError(
                         "The media connection generation changed before handle resolution."
@@ -639,6 +644,7 @@ def call_video_room_management_method(
     **kwargs: Any,
 ) -> Any:
     """Run one direct command with a short-lived VideoRoom plugin."""
+    require_legacy_key(_session_key(instance))
 
     try:
         return janus_runtime.run(
@@ -726,6 +732,7 @@ async def acall_plugin_method(bound_handle, method_name, *args, **kwargs):
 
 
 async def acall_video_room_management_method(instance, method_name, *args, **kwargs):
+    await sync_to_async(require_legacy_key)(_session_key(instance))
     janus_runtime.require_owner_loop()
     try:
         return await janus_runtime.adapter.management_command(

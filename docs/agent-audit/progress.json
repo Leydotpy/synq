@@ -500,7 +500,7 @@
     ]
   },
   "gateway_followup": {
-    "date": "2026-10-30",
+    "date": "2026-10-31",
     "baseline_commit": "602eb4237c2e83cfd5b75d362c6a5cd643c70c53",
     "branch": "codex/gateway-control-plane",
     "tasks": [
@@ -530,6 +530,14 @@
         "evidence": "docs/gateway-control-plane.md",
         "notes": "169 PostgreSQL 16/Redis 7.4 tests passed, zero skips, in Actions 41074432251. Includes concurrent claims, revocation races, actual broker timeout/retry and signed gateway outcomes through the real Django ASGI authority endpoint. Gateway CI 41072340216 passed 313 tests per supported Python version. Live owner allocation/enforcement remains SG-07; no cutover or deployment.",
         "implementation_commit": "088fd3adee2a20e9a0b3cbeae0477930f4f35939"
+      },
+      {
+        "id": "SG-07",
+        "status": "in_progress",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-control-plane.md",
+        "notes": "Immutable new-session cohort, signed owner leases, replay/generation fencing and legacy Janus exclusion. Local 182 tests: 174 passed, eight PostgreSQL/Redis checks skipped; CI pending. No cutover or deployment."
       }
     ]
   }

@@ -40,6 +40,7 @@ jobs:
           apps.meetings.tests.test_gateway_admission
           apps.meetings.tests.test_gateway_commands
           apps.meetings.tests.test_gateway_command_streams
+          apps.meetings.tests.test_gateway_ownership
           apps.meetings.tests.test_admission_and_invites
           apps.meetings.tests.test_lifecycle_hardening
           apps.meetings.tests.test_jrtc_signaling_contracts

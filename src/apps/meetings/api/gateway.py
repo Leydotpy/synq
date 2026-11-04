@@ -221,6 +221,22 @@ class GatewayCommandAuthorityView(GatewayAPIView):
         )
 
 
+class GatewayOwnershipView(GatewayAPIView):
+    authentication_classes = [GatewayServiceAuthentication]
+
+    def post(self, request):
+        from jrtc_signalling.bus import canonical
+
+        from apps.meetings.models import MeetingSession
+        from apps.meetings.services.gateway_ownership import ownership_request
+
+        try:
+            result = ownership_request(canonical(request.data))
+        except MeetingSession.DoesNotExist:
+            raise exceptions.NotFound() from None
+        return response.Response(result)
+
+
 class GatewayCommandStatusView(CurrentProfileMixin, GatewayAPIView):
     def get(self, request, session_id, request_id):
         from apps.meetings.models import GatewayAuthorizationOutbox, GatewayCommand

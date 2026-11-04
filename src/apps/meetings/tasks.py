@@ -404,6 +404,8 @@ def provision_janus_room_for_session(self, session_id: str) -> dict:
     session = MeetingSession.objects.select_related("room", "started_by_profile").filter(
         pk=session_id,
     ).first()
+    if session is not None and session.signalling_backend == "gateway":
+        return {"status": "gateway_owned"}
     if session is None:
         logger.info("Skipping Janus provisioning for missing meeting session '%s'.", session_id)
         return {}
@@ -565,6 +567,8 @@ def attach_participant_media_handles(self, participant_id: str) -> dict:
         session = MeetingSession.objects.select_for_update().get(
             pk=participant_session_id,
         )
+        if session.signalling_backend == "gateway":
+            return {"status": "gateway_owned"}
         participant = Participant.objects.select_for_update().filter(
             pk=participant_id,
             session=session,
@@ -635,6 +639,8 @@ def detach_participant_media_handles(
         pk=participant_id
     ).first()
     if participant is None:
+        return
+    if participant.session.signalling_backend == "gateway":
         return
     media_handles = list(participant.media_handles.order_by("pk"))
     if cleanup_snapshot is None:
@@ -807,6 +813,8 @@ def sync_janus_participants(self, session_id: str) -> dict:
     session = MeetingSession.objects.select_related("room", "started_by_profile").filter(
         pk=session_id,
     ).first()
+    if session is not None and session.signalling_backend == "gateway":
+        return {"status": "gateway_owned"}
     if session is None:
         logger.info("Skipping Janus sync for missing meeting session '%s'.", session_id)
         return {}
@@ -850,6 +858,8 @@ def destroy_janus_room_for_session(
     session = MeetingSession.objects.select_related("room", "started_by_profile").filter(
         pk=session_id,
     ).first()
+    if session is not None and session.signalling_backend == "gateway":
+        return {"status": "gateway_owned"}
     if session is None:
         logger.info("Skipping Janus cleanup for missing meeting session '%s'.", session_id)
         return {}

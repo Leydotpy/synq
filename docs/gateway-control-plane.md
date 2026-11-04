@@ -287,3 +287,49 @@ The gateway SG-06 report records the implementation and compatibility evidence.
 Rollback: disable new command/admission routing, preserve committed history,
 leases, inbox/outbox and keys for reconciliation, and keep the legacy path running.
 This task does not merge, deploy or transfer Janus ownership.
+
+
+## SG-07: exclusive gateway runtime ownership
+
+`GATEWAY_RUNTIME_ENABLED` defaults false. For an isolated rehearsal room, set
+both `gateway_control_plane` and `gateway_runtime` before creating a new session,
+with the existing admission/command flags enabled. Migration 0017 persists
+`MeetingSession.signalling_backend` as legacy or gateway. Existing sessions
+remain legacy. Ordinary model saves and queryset updates reject any later
+backend change; turning rollout flags off cannot transfer an assigned cohort.
+A gateway host is admitted without joined_at or legacy Janus provisioning.
+
+The HTTPS endpoint `POST /api/v1/meetings/internal/gateway/owners/` requires both
+the dedicated authority bearer token and a canonical owner-request packet signed
+by a configured gateway Ed25519 key. The key determines the owner ID. The payload
+contains request_id, meeting_id, process incarnation UUID, claim/renew/release,
+expected generation and issued_at. Requests older than ten seconds or more than
+five seconds in the future fail closed. No browser identity can claim an owner.
+
+Meeting-row locking serializes claims. The route contains the owner, process
+incarnation, generation and 30-second lease. Retried claims return the original
+lease. Renew/release require the exact incumbent incarnation and generation.
+Retired incarnations are recorded in GatewayOwnerGeneration, preventing replay
+of an older claim after later releases. Clean restart increments the generation;
+a stale worker cannot renew or release its replacement. SG-06 dispatchers target
+this published route, retaining their own permission/epoch/binding checks.
+
+Expiry alone is not evidence of remote Janus cleanup: this stage refuses
+unreconciled takeover. SG-15 owns reconciled failover and rolling handoff. An
+exact-owner release remains allowed while rollout flags are disabled, so a
+shutdown can drain safely. No raw database update should be used to bypass a
+failed cleanup or convert an active session between backends.
+
+The legacy management facade, handle preparation and ICE authorization reject
+gateway sessions. Celery provisioning, handle preparation, participant sync,
+room destruction and participant detach skip their resources. The existing ASGI
+runtime and Celery process hooks remain available for legacy cohorts. Browser
+media dispatch, domain event projection, moderation and final cutover remain
+SG-08/10/11/13/17. No session is served by both paths, and no production routing
+or deployment changes here. See the gateway `docs/RUNTIME_OWNERSHIP.md` for the
+explicit deferred-path manifest, API configuration and disposal rules.
+
+Local verification: 182 tests ran, 174 passed and eight PostgreSQL/Redis checks
+were skipped. The ownership suite passed twelve SQLite tests and deferred one
+competing-owner test to PostgreSQL CI. Existing admission, outbox, ICE and runtime
+regressions passed. Published CI evidence is recorded in the final SG-07 report.

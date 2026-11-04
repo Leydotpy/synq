@@ -66,6 +66,8 @@ from apps.meetings.services.janus import (
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.services.permissions import MeetingPermissionService
 
+from apps.meetings.services.gateway_ownership import require_legacy_key
+
 logger = get_logger(__name__)
 
 
@@ -99,6 +101,7 @@ def _claim_media_command(
 ) -> _MediaCommandClaim:
     """Claim a stable handle generation before performing Janus network I/O."""
 
+    require_legacy_key(media_handle.participant.session_id)
     expected_connection_id = media_handle.connection_id
     expected_owner_id = (
         media_handle.runtime_owner_id
@@ -563,6 +566,7 @@ def _prepare_media_handle(
     IDs and forces a fresh attach; persisted IDs are never adopted.
     """
 
+    require_legacy_key(participant.session_id)
     active_statuses = {
         RealtimeConnectionStatus.CONNECTED,
         RealtimeConnectionStatus.SUBSCRIBED,
@@ -1762,6 +1766,7 @@ class MeetingMediaSignalService:
             allowed = await ParticipantMediaHandle.objects.filter(pk=media_handle.pk,
                 participant_id=participant.pk, participant__status__in=[ParticipantStatus.ADMITTED, ParticipantStatus.ACTIVE],
                 participant__session_id=participant.session_id,
+                participant__session__signalling_backend="legacy",
                 connection_id=connection.pk, connection__socket_id=connection.socket_id,
                 connection__participant_id=participant.pk, connection__session_id=participant.session_id,
                 connection__status__in=[RealtimeConnectionStatus.CONNECTED, RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],
