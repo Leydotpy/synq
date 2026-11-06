@@ -973,6 +973,25 @@ class GatewayLifecycleQuarantine(UUIDTimestampedModel):
     reason_code = models.CharField(max_length=64)
 
 
+class GatewayStateProjection(UUIDTimestampedModel):
+    """Permission-aware materialized state; never an admission authority."""
+
+    session = models.OneToOneField(MeetingSession, on_delete=models.CASCADE, related_name="gateway_state")
+    version = models.PositiveBigIntegerField(default=0)
+    state = models.JSONField(default=dict)
+
+
+class GatewayStateChange(UUIDTimestampedModel):
+    """Bounded committed invalidation log for SSE replay and snapshot recovery."""
+
+    session = models.ForeignKey(MeetingSession, on_delete=models.CASCADE, related_name="gateway_state_changes")
+    version = models.PositiveBigIntegerField()
+    participant_ids = models.JSONField(default=list)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("session", "version"), name="gateway_state_version_unique")]
+
+
 class ParticipantConnection(UUIDTimestampedModel):
     """Socket.IO connection metadata used to map profiles to realtime sessions."""
 

@@ -65,6 +65,9 @@ class MeetingNamespace(AsyncNamespace):
 
         profile = await self._get_profile(sid)
         session = await self._get_session(data["session_id"])
+        from apps.meetings.services.gateway_state import enabled
+        if enabled(session):
+            raise ValueError("Gateway meeting state requires the authenticated SSE endpoint.")
         environ = self.server.get_environ(sid, namespace=self.namespace) or {}
         headers = extract_scope_headers(environ)
         connection = await sync_to_async(MeetingLifecycleService.bind_connection_to_session)(

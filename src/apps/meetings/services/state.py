@@ -61,6 +61,16 @@ class MeetingStateBuilder:
     def build(session: MeetingSession, authenticated_profile=None, message_limit: int = 50, reaction_limit: int = 25) -> dict:
         """Return a serialized state snapshot for a meeting session."""
 
+        from django.core.exceptions import PermissionDenied
+        from apps.meetings.services.gateway_state import enabled, snapshot
+        from apps.meetings.services.gateway_tickets import GatewayDenied
+        if enabled(session):
+            if authenticated_profile is None:
+                raise PermissionDenied
+            try:
+                return snapshot(session.pk, authenticated_profile.pk)
+            except GatewayDenied:
+                raise PermissionDenied from None
         hydrated_session = MeetingSession.objects.select_related(
             "room",
             "room__created_by_profile",

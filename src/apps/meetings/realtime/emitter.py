@@ -34,6 +34,9 @@ class MeetingSocketEmitter:
     def emit_session_state(*, session: MeetingSession) -> None:
         """Send a permission-aware session snapshot to each live socket."""
 
+        from apps.meetings.services.gateway_state import enabled
+        if enabled(session):
+            return  # This cohort uses the committed SSE projection exclusively.
         connections = ParticipantConnection.objects.filter(
             session=session,
             status__in=[
@@ -58,6 +61,9 @@ class MeetingSocketEmitter:
 
     @staticmethod
     async def aemit_session_state(*, session: MeetingSession) -> None:
+        from apps.meetings.services.gateway_state import enabled
+        if enabled(session):
+            return
         from conf.socketio import get_socket_server
         connections = ParticipantConnection.objects.filter(session=session,
             status__in=[RealtimeConnectionStatus.CONNECTED, RealtimeConnectionStatus.SUBSCRIBED, RealtimeConnectionStatus.ACTIVE],

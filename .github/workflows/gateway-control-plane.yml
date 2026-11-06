@@ -32,6 +32,10 @@ jobs:
         with:
           version: "0.13.4"
       - run: uv sync --frozen
+      - name: Check gateway state implementation style
+        run: |
+          uvx ruff@0.14.14 check src/apps/meetings/services/gateway_state.py src/apps/meetings/services/gateway_presence.py src/apps/meetings/api/gateway_state.py src/apps/meetings/tests/test_gateway_state.py src/apps/meetings/services/gateway_event_worker.py src/apps/meetings/services/gateway_events.py scripts/check_gateway_state.py
+          uvx ruff@0.14.14 format --check src/apps/meetings/services/gateway_state.py src/apps/meetings/services/gateway_presence.py src/apps/meetings/api/gateway_state.py src/apps/meetings/tests/test_gateway_state.py src/apps/meetings/services/gateway_event_worker.py src/apps/meetings/services/gateway_events.py scripts/check_gateway_state.py src/apps/meetings/migrations/0019_gateway_state_projection.py
       - run: uv run --frozen python src/manage.py makemigrations --check --dry-run --settings=conf.test_settings
       - run: >-
           uv run --frozen python src/manage.py test
@@ -42,6 +46,7 @@ jobs:
           apps.meetings.tests.test_gateway_command_streams
           apps.meetings.tests.test_gateway_ownership
           apps.meetings.tests.test_gateway_events
+          apps.meetings.tests.test_gateway_state
           apps.meetings.tests.test_admission_and_invites
           apps.meetings.tests.test_lifecycle_hardening
           apps.meetings.tests.test_jrtc_signaling_contracts
@@ -69,3 +74,9 @@ jobs:
         run: >-
           uv run --frozen --with pytest --with aiortc python
           gateway-integration/scripts/check_django_lifecycle.py --synq .
+      - name: Verify live gateway state projection and SSE
+        env:
+          DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
+        run: >-
+          uv run --frozen --with pytest --with aiortc python
+          scripts/check_gateway_state.py --gateway gateway-integration

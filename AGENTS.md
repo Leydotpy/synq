@@ -23,6 +23,10 @@ inbox and observation worker on the same authorized branch. Observations remain
 separate from admission/permissions and legacy raw Janus dispatch. SSE/public
 projection is SG-11; no cutover, merge or deployment is authorized.
 
+2026-11-06 additive scope: SG-11 adds the opt-in permission-aware gateway state
+projection, disposable Redis presence and authenticated SSE/snapshot endpoints.
+The legacy cohort remains unchanged. No frontend cutover, merge or deployment.
+
 ## Current decisions and stronger acceptance rules
 
 - The older migration instructions allowed whole-service sync bridges during compatibility work and required temporary management handles. Those phase-specific recommendations are superseded for this performance phase: use direct async orchestration and package-owned reusable management services, preserving the existing transactional fences.

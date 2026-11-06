@@ -32,8 +32,9 @@ def receive_event(producer, event, *, now=None):
     """Commit receipt and latest complete snapshot before acknowledgement.
 
     A higher sequence reconciles a gap because every event carries all fields.
-    These snapshots are not live notification history and never create admission,
-    role, permission, joined_at, Socket.IO or SSE mutations.
+    These snapshots never create admission, role, permission or joined_at changes.
+    Optional SG-11 projections commit in the same transaction; SSE reads only
+    committed state through its separate authenticated endpoint.
     """
     now = now or timezone.now()
     validate_message(event, schema="lifecycle-event")
@@ -149,6 +150,9 @@ def receive_event(producer, event, *, now=None):
                 disposition = (
                     "reconciled" if event["sequence"] > sequence + 1 else "recorded"
                 )
+                from apps.meetings.services.gateway_state import project_event
+
+                project_event(session, now=now)
         GatewayLifecycleReceipt.objects.create(
             id=ids["event_id"],
             participant=participant,

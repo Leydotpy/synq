@@ -408,3 +408,18 @@ Rollback: drain sockets with the gateway lifecycle flag disabled for subsequent
 startup, preserve its SQLite spool and signing/verifying keys, then stop this
 worker. Keep migration rows for dedupe/replay. Legacy/raw-event and command workers
 remain available. No deployment, merge, production enablement or frontend change.
+
+
+## SG-11 — permission-aware state and SSE
+
+The opt-in server-side projection and notification implementation is documented in
+[gateway-state.md](gateway-state.md). Migration 0019 adds a monotonic projection
+and bounded committed replay log; the existing event worker maintains disposable
+Redis presence. Authorized users receive paginated snapshots and authenticated
+SSE invalidations, with current permission filtering on every pull and snapshot
+repair after a gap. Approval remains separate from observed connection state.
+
+`GATEWAY_STATE_ENABLED` defaults to false. Gateway state no longer competes with
+legacy Socket.IO state when this flag is enabled; legacy meeting cohorts retain
+the existing path. No frontend migration, production enablement, merge or deploy
+is part of SG-11. The gateway dependency remains pinned to `16a3272ca4625b133f24dbbf0e8fdd1e036c8694`.

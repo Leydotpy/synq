@@ -7,6 +7,7 @@ from contextlib import suppress
 from asgiref.sync import sync_to_async
 
 from apps.meetings.services.gateway_events import quarantine, receive_event
+from apps.meetings.services.gateway_presence import PresenceProjector
 from jrtc_signalling.bus import LIFECYCLE, BusError, digest
 from jrtc_signalling.bus_transport import Streams
 
@@ -17,6 +18,7 @@ class GatewayEventWorker:
         self.transport = Streams(config.redis_url, "django-lifecycle-v1")
         self.stop = asyncio.Event()
         self.counters = Counter()
+        self.presence = PresenceProjector(config.redis_url)
 
     async def handle(self, delivery):
         try:
@@ -45,6 +47,12 @@ class GatewayEventWorker:
                 while not self.stop.is_set():
                     if not await self.transport.healthy():
                         raise BusError("Lifecycle transport unavailable.")
+                    try:
+                        await self.presence.tick()
+                    except Exception:
+                        # Durable projection/log and the SSE polling fallback
+                        # survive a lost disposable cache write.
+                        self.counters["presence_failure"] += 1
                     with suppress(TimeoutError):
                         await asyncio.wait_for(self.stop.wait(), 1)
             except asyncio.CancelledError:
@@ -54,5 +62,7 @@ class GatewayEventWorker:
             finally:
                 with suppress(Exception):
                     await self.transport.close()
+                with suppress(Exception):
+                    await self.presence.close()
             with suppress(TimeoutError):
                 await asyncio.wait_for(self.stop.wait(), 1)
