@@ -951,6 +951,28 @@ class GatewayCommandQuarantine(UUIDTimestampedModel):
     reason_code = models.CharField(max_length=64)
 
 
+class GatewaySessionObservation(UUIDTimestampedModel):
+    """Latest authenticated transport snapshot; never admission or permissions."""
+
+    participant = models.OneToOneField(Participant, on_delete=models.CASCADE, related_name="gateway_observation")
+    envelope = models.JSONField()
+    digest = models.CharField(max_length=64)
+    reconciled_gaps = models.PositiveBigIntegerField(default=0)
+
+
+class GatewayLifecycleReceipt(UUIDTimestampedModel):
+    """Bounded inbox; the retained observation high-water mark also fences replay."""
+
+    participant = models.ForeignKey(Participant, on_delete=models.CASCADE, related_name="gateway_lifecycle_receipts")
+    digest = models.CharField(max_length=64)
+    disposition = models.CharField(max_length=16)
+
+
+class GatewayLifecycleQuarantine(UUIDTimestampedModel):
+    digest = models.CharField(max_length=64, unique=True)
+    reason_code = models.CharField(max_length=64)
+
+
 class ParticipantConnection(UUIDTimestampedModel):
     """Socket.IO connection metadata used to map profiles to realtime sessions."""
 

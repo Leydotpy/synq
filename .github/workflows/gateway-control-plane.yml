@@ -4,7 +4,7 @@ permissions:
   contents: read
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       redis:
@@ -41,6 +41,7 @@ jobs:
           apps.meetings.tests.test_gateway_commands
           apps.meetings.tests.test_gateway_command_streams
           apps.meetings.tests.test_gateway_ownership
+          apps.meetings.tests.test_gateway_events
           apps.meetings.tests.test_admission_and_invites
           apps.meetings.tests.test_lifecycle_hardening
           apps.meetings.tests.test_jrtc_signaling_contracts
@@ -50,3 +51,21 @@ jobs:
           apps.meetings.tests.test_jrtc_event_plane
           apps.meetings.tests.test_realtime_namespace
           --settings=conf.gateway_postgres_test_settings
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Leydotpy/jrtc-signalling
+          ref: 1590cc61168b304ea99924e0d4f3222fc9c8783b
+          path: gateway-integration
+      - name: Install isolated Janus integration dependency
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends janus
+          sudo systemctl stop janus || true
+          dpkg-query --show janus
+      - name: Verify live gateway lifecycle events against Django
+        env:
+          DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
+        run: >-
+          uv run --frozen --with pytest --with aiortc python
+          gateway-integration/scripts/check_django_lifecycle.py --synq .

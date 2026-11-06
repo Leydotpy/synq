@@ -351,3 +351,51 @@ Rollback: disable runtime routing for new sessions, drain existing owners and
 preserve route/history rows until exact-owner release or reconciliation. Existing
 sessions keep their persisted cohort; start a new legacy session after draining.
 No merge, production deployment or live browser media cutover is part of SG-07.
+
+
+## SG-10 lifecycle observation inbox (2026-11-06)
+
+The separate `run_gateway_events` worker consumes authenticated
+`synq.signalling.lifecycle.v1` snapshots through Broka Redis Streams. Migration
+0018 adds `GatewaySessionObservation`, bounded lifecycle inbox receipts and a
+hash-only poison quarantine. `GATEWAY_EVENTS_ENABLED` defaults to false; the worker
+also requires the existing bus config plus `JRTC_EVENT_BROKER_ENGINE=redis` and
+`JRTC_REDIS_MODE=streams`. Enable only for an isolated gateway cohort.
+
+Every snapshot carries owner and grant generations, participant/session IDs,
+authorization epoch, stable event ID, sequence, timestamp and trace ID. Signature,
+cohort, owner history/current route, grant and permission checks run before the
+transaction records it. Online state requires a current lease; matching terminal
+replay remains possible after release/expiry. The meeting lock serializes delivery
+with authority mutations. Receipts commit before ACK; database/ACK failures stay
+pending. Higher full snapshots repair gaps, old events cannot roll state back and
+terminal generations cannot reactivate. Inbox samples are capped at 256 per
+participant and poison samples at 1,000 hashes; the latest observation retains the
+replay cursor after pruning.
+
+No event changes admission, roles, permissions, joined_at or legacy connections.
+The raw `janus.events` pipeline and logical dispatcher are unchanged. These are
+internal snapshots; SG-11 still owns permission-aware public presence, projection
+versions and SSE. In particular, consumers of this row must recheck its epoch,
+grant and owner against current authority. It is not an admission decision.
+
+Gateway publication persists a bounded latest snapshot per connection, preserves
+terminal capacity under backpressure, replays after broker outages and reconciles
+abandoned transports to OFFLINE after process restart. Full snapshots replay every
+five minutes to repair a dropped final entry; delivered terminal snapshots are
+retained for 24 hours. See gateway `docs/LIFECYCLE_EVENTS.md` for spool budgets,
+retention and route ACL/key requirements. No SDP/ICE or ticket material enters the
+bus or observation tables.
+
+Local verification: 198 tests passed with PostgreSQL 16.2 and Redis 7.0.15, zero
+skips, including duplicate-worker, reordered-snapshot and revocation races. A
+separate live check passed signed Django ticket/ownership HTTP -> ASGI media ->
+actual Janus -> Broka/Redis -> PostgreSQL observation, including lobby isolation,
+publishing and broker-stalled disconnect replay. Authority fields remain unchanged.
+Hosted results and immutable dependency/implementation commits are recorded in the
+SG-10 completion report after publication.
+
+Rollback: drain sockets with the gateway lifecycle flag disabled for subsequent
+startup, preserve its SQLite spool and signing/verifying keys, then stop this
+worker. Keep migration rows for dedupe/replay. Legacy/raw-event and command workers
+remain available. No deployment, merge, production enablement or frontend change.

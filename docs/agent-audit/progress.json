@@ -500,7 +500,7 @@
     ]
   },
   "gateway_followup": {
-    "date": "2026-11-04",
+    "date": "2026-11-06",
     "baseline_commit": "602eb4237c2e83cfd5b75d362c6a5cd643c70c53",
     "branch": "codex/gateway-control-plane",
     "tasks": [
@@ -539,6 +539,14 @@
         "evidence": "docs/gateway-control-plane.md",
         "notes": "182 PostgreSQL 16/Redis 7.4 tests passed, zero skips, in Actions 41876688346. Includes competing owner claims, signed HTTP lease round trips, retired-incarnation replay and immutable cohort exclusion from legacy Janus paths. Five real Django/gateway compatibility checks passed locally. Gateway live Janus recovery/disposal tests passed in Actions 41191969654. No media cutover or deployment; reconciled crash takeover remains SG-15.",
         "implementation_commit": "ea002b1bc29b69681cdea1cd7364d7fa1c9613bf"
+      },
+      {
+        "id": "SG-10",
+        "status": "in_progress",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-control-plane.md",
+        "notes": "Local PostgreSQL/Redis regression 198 tests and real Janus/Broka/Django lifecycle integration passed. Publication and hosted verification pending; no production enablement."
       }
     ]
   }

@@ -18,6 +18,11 @@ at `602eb4237c2e83cfd5b75d362c6a5cd643c70c53`. The earlier in-process architectu
 is retained for compatibility. No transport cutover, merge or deployment is
 authorized by this implementation. See [gateway control plane](docs/gateway-control-plane.md).
 
+2026-11-06 additive scope: SG-10 implements the authenticated gateway lifecycle
+inbox and observation worker on the same authorized branch. Observations remain
+separate from admission/permissions and legacy raw Janus dispatch. SSE/public
+projection is SG-11; no cutover, merge or deployment is authorized.
+
 ## Current decisions and stronger acceptance rules
 
 - The older migration instructions allowed whole-service sync bridges during compatibility work and required temporary management handles. Those phase-specific recommendations are superseded for this performance phase: use direct async orchestration and package-owned reusable management services, preserving the existing transactional fences.
