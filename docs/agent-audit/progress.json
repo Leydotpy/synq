@@ -552,11 +552,12 @@
       },
       {
         "id": "SG-11",
-        "status": "in_progress",
+        "status": "ready_for_review",
         "implementation": "present",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-state.md",
-        "notes": "Local PostgreSQL/Redis regressions and actual Janus/Broka/Django/SSE integration passed; final commit and CI evidence pending. Feature remains disabled; no frontend cutover or deployment."
+        "notes": "Actions 42308160215 passed 228 PostgreSQL 16/Redis 7.4 tests (zero skips), both actual Janus integrations (existing lifecycle and new authenticated projection/SSE), targeted style checks and migration drift at 2cd29394081243cc0be9feb62d7359f5a3dcf041. Local PostgreSQL 16.2/Redis 7.0.15 run also passed 228 tests and both live integrations. Feature remains disabled; SG-12 frontend work and production enablement are not included.",
+        "implementation_commit": "2cd29394081243cc0be9feb62d7359f5a3dcf041"
       }
     ]
   }

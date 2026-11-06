@@ -423,3 +423,11 @@ repair after a gap. Approval remains separate from observed connection state.
 legacy Socket.IO state when this flag is enabled; legacy meeting cohorts retain
 the existing path. No frontend migration, production enablement, merge or deploy
 is part of SG-11. The gateway dependency remains pinned to `16a3272ca4625b133f24dbbf0e8fdd1e036c8694`.
+
+SG-11 implementation: `2cd29394081243cc0be9feb62d7359f5a3dcf041`.
+[CI 42308160215](https://github.com/Leydotpy/synq/actions/runs/42308160215)
+passed 228 PostgreSQL 16/Redis 7.4 tests (zero skips), the existing live lifecycle
+integration and the new live Janus/Broka/projection/SSE integration. Targeted Ruff
+and migration drift checks passed. The corresponding local run passed 228 tests
+and both live integrations against PostgreSQL 16.2, Redis 7.0.15 and Janus 1.1.2.
+The audit state is `ready_for_review`; only the maintainer accepts the task.
