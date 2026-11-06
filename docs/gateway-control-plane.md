@@ -392,8 +392,17 @@ skips, including duplicate-worker, reordered-snapshot and revocation races. A
 separate live check passed signed Django ticket/ownership HTTP -> ASGI media ->
 actual Janus -> Broka/Redis -> PostgreSQL observation, including lobby isolation,
 publishing and broker-stalled disconnect replay. Authority fields remain unchanged.
-Hosted results and immutable dependency/implementation commits are recorded in the
-SG-10 completion report after publication.
+[Implementation badbad7](https://github.com/Leydotpy/synq/commit/badbad7d3a6158e810217777a9b5ffdbe61d964a)
+is followed by [dependency pin a4ea695](https://github.com/Leydotpy/synq/commit/a4ea69571bd9f21e8301f1b656ebce626b9c392f),
+which pins gateway `16a3272ca4625b133f24dbbf0e8fdd1e036c8694` in pyproject and uv.lock.
+This includes the receive-only media-kind correction and live audio assertions.
+[Synq CI 42263492020](https://github.com/Leydotpy/synq/actions/runs/42263492020)
+passed 198 PostgreSQL 16/Redis 7.4 tests in 18.253s, zero skips; migration drift and
+frozen installation passed. The live Janus 1.1.2 lifecycle check passed in 19.319s.
+[Gateway CI 42263270744](https://github.com/Leydotpy/jrtc-signalling/actions/runs/42263270744)
+passed all six jobs, including six live Janus/TURN tests. The installed-artifact
+local rerun passed 198 tests and the live check. SG-10 is ready for maintainer review;
+this is not production acceptance.
 
 Rollback: drain sockets with the gateway lifecycle flag disabled for subsequent
 startup, preserve its SQLite spool and signing/verifying keys, then stop this

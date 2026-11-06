@@ -542,11 +542,13 @@
       },
       {
         "id": "SG-10",
-        "status": "in_progress",
+        "status": "ready_for_review",
         "implementation": "present",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-control-plane.md",
-        "notes": "Local PostgreSQL/Redis regression 198 tests and real Janus/Broka/Django lifecycle integration passed. Publication and hosted verification pending; no production enablement."
+        "notes": "Final Actions 42263492020 passed 198 PostgreSQL 16/Redis 7.4 tests (zero skips) and the actual Janus/Broka/Django lifecycle integration. Gateway Actions 42263270744 passed all six jobs at dependency 16a3272ca4625b133f24dbbf0e8fdd1e036c8694, including receive-only audio metadata assertions. Local installed-artifact rerun also passed 198 tests and the live integration. Admission/permissions remain unchanged; public projection/SSE stays SG-11. No production enablement or deployment.",
+        "implementation_commit": "a4ea69571bd9f21e8301f1b656ebce626b9c392f",
+        "source_implementation_commit": "badbad7d3a6158e810217777a9b5ffdbe61d964a"
       }
     ]
   }
