@@ -558,6 +558,14 @@
         "evidence": "docs/gateway-state.md",
         "notes": "Actions 42308160215 passed 228 PostgreSQL 16/Redis 7.4 tests (zero skips), both actual Janus integrations (existing lifecycle and new authenticated projection/SSE), targeted style checks and migration drift at 2cd29394081243cc0be9feb62d7359f5a3dcf041. Local PostgreSQL 16.2/Redis 7.0.15 run also passed 228 tests and both live integrations. Feature remains disabled; SG-12 frontend work and production enablement are not included.",
         "implementation_commit": "2cd29394081243cc0be9feb62d7359f5a3dcf041"
+      },
+      {
+        "id": "SG-12",
+        "status": "in_progress",
+        "implementation": "partial",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-state.md",
+        "notes": "SDK-compatible opt-in state, HTTPS application commands and canonical notification identities implemented. 239 PostgreSQL/Redis tests and both live Janus integrations pass locally. Chromium/React acceptance is pending CI; local browser launch is blocked by Unix socket restrictions. No rollout."
       }
     ]
   }

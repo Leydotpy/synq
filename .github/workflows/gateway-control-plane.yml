@@ -34,8 +34,8 @@ jobs:
       - run: uv sync --frozen
       - name: Check gateway state implementation style
         run: |
-          uvx ruff@0.14.14 check src/apps/meetings/services/gateway_state.py src/apps/meetings/services/gateway_presence.py src/apps/meetings/api/gateway_state.py src/apps/meetings/tests/test_gateway_state.py src/apps/meetings/services/gateway_event_worker.py src/apps/meetings/services/gateway_events.py scripts/check_gateway_state.py
-          uvx ruff@0.14.14 format --check src/apps/meetings/services/gateway_state.py src/apps/meetings/services/gateway_presence.py src/apps/meetings/api/gateway_state.py src/apps/meetings/tests/test_gateway_state.py src/apps/meetings/services/gateway_event_worker.py src/apps/meetings/services/gateway_events.py scripts/check_gateway_state.py src/apps/meetings/migrations/0019_gateway_state_projection.py
+          uvx ruff@0.14.14 check src/apps/meetings/services/gateway_state.py src/apps/meetings/services/gateway_presence.py src/apps/meetings/api/gateway_state.py src/apps/meetings/tests/test_gateway_state.py src/apps/meetings/services/gateway_event_worker.py src/apps/meetings/services/gateway_events.py scripts/check_gateway_state.py src/apps/meetings/services/gateway_sdk.py src/apps/meetings/api/gateway_application.py src/apps/meetings/tests/test_gateway_sdk.py scripts/check_gateway_browser.py
+          uvx ruff@0.14.14 format --check src/apps/meetings/services/gateway_state.py src/apps/meetings/services/gateway_presence.py src/apps/meetings/api/gateway_state.py src/apps/meetings/tests/test_gateway_state.py src/apps/meetings/services/gateway_event_worker.py src/apps/meetings/services/gateway_events.py scripts/check_gateway_state.py src/apps/meetings/migrations/0019_gateway_state_projection.py src/apps/meetings/services/gateway_sdk.py src/apps/meetings/api/gateway_application.py src/apps/meetings/tests/test_gateway_sdk.py scripts/check_gateway_browser.py
       - run: uv run --frozen python src/manage.py makemigrations --check --dry-run --settings=conf.test_settings
       - run: >-
           uv run --frozen python src/manage.py test
@@ -47,6 +47,7 @@ jobs:
           apps.meetings.tests.test_gateway_ownership
           apps.meetings.tests.test_gateway_events
           apps.meetings.tests.test_gateway_state
+          apps.meetings.tests.test_gateway_sdk
           apps.meetings.tests.test_admission_and_invites
           apps.meetings.tests.test_lifecycle_hardening
           apps.meetings.tests.test_jrtc_signaling_contracts

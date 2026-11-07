@@ -150,6 +150,10 @@ def receive_event(producer, event, *, now=None):
                 disposition = (
                     "reconciled" if event["sequence"] > sequence + 1 else "recorded"
                 )
+                if disposition == "recorded":
+                    from apps.meetings.services.gateway_sdk import record_presence_event
+
+                    record_presence_event(session, participant, event, previous, same)
                 from apps.meetings.services.gateway_state import project_event
 
                 project_event(session, now=now)

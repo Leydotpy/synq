@@ -2,6 +2,7 @@
 
 from django.urls import path
 from apps.meetings.api.gateway_state import GatewaySnapshotView, GatewayStateStreamView
+from apps.meetings.api.gateway_application import GatewayApplicationView
 
 from apps.meetings.api.gateway import GatewayAuthorityView, GatewayCommandAuthorityView, GatewayCommandStatusView, GatewayTicketView, GatewayJoinIntentView, GatewayAdmissionDecisionView, GatewayOwnershipView
 
@@ -23,6 +24,9 @@ from apps.meetings.api.views import (
 app_name = "meetings-api"
 
 urlpatterns = [
+    path("sessions/<uuid:session_id>/gateway/chat/", GatewayApplicationView.as_view(), {"operation": "chat"}, name="gateway-chat"),
+    path("sessions/<uuid:session_id>/gateway/reactions/", GatewayApplicationView.as_view(), {"operation": "reactions"}, name="gateway-reactions"),
+    path("sessions/<uuid:session_id>/gateway/leave/", GatewayApplicationView.as_view(), {"operation": "leave"}, name="gateway-leave"),
     path("sessions/<uuid:session_id>/gateway/state/", GatewaySnapshotView.as_view(), name="gateway-state"),
     path("sessions/<uuid:session_id>/gateway/events/", GatewayStateStreamView.as_view(), name="gateway-state-stream"),
     path("internal/gateway/owners/", GatewayOwnershipView.as_view(), name="gateway-ownership"),

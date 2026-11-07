@@ -162,7 +162,10 @@ class GatewaySnapshotView(CurrentProfileMixin, APIView):
         try:
             if request.auth:
                 credentials(request)  # Also reject expired cached bearer credentials.
-            if set(request.query_params) - {"after", "version"}:
+            if set(request.query_params) - {"after", "version", "sdk"}:
+                raise ValueError
+            sdk = request.query_params.get("sdk", "0")
+            if sdk not in {"0", "1"}:
                 raise ValueError
             after = request.query_params.get("after", "")
             version = request.query_params.get("version")
@@ -175,8 +178,14 @@ class GatewaySnapshotView(CurrentProfileMixin, APIView):
                     raise ValueError
                 version = int(version)
             payload = snapshot(
-                session_id, self.get_profile().pk, after=after, version=version
+                session_id,
+                self.get_profile().pk,
+                after=after,
+                version=version,
+                sdk=sdk == "1",
             )
+            if len(json.dumps(payload, ensure_ascii=False).encode()) > MAX_FRAME_BYTES:
+                raise GatewayDenied("UNAVAILABLE", 503)
             return Response(payload, headers={"Cache-Control": "no-store"})
         except ValueError:
             raise exceptions.ValidationError("Invalid snapshot cursor.") from None

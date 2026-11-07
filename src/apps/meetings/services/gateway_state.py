@@ -90,18 +90,25 @@ def _audience(session, profile_id):
 
 
 def _materialize(session, now):
+    from apps.meetings.services.gateway_sdk import application_state, person_state
+
     route = GatewayCommandRoute.objects.filter(session=session).first()
-    moderators = set(
-        session.room.memberships.filter(
-            is_active=True, can_manage_waiting_room=True
-        ).values_list("profile_id", flat=True)
-    )
+    memberships = {
+        m.profile_id: m for m in session.room.memberships.filter(is_active=True)
+    }
+    moderators = {
+        key
+        for key, membership in memberships.items()
+        if membership.can_manage_waiting_room
+    }
     people, presence = {}, {}
     participants = Participant.objects.filter(session=session).select_related(
         "profile__user",
         "gateway_grant",
         "gateway_observation",
         "join_request",
+        "join_request__profile",
+        "join_request__reviewed_by_profile",
     )
     for p in participants:
         grant = getattr(p, "gateway_grant", None)
@@ -140,6 +147,7 @@ def _materialize(session, now):
                 for kind in permissions:
                     media[kind] = media[kind] and permissions[kind]
         state = {
+            "sdk": person_state(p, memberships.get(p.profile_id)),
             "participant_id": str(p.pk),
             "display_name": p.display_name[:255],
             "admission": p.status,
@@ -174,6 +182,7 @@ def _materialize(session, now):
                 **media,
             }
     return {
+        "application": application_state(session),
         "meeting": {
             "id": str(session.pk),
             "lifecycle": session.lifecycle_state,
@@ -268,7 +277,7 @@ def event_id(change):
     return f"{change.version}:{change.pk}"
 
 
-def _snapshot(projection, participant, moderator, *, after=""):
+def _snapshot(projection, participant, moderator, *, after="", sdk=False):
     visible = _visible(projection, participant, moderator)
     own = str(participant.pk)
     keys = sorted(key for key in visible if key != own and key > after)
@@ -276,7 +285,7 @@ def _snapshot(projection, participant, moderator, *, after=""):
     change = GatewayStateChange.objects.get(
         session_id=projection.session_id, version=projection.version
     )
-    return {
+    result = {
         "schema_version": 1,
         "meeting": projection.state["meeting"],
         "projection_version": projection.version,
@@ -287,16 +296,21 @@ def _snapshot(projection, participant, moderator, *, after=""):
         "participants": [_public(visible[key], moderator=moderator) for key in page],
         "next_after": page[-1] if len(keys) > PAGE_SIZE else None,
     }
+    if sdk:
+        from apps.meetings.services.gateway_sdk import sdk_snapshot
+
+        result["sdk"] = sdk_snapshot(projection, participant, moderator, visible, page)
+    return result
 
 
 @transaction.atomic
-def snapshot(session_id, profile_id, *, after="", version=None):
+def snapshot(session_id, profile_id, *, after="", version=None, sdk=False):
     session = _session(session_id)
     participant, moderator = _audience(session, profile_id)
     projection, _ = _project(session, timezone.now())
     if version is not None and version != projection.version:
         raise GatewayDenied("SNAPSHOT_CHANGED", 409)
-    return _snapshot(projection, participant, moderator, after=after)
+    return _snapshot(projection, participant, moderator, after=after, sdk=sdk)
 
 
 @transaction.atomic

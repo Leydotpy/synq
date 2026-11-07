@@ -27,6 +27,11 @@ projection is SG-11; no cutover, merge or deployment is authorized.
 projection, disposable Redis presence and authenticated SSE/snapshot endpoints.
 The legacy cohort remains unchanged. No frontend cutover, merge or deployment.
 
+2026-11-07 additive scope: SG-12 adds the narrow Django compatibility surface
+required by synq.js: opt-in SDK snapshots, HTTPS application commands and committed
+notification identities. It does not bind a Socket.IO connection or grant media
+presence. The flags remain disabled; no merge, deployment or cutover.
+
 ## Current decisions and stronger acceptance rules
 
 - The older migration instructions allowed whole-service sync bridges during compatibility work and required temporary management handles. Those phase-specific recommendations are superseded for this performance phase: use direct async orchestration and package-owned reusable management services, preserving the existing transactional fences.

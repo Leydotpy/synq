@@ -154,3 +154,38 @@ The last command needs the pinned gateway checkout's test helpers and actual Jan
 It proves lobby isolation, actual audio WebRTC-up, signed lifecycle publication,
 Django HTTP snapshots/SSE, reconnect replay and broker-stalled disconnect repair.
 Task reports record exact executed counts and immutable commit/CI evidence.
+
+## SG-12 SDK compatibility (2026-11-07)
+
+`GET gateway/state/?sdk=1` adds a `sdk` member with the existing browser SDK's
+room, session, real profile identities, coordinator permissions, participant
+permissions, waiting queue, ten recent messages and 25 unexpired reactions.
+Participants and requests remain scoped to the same paginated projection version.
+Waiting callers see their own request and no meeting content. The optional shape
+never reads legacy connection/media-handle ownership into the gateway cohort;
+`gateway_presence` stays separate from admission. Responses above 128 KiB fail
+closed. The original compact snapshot/SSE shape is unchanged.
+
+`POST gateway/chat/`, `gateway/reactions/` and `gateway/leave/` provide application
+operations without a Socket.IO binding. They require HTTPS, existing Django
+authentication/CSRF, current gateway cohort/admission and participant capability
+checks under the meeting lock. The strict 8 KiB parser rejects media/unknown fields.
+Leave increments the authorization epoch and queues the existing disconnect command.
+The existing participant PATCH/DELETE and end/share HTTPS endpoints remain in use.
+
+Snapshots include up to 64 permission-filtered committed domain identities for
+notifications. The client establishes an anchor during quiet hydration and emits
+only unseen canonical events following contiguous **live** SSE invalidations.
+Replay, missing anchors, permission transitions and repair stay quiet. Actual
+ordered gateway media-connected/disconnected observations can create presence
+event records; they never set Participant.status or joined_at. Reconciled gaps
+do not manufacture presence notifications. This is bounded delivery, not an
+unbounded message-history API.
+
+Local validation: Python 3.14.9, PostgreSQL 16.2 (UTF-8), Redis 7.0.15: 239 tests
+passed in 22.980s, zero skips. Existing real Janus lifecycle integration passed
+in 4.582s; real Janus/Broka/projection/SSE integration passed in 5.728s. Migration
+drift and targeted Ruff checks pass. `scripts/check_gateway_browser.py` adds real
+Chromium/React acceptance with isolated HTTPS/WSS, TURN, Janus, Redis and Django;
+its browser result is pending CI because local Chromium cannot create a Unix
+socket in this environment. SG-12 is still in progress until that gate passes.
