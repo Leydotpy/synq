@@ -66,6 +66,30 @@ def main():
     from live_ice_helpers import TurnServer
     from test_janus_live import JanusServer
     from aioice.ice import get_host_addresses
+    from jrtc_video.plugin import parse_videoroom_response
+    from pydantic import ValidationError
+
+    def observed_response(payload):
+        try:
+            return parse_videoroom_response(payload)
+        except Exception as error:
+            if isinstance(error.__cause__, ValidationError):
+                # Diagnose schema mismatches without logging responses, SDP,
+                # candidate addresses, credentials or validation input values.
+                print(
+                    json.dumps(
+                        {
+                            "janus_validation": [
+                                {"loc": item["loc"], "type": item["type"]}
+                                for item in error.__cause__.errors(
+                                    include_input=False, include_context=False
+                                )
+                            ]
+                        }
+                    ),
+                    flush=True,
+                )
+            raise
 
     @override_settings(
         GATEWAY_STATE_ENABLED=True,
@@ -73,6 +97,12 @@ def main():
     )
     class BrowserIntegration(OwnershipFixture, TransactionTestCase):
         def test_browser_admission_media_state_and_revocation(self):
+            observer = patch(
+                "jrtc_video.plugin.parse_videoroom_response",
+                side_effect=observed_response,
+            )
+            observer.start()
+            self.addCleanup(observer.stop)
             api_port, gateway_port = free_port(), free_port()
             api = f"https://127.0.0.1:{api_port}"
             gateway = f"wss://127.0.0.1:{gateway_port}/ws"
