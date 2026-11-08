@@ -65,6 +65,7 @@ def main():
     from jrtc_signalling.janus_runtime import JanusConfig, JanusRuntime
     from live_ice_helpers import TurnServer
     from test_janus_live import JanusServer
+    from aioice.ice import get_host_addresses
 
     @override_settings(
         GATEWAY_STATE_ENABLED=True,
@@ -93,7 +94,14 @@ def main():
                 janus_dir.mkdir()
                 turn_dir.mkdir()
                 janus = JanusServer(janus_dir)
-                turn = TurnServer(turn_dir, "127.0.0.1")
+                # Match SG-09's real TURN rehearsal: Janus uses host-interface
+                # candidates on CI, so relay allocations must share that
+                # interface. The TURN listener remains private on loopback.
+                try:
+                    addresses = get_host_addresses(use_ipv4=True, use_ipv6=False)
+                except PermissionError:
+                    addresses = []
+                turn = TurnServer(turn_dir, (addresses or ["127.0.0.1"])[0])
                 await janus.start()
                 await turn.start()
                 bus = BusConfig(
