@@ -89,7 +89,13 @@ def _snapshot(participant, intent=None, decision=None):
 
 
 def request_intent(
-    *, session_id, profile_id, display_name="", passcode=None, invite_token=None
+    *,
+    session_id,
+    profile_id,
+    display_name="",
+    note="",
+    passcode=None,
+    invite_token=None,
 ):
     """Validate identity/policy before creating a pending or direct admission."""
     try:
@@ -154,6 +160,7 @@ def request_intent(
                     session=session,
                     profile=profile,
                     requested_display_name=display_name,
+                    note=note,
                     requested_role=MeetingRole.PARTICIPANT,
                 )
             participant = existing or Participant(
@@ -218,6 +225,7 @@ def review_intent(
     decision_id,
     approve,
     expected_epoch,
+    reason="",
 ):
     """Idempotency key and epoch precondition bind each review to its original intent."""
     if (
@@ -258,6 +266,7 @@ def review_intent(
                 or previous.actor_profile_id != actor.pk
                 or previous.approve != approve
                 or previous.expected_epoch != expected_epoch
+                or intent.resolution_reason != reason
             ):
                 raise GatewayDenied("IDEMPOTENCY_CONFLICT", 409)
             return _snapshot(participant, intent, previous)
@@ -290,7 +299,7 @@ def review_intent(
             decision_status = MeetingJoinRequestStatus.REJECTED
         advance_epoch(participant)
         participant.save()
-        intent.mark_reviewed(reviewer=actor, status=decision_status)
+        intent.mark_reviewed(reviewer=actor, status=decision_status, reason=reason)
         intent.save(
             update_fields=[
                 "status",

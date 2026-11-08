@@ -17,6 +17,7 @@ from django.http import HttpRequest, StreamingHttpResponse
 from rest_framework import exceptions
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.renderers import JSONRenderer
 from rest_framework.views import APIView
 
 from core.api.api import CurrentProfileMixin
@@ -199,6 +200,13 @@ class GatewaySnapshotView(CurrentProfileMixin, APIView):
 
 class GatewayStateStreamView(CurrentProfileMixin, APIView):
     permission_classes = [IsAuthenticated]
+
+    def perform_content_negotiation(self, request, force=False):
+        # Successful responses own their SSE content type. Keep authentication
+        # and validation errors as JSON even when the browser requests SSE.
+        if request.headers.get("Accept") == "text/event-stream":
+            return JSONRenderer(), "application/json"
+        return super().perform_content_negotiation(request, force=force)
 
     def get(self, request, session_id):
         if request.query_params:

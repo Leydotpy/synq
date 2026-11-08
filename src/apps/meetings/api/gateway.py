@@ -151,6 +151,7 @@ class GatewayAuthorityView(GatewayAPIView):
 
 
 class JoinIntentRequest(StrictSerializer):
+    note = serializers.CharField(max_length=4000, allow_blank=True, required=False)
     display_name = serializers.CharField(
         max_length=255, allow_blank=True, required=False
     )
@@ -161,6 +162,7 @@ class JoinIntentRequest(StrictSerializer):
 
 
 class AdmissionDecisionRequest(StrictSerializer):
+    reason = serializers.CharField(max_length=1000, allow_blank=True, required=False)
     decision_id = serializers.UUIDField()
     approve = serializers.BooleanField()
     expected_epoch = serializers.IntegerField(min_value=0, max_value=2**53 - 1)

@@ -1,6 +1,7 @@
 """Gateway SDK state/HTTPS compatibility without Socket.IO presence mutations."""
 
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
+from uuid import uuid4
 
 from apps.meetings.models import (
     GatewayAuthorizationOutbox,
@@ -15,7 +16,69 @@ from apps.meetings.tests.test_gateway_state import StateFixture
 
 
 @override_settings(GATEWAY_STATE_ENABLED=True)
+class GatewaySDKStreamTests(StateFixture, TransactionTestCase):
+    def test_browser_sse_accept_header_streams_and_keeps_errors_json(self):
+        self.client.force_authenticate(None)
+        self.client.force_login(self.host.user)
+        response = self.client.get(self.stream_url, HTTP_ACCEPT="text/event-stream")
+        try:
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.streaming)
+            self.assertEqual(response["Content-Type"], "text/event-stream")
+        finally:
+            response.close()
+        self.client.logout()
+        response = self.client.get(self.stream_url, HTTP_ACCEPT="text/event-stream")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response["Content-Type"], "application/json")
+
+
+@override_settings(GATEWAY_STATE_ENABLED=True)
 class GatewaySDKTests(StateFixture, TestCase):
+    def test_admission_note_and_review_reason_survive_https_and_sdk_snapshot(self):
+        self.client.force_authenticate(user=self.guest.user)
+        response = self.post("join-intents", {"note": "Please admit my second device."})
+        self.assertEqual(response.status_code, 200)
+        request_id = response.data["join_request_id"]
+        waiting = self.sdk(self.guest)["sdk"]["own_join_request"]
+        self.assertEqual(waiting["note"], "Please admit my second device.")
+        self.client.force_authenticate(user=self.host.user)
+        payload = {
+            "decision_id": str(uuid4()),
+            "approve": True,
+            "expected_epoch": 0,
+            "reason": "Identity checked by host.",
+        }
+        operation = f"join-intents/{request_id}/decision"
+        self.assertEqual(self.post(operation, payload).status_code, 200)
+        self.assertEqual(self.post(operation, payload).status_code, 200)
+        self.assertEqual(
+            self.sdk(self.guest)["sdk"]["own_join_request"]["resolution_reason"],
+            payload["reason"],
+        )
+        self.assertEqual(
+            self.post(operation, {**payload, "reason": "Changed reason"}).status_code,
+            409,
+        )
+
+    def test_admission_text_fields_are_bounded(self):
+        self.assertEqual(
+            self.post("join-intents", {"note": "x" * 4001}).status_code, 400
+        )
+        self.intent()
+        self.assertEqual(
+            self.post(
+                f"join-intents/{self.intent_id}/decision",
+                {
+                    "decision_id": str(uuid4()),
+                    "approve": True,
+                    "expected_epoch": 0,
+                    "reason": "x" * 1001,
+                },
+            ).status_code,
+            400,
+        )
+
     def test_presence_notifications_require_actual_ordered_media_events(self):
         self.receive(self.event())
         self.assertFalse(self.sdk()["sdk"]["gateway_events"])
