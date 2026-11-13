@@ -565,7 +565,7 @@
         "implementation": "partial",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-state.md",
-        "notes": "SDK-compatible opt-in state, HTTPS application commands and canonical notification identities implemented. 239 PostgreSQL/Redis tests and both live Janus integrations pass locally. Chromium/React acceptance is pending CI; local browser launch is blocked by Unix socket restrictions. No rollout."
+        "notes": "2026-11-13: installed gateway 23f6513d12f4707ba93529ddd56460ce184634ce and jrtc-video eed430960cc88fa574370d62eae502093757a9f1. Python 3.14.10: 242 PostgreSQL/Redis tests (38.841s, zero skips), actual Janus lifecycle (4.865s) and projection/SSE (6.128s) passed. Full Chromium/React rerun pending; no rollout."
       }
     ]
   }

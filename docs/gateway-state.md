@@ -189,3 +189,14 @@ drift and targeted Ruff checks pass. `scripts/check_gateway_browser.py` adds rea
 Chromium/React acceptance with isolated HTTPS/WSS, TURN, Janus, Redis and Django;
 its browser result is pending CI because local Chromium cannot create a Unix
 socket in this environment. SG-12 is still in progress until that gate passes.
+
+SG-12 dependency correction (2026-11-13): the backend and its CI checkout now use
+gateway `23f6513d12f4707ba93529ddd56460ce184634ce` with jrtc-video
+`eed430960cc88fa574370d62eae502093757a9f1`. Real Chromium exposed subscription
+updates racing an in-flight authorization check and Janus inactive slots without
+a source ID. Gateway topology now waits for the pending authority result; the
+typed plugin allows missing feeds only for inactive media or data aggregates.
+Gateway Actions 43474949853 passed all six jobs, including six actual Janus/TURN
+tests and the Python 3.12/3.13/3.14 matrix. Synq's matched installed dependencies
+passed 242 PostgreSQL/Redis tests locally on Python 3.14.10 (38.841s, zero skips).
+The complete browser rerun remains the SG-12 acceptance gate.

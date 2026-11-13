@@ -99,7 +99,7 @@ def main():
         def test_browser_admission_media_state_and_revocation(self):
             observer = patch(
                 "jrtc_video.plugin.parse_videoroom_response",
-                side_effect=observed_response,
+                new=observed_response,
             )
             observer.start()
             self.addCleanup(observer.stop)

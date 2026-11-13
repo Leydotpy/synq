@@ -687,7 +687,7 @@ kafka = [
 [[package]]
 name = "jrtc-signalling"
 version = "0.1.0"
-source = { git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=16a3272ca4625b133f24dbbf0e8fdd1e036c8694#16a3272ca4625b133f24dbbf0e8fdd1e036c8694" }
+source = { git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=23f6513d12f4707ba93529ddd56460ce184634ce#23f6513d12f4707ba93529ddd56460ce184634ce" }
 dependencies = [
     { name = "httpx2" },
     { name = "jsonschema" },
@@ -707,7 +707,7 @@ bus = [
 [[package]]
 name = "jrtc-video"
 version = "3.0.3"
-source = { git = "https://github.com/Leydotpy/jrtc-plugins.git?subdirectory=jrtc-video&rev=87bbb9b79870724a91fc98f8711c55f5cb4519e2#87bbb9b79870724a91fc98f8711c55f5cb4519e2" }
+source = { git = "https://github.com/Leydotpy/jrtc-plugins.git?subdirectory=jrtc-video&rev=eed430960cc88fa574370d62eae502093757a9f1#eed430960cc88fa574370d62eae502093757a9f1" }
 dependencies = [
     { name = "jrtc" },
     { name = "logvista" },
@@ -1350,8 +1350,8 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.140.0" },
     { name = "gunicorn", specifier = ">=26.0.0" },
     { name = "jrtc", extras = ["kafka"], git = "https://github.com/Leydotpy/jrtc.git?rev=b0998af03c0702302855cc7c52c3dd53ac7a32af" },
-    { name = "jrtc-signalling", extras = ["bus"], git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=16a3272ca4625b133f24dbbf0e8fdd1e036c8694" },
-    { name = "jrtc-video", git = "https://github.com/Leydotpy/jrtc-plugins.git?subdirectory=jrtc-video&rev=87bbb9b79870724a91fc98f8711c55f5cb4519e2" },
+    { name = "jrtc-signalling", extras = ["bus"], git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=23f6513d12f4707ba93529ddd56460ce184634ce" },
+    { name = "jrtc-video", git = "https://github.com/Leydotpy/jrtc-plugins.git?subdirectory=jrtc-video&rev=eed430960cc88fa574370d62eae502093757a9f1" },
     { name = "logvista", specifier = ">=0.1,<1" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.4" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.1,<3" },
