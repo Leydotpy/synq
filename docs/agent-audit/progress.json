@@ -561,11 +561,18 @@
       },
       {
         "id": "SG-12",
-        "status": "in_progress",
-        "implementation": "partial",
+        "status": "ready_for_review",
+        "implementation": "present",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-state.md",
-        "notes": "2026-11-13: 242 database tests and both live integrations passed locally and in Actions 43475412969. Browser 43475533154 passed two-way TURN RTP/renewal/quiet repair but exposed a null source MID schema mismatch on departure. Now pinned to gateway a623d2feb128e39da8c86fdfc083f676b16e31cd (490 local service tests, zero skips); complete browser rerun pending. No rollout."
+        "notes": "2026-11-14: Actions 43563883857 passed 242 PostgreSQL/Redis tests and both real Janus integrations. Browser Actions 43563938796 passed all SG-12 React/HTTPS/WSS/TURN/SSE/rejoin/removal/end checks using the matched installed gateway/plugin pins. No cutover, merge or deployment.",
+        "implementation_commit": "d8f47f354e5a0f5939813ccd894ff29f115d3cdd",
+        "review_status": "pending_maintainer_review",
+        "verification_evidence": [
+          "docs/gateway-state.md",
+          "https://github.com/Leydotpy/synq/actions/runs/43563883857",
+          "https://github.com/Leydotpy/synq.js/actions/runs/43563938796"
+        ]
       }
     ]
   }

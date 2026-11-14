@@ -208,3 +208,19 @@ null source MID after publisher departure. Gateway dependency
 an actual Janus regression; its complete local service suite passed 490 tests
 with zero skips. The browser's remaining rejoin/removal/end stages are rerun
 against this dependency before SG-12 completion.
+
+SG-12 acceptance completed on 2026-11-14. Final backend commit
+`d8f47f354e5a0f5939813ccd894ff29f115d3cdd` passed
+[Actions 43563883857](https://github.com/Leydotpy/synq/actions/runs/43563883857):
+242 tests (25.861s, zero skips), actual Janus lifecycle (20.540s), actual
+Janus/Broka/projection/SSE (6.216s), targeted style and migration checks.
+[Browser Actions 43563938796](https://github.com/Leydotpy/synq.js/actions/runs/43563938796)
+passed the complete React SDK scenario with Chromium 143.0.7499.4: direct/lobby
+admission, four audio peers exchanging RTP over TURN, chat/reaction, renewal,
+one forced SSE drop and four resume cursors, silent repair, explicit rejoin,
+removal/reconnect denial and meeting end. Seven ticket requests were observed;
+the gateway cohort created no legacy ParticipantConnection/ParticipantMediaHandle.
+This is SG-12 client compatibility evidence. SG-13's complete server-side
+revocation guarantees and hostile-client cases remain separate, as do automated
+recovery, deployment authentication, broader browser/device coverage and rollout.
+Implementation is ready for maintainer review; no merge or deployment occurred.
