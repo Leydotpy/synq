@@ -200,3 +200,11 @@ Gateway Actions 43474949853 passed all six jobs, including six actual Janus/TURN
 tests and the Python 3.12/3.13/3.14 matrix. Synq's matched installed dependencies
 passed 242 PostgreSQL/Redis tests locally on Python 3.14.10 (38.841s, zero skips).
 The complete browser rerun remains the SG-12 acceptance gate.
+
+The subsequent browser run 43475533154 passed bidirectional TURN media, renewal
+and quiet state repair, then found that the gateway response schema rejected a
+null source MID after publisher departure. Gateway dependency
+`a623d2feb128e39da8c86fdfc083f676b16e31cd` permits this inactive layout and adds
+an actual Janus regression; its complete local service suite passed 490 tests
+with zero skips. The browser's remaining rejoin/removal/end stages are rerun
+against this dependency before SG-12 completion.
