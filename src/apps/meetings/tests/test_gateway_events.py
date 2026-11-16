@@ -79,7 +79,9 @@ class EventFixture(OwnershipFixture):
         return receive_event(producer, verified)
 
     def observed(self):
-        return GatewaySessionObservation.objects.get(participant=self.participant).envelope
+        return GatewaySessionObservation.objects.get(
+            participant=self.participant
+        ).envelope
 
 
 class GatewayEventTests(EventFixture, TestCase):
@@ -120,10 +122,11 @@ class GatewayEventTests(EventFixture, TestCase):
             participant_session_id=self.claims["participant_session_id"],
             generation=self.claims["generation"],
         )
-        fresh = self.event()
+        fresh = self.event(state="MEDIA_CONNECTED")
         self.assertEqual(self.receive(fresh), "recorded")
         self.assertEqual(self.receive(old), "stale")
         self.assertEqual(self.observed(), fresh)
+        self.assertEqual(self.observed()["snapshot"]["connection"], "MEDIA_CONNECTED")
         _, self.claims = self.issue()
         newest = self.event()
         self.assertEqual(self.receive(newest), "recorded")
@@ -216,7 +219,9 @@ class GatewayEventTests(EventFixture, TestCase):
 
     def test_ack_failure_replays_committed_receipt_and_poison_has_hash_only_dlq(self):
         worker = GatewayEventWorker(self.bus)
-        acknowledgement = SimpleNamespace(ack=AsyncMock(side_effect=RuntimeError("ack lost")))
+        acknowledgement = SimpleNamespace(
+            ack=AsyncMock(side_effect=RuntimeError("ack lost"))
+        )
         event = self.event()
         delivery = SimpleNamespace(
             payload=self.owner.sign(event, "lifecycle-event"),

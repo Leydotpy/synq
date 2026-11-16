@@ -43,7 +43,8 @@ def main():
     django.setup()
     import httpx2 as httpx
     import uvicorn
-    from asgiref.sync import async_to_sync
+    from asgiref.sync import sync_to_async
+    from django.db import connections
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.x509.oid import NameOID
@@ -190,6 +191,30 @@ def main():
 
                 async def application(scope, receive, send):
                     path = scope.get("path", "")
+                    # Fault injection exists only in this ephemeral test server.
+                    if path == "/test/restart-janus" and scope.get("method") == "POST":
+                        counters["janus_restart"] += 1
+                        old = runtime.session(str(self.session.pk))
+                        await janus.stop()
+                        async with asyncio.timeout(10):
+                            while old.ready:
+                                await asyncio.sleep(0.02)
+                        await janus.start()
+                        async with asyncio.timeout(15):
+                            while (
+                                not runtime.manager.ready
+                                or runtime.session(str(self.session.pk)) is old
+                            ):
+                                await asyncio.sleep(0.02)
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": 204,
+                                "headers": [],
+                            }
+                        )
+                        await send({"type": "http.response.body", "body": b""})
+                        return
                     if path in {"/", "/sdk.js"}:
                         body = (
                             js
@@ -351,7 +376,7 @@ def main():
                     )
                     try:
                         output, error = await asyncio.wait_for(
-                            process.communicate(), 100
+                            process.communicate(), 180
                         )
                     except BaseException:
                         process.kill()
@@ -364,6 +389,7 @@ def main():
                     self.assertGreaterEqual(counters["tickets"], 5)
                     self.assertEqual(counters["sse_forced_drop"], 1)
                     self.assertGreaterEqual(counters["sse_cursors"], 3)
+                    self.assertEqual(counters["janus_restart"], 1)
                     print(
                         "HTTPS ticket refresh, SSE drop/resume and broker delivery:",
                         dict(counters),
@@ -382,6 +408,7 @@ def main():
                     await asyncio.gather(*worker_tasks, return_exceptions=True)
                     await turn.close()
                     await janus.stop()
+                    await sync_to_async(connections.close_all, thread_sensitive=True)()
 
             with (
                 tempfile.TemporaryDirectory() as directory,
@@ -390,10 +417,12 @@ def main():
                     return_value=self.bus,
                 ),
                 override_settings(
-                    GATEWAY_TICKET_TTL_SECONDS=24, CSRF_TRUSTED_ORIGINS=[api]
+                    GATEWAY_TICKET_TTL_SECONDS=24,
+                    CSRF_TRUSTED_ORIGINS=[api],
+                    SOCKET_IO_REDIS_URL=os.environ["GATEWAY_TEST_REDIS_URL"],
                 ),
             ):
-                async_to_sync(exercise)(Path(directory))
+                asyncio.run(exercise(Path(directory)))
             self.assertFalse(
                 ParticipantConnection.objects.filter(session=self.session).exists()
             )

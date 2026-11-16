@@ -269,6 +269,32 @@ class GatewayTicketTests(GatewayTicketFixture, TestCase):
                 generation=result["generation"],
             )
 
+    def test_expired_ticket_resumes_approved_guest_without_another_review(self):
+        intent = self.waiting()
+        participant = Lifecycle.review_join_request(
+            join_request=intent, reviewer_profile=self.host, approve=True
+        )
+        original, old = self.issue(self.guest)
+        GatewayTicket.objects.filter(pk=old["jti"]).update(
+            expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        with self.assertRaises(GatewayDenied):
+            check_ticket(claims=old, operation="session.hello", consume=True)
+        resumed, claims = self.issue(
+            self.guest,
+            purpose="resume",
+            participant_session_id=original["participant_session_id"],
+            generation=original["generation"],
+        )
+        self.assertEqual(resumed["generation"], original["generation"] + 1)
+        self.assertEqual(
+            resumed["authorization_epoch"], original["authorization_epoch"]
+        )
+        check_ticket(claims=claims, operation="session.resume", consume=True)
+        participant.refresh_from_db()
+        self.assertEqual(participant.status, ParticipantStatus.ADMITTED)
+        self.assertEqual(participant.join_request_id, intent.pk)
+
     def test_rate_limit_survives_new_binding_and_rolls_forward(self):
         for _ in range(10):
             self.issue()

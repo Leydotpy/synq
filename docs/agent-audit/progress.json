@@ -573,6 +573,16 @@
           "https://github.com/Leydotpy/synq/actions/runs/43563883857",
           "https://github.com/Leydotpy/synq.js/actions/runs/43563938796"
         ]
+      },
+      {
+        "id": "SG-14",
+        "status": "in_progress",
+        "baseline_commit": "65ffc88d487f298be0368950aa8ca4de36fd2bba",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-recovery.md",
+        "notes": "PostgreSQL resume races and existing approval preservation; installed gateway pin and browser fault fixture.",
+        "review_status": "pending_maintainer_review"
       }
     ]
   }

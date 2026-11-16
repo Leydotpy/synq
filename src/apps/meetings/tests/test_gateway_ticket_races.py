@@ -7,7 +7,7 @@ from unittest.mock import patch
 from django.db import close_old_connections, connections
 from django.test import TransactionTestCase, skipUnlessDBFeature
 
-from apps.meetings.models import GatewayTicket
+from apps.meetings.models import GatewayGrant, GatewayTicket
 from apps.meetings.services.gateway_tickets import GatewayDenied, check_ticket
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.tests.test_gateway_tickets import GatewayTicketFixture
@@ -71,3 +71,55 @@ class GatewayTicketRaceTests(GatewayTicketFixture, TransactionTestCase):
         self.assertTrue("denied" in results or "accepted_before_revoke" in results)
         with self.assertRaises(GatewayDenied):
             check_ticket(claims=claims, operation="media.publish", consume=False)
+
+    def test_two_tabs_cannot_both_advance_the_same_resume_generation(self):
+        original, _ = self.issue()
+
+        def resume():
+            self.issue(
+                purpose="resume",
+                participant_session_id=original["participant_session_id"],
+                generation=original["generation"],
+            )
+            return "accepted"
+
+        self.assertCountEqual(self.race(resume, resume), ["accepted", "denied"])
+        self.assertEqual(
+            GatewayGrant.objects.get().generation, original["generation"] + 1
+        )
+
+    def test_revocation_racing_resume_cannot_leave_a_usable_grant(self):
+        original, _ = self.issue()
+
+        def resume():
+            _, claims = self.issue(
+                purpose="resume",
+                participant_session_id=original["participant_session_id"],
+                generation=original["generation"],
+            )
+            return claims
+
+        def revoke():
+            MeetingLifecycleService.update_participant_permissions(
+                session=self.session,
+                actor_profile=self.host,
+                participant=self.participant,
+                updates={"can_publish_audio": False},
+            )
+            return "revoked"
+
+        for result in self.race(resume, revoke):
+            if isinstance(result, dict):
+                self.assertGreaterEqual(
+                    result["authorization_epoch"], original["authorization_epoch"]
+                )
+                if result["authorization_epoch"] == original["authorization_epoch"]:
+                    with self.assertRaises(GatewayDenied):
+                        check_ticket(
+                            claims=result, operation="session.resume", consume=True
+                        )
+                else:
+                    grant = check_ticket(
+                        claims=result, operation="session.resume", consume=True
+                    )
+                    self.assertFalse(grant["permissions"]["audio"])
