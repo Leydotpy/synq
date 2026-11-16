@@ -216,10 +216,15 @@ def main():
                         await send({"type": "http.response.body", "body": b""})
                         return
                     if path in {"/", "/sdk.js"}:
+                        # Scope the ESM bundle: helpers such as "closed" must not
+                        # collide with native Window properties in a classic script.
                         body = (
                             js
                             if path == "/sdk.js"
-                            else b'<!doctype html><html><body><div id="root"></div><script src="/sdk.js"></script></body></html>'
+                            else (
+                                b'<!doctype html><html><body><div id="root"></div>'
+                                b'<script type="module" src="/sdk.js"></script></body></html>'
+                            )
                         )
                         await send(
                             {
