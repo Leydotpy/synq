@@ -500,7 +500,7 @@
     ]
   },
   "gateway_followup": {
-    "date": "2026-11-06",
+    "date": "2026-11-17",
     "baseline_commit": "602eb4237c2e83cfd5b75d362c6a5cd643c70c53",
     "branch": "codex/gateway-control-plane",
     "tasks": [
@@ -576,13 +576,20 @@
       },
       {
         "id": "SG-14",
-        "status": "in_progress",
+        "status": "ready_for_review",
         "baseline_commit": "65ffc88d487f298be0368950aa8ca4de36fd2bba",
         "implementation": "present",
         "verification": "runtime_subset_passed",
         "evidence": "docs/gateway-recovery.md",
-        "notes": "PostgreSQL resume races and existing approval preservation; installed gateway pin and browser fault fixture.",
-        "review_status": "pending_maintainer_review"
+        "notes": "245 PostgreSQL/Redis tests, both actual Janus integrations, style and migration drift passed in Actions 43985742300. Complete Chromium/React/TURN recovery and terminal-command acknowledgement passed in frontend Actions 44133663381 using matched pins. Approval and current authority are preserved; stale generations cannot overwrite current presence. No merge or deployment.",
+        "review_status": "pending_maintainer_review",
+        "implementation_commit": "68b0db204b1e25915a45210f2394dd73aaf7239a",
+        "last_updated": "2026-11-17",
+        "verification_evidence": [
+          "docs/gateway-recovery.md",
+          "https://github.com/Leydotpy/synq/actions/runs/43985742300",
+          "https://github.com/Leydotpy/synq.js/actions/runs/44133663381"
+        ]
       }
     ]
   }
