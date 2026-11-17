@@ -189,6 +189,29 @@ def main():
                 ]
                 worker_tasks = [asyncio.create_task(worker.run()) for worker in workers]
 
+                def recovery_diagnostics():
+                    return {
+                        "active": runtime.active,
+                        "stopping": runtime.stopping.is_set(),
+                        "janus_ready": runtime.manager.ready,
+                        "maintenance_done": runtime.task.done(),
+                        "reconciler_done": runtime.reconciler.done(),
+                        "bindings": len(runtime.registry.bindings),
+                        "uncertain": len(runtime.registry.uncertain),
+                        "unresolved_meetings": len(runtime.registry.unresolved_meetings),
+                        "cleanup_failed": runtime.registry.cleanup_failed,
+                        "lifecycle_failed": runtime.lifecycle.failed,
+                        "lifecycle_done": runtime.lifecycle.task.done(),
+                    }
+
+                async def gateway_application(scope, receive, send):
+                    async def observed_send(message):
+                        if message["type"] == "websocket.close":
+                            counters[f"gateway_close_{message.get('code', 1000)}"] += 1
+                        await send(message)
+
+                    await gateway_app(scope, receive, observed_send)
+
                 async def application(scope, receive, send):
                     path = scope.get("path", "")
                     # Fault injection exists only in this ephemeral test server.
@@ -206,6 +229,10 @@ def main():
                                 or runtime.session(str(self.session.pk)) is old
                             ):
                                 await asyncio.sleep(0.02)
+                        print(
+                            json.dumps({"janus_restarted": recovery_diagnostics()}),
+                            flush=True,
+                        )
                         await send(
                             {
                                 "type": "http.response.start",
@@ -334,7 +361,7 @@ def main():
                     )
                     for app, port, lifespan in (
                         (application, api_port, "off"),
-                        (gateway_app, gateway_port, "on"),
+                        (gateway_application, gateway_port, "on"),
                     )
                 ]
                 server_tasks = [
@@ -389,6 +416,15 @@ def main():
                         raise
                     print(output.decode(), flush=True)
                     if process.returncode:
+                        print(
+                            json.dumps(
+                                {
+                                    "gateway_recovery": recovery_diagnostics(),
+                                    "fixture_counters": dict(counters),
+                                }
+                            ),
+                            flush=True,
+                        )
                         print(error.decode()[-6000:], flush=True)
                     self.assertEqual(process.returncode, 0, "Browser acceptance failed")
                     self.assertGreaterEqual(counters["tickets"], 5)
