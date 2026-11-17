@@ -198,7 +198,9 @@ def main():
                         "reconciler_done": runtime.reconciler.done(),
                         "bindings": len(runtime.registry.bindings),
                         "uncertain": len(runtime.registry.uncertain),
-                        "unresolved_meetings": len(runtime.registry.unresolved_meetings),
+                        "unresolved_meetings": len(
+                            runtime.registry.unresolved_meetings
+                        ),
                         "cleanup_failed": runtime.registry.cleanup_failed,
                         "lifecycle_failed": runtime.lifecycle.failed,
                         "lifecycle_done": runtime.lifecycle.task.done(),
@@ -207,7 +209,8 @@ def main():
                 async def gateway_application(scope, receive, send):
                     async def observed_send(message):
                         if message["type"] == "websocket.close":
-                            counters[f"gateway_close_{message.get('code', 1000)}"] += 1
+                            code = message.get("code", 1000)
+                            counters[f"gateway_close_{code}"] += 1
                         await send(message)
 
                     await gateway_app(scope, receive, observed_send)
