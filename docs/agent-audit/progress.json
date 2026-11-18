@@ -500,7 +500,7 @@
     ]
   },
   "gateway_followup": {
-    "date": "2026-11-17",
+    "date": "2026-11-19",
     "baseline_commit": "602eb4237c2e83cfd5b75d362c6a5cd643c70c53",
     "branch": "codex/gateway-control-plane",
     "tasks": [
@@ -589,6 +589,24 @@
           "docs/gateway-recovery.md",
           "https://github.com/Leydotpy/synq/actions/runs/43985742300",
           "https://github.com/Leydotpy/synq.js/actions/runs/44133663381"
+        ]
+      },
+      {
+        "id": "SG-15",
+        "status": "ready_for_review",
+        "baseline_commit": "ef790c3f26ab875e4909e74e967214bbf26bd1eb",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-control-plane.md",
+        "notes": "Two real gateway processes published WebRTC audio across four owner generations. PostgreSQL elections, stale outcomes, process-targeted dispatch, Janus cleanup, Redis outage recovery and fresh-session rollback passed. Multiworker ownership defaults off.",
+        "review_status": "pending_maintainer_review",
+        "implementation_commit": "e0b0481ce05a2b1b18d43ef6f6fad235042009be",
+        "last_updated": "2026-11-19",
+        "verification_evidence": [
+          "scripts/check_gateway_multiworker.py",
+          "src/apps/meetings/tests/test_gateway_ownership.py",
+          "https://github.com/Leydotpy/synq/actions/runs/44364899582",
+          "https://github.com/Leydotpy/jrtc-signalling/actions/runs/44364848787"
         ]
       }
     ]
