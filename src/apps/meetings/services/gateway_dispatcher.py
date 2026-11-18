@@ -7,6 +7,8 @@ from contextlib import suppress
 from asgiref.sync import sync_to_async
 from django.db.models import Q
 from django.utils import timezone
+from jrtc_signalling.bus import EVENTS, BusError, digest
+from jrtc_signalling.bus_transport import Streams
 
 from apps.meetings.models import GatewayAuthorizationOutbox
 from apps.meetings.services.gateway_commands import (
@@ -16,8 +18,6 @@ from apps.meetings.services.gateway_commands import (
     quarantine,
     receive_outcome,
 )
-from jrtc_signalling.bus import EVENTS, BusError, command_route, digest
-from jrtc_signalling.bus_transport import Streams
 
 
 def candidates():
@@ -49,13 +49,13 @@ class GatewayCommandWorker:
             try:
                 packet = self.config.signer.sign(claim["envelope"], "command")
                 await self.transport.publish(
-                    command_route(claim["envelope"]["target_owner"]),
+                    claim["route"],
                     packet,
                     str(claim["command_id"]),
                 )
                 success = True
                 self.counters["published"] += 1
-            except Exception:
+            except Exception:  # noqa: BLE001 - adapter failures leave the durable intent retryable
                 self.counters["publish_failed"] += 1
             await sync_to_async(publication_finished)(claim, success=success)
 
@@ -76,7 +76,7 @@ class GatewayCommandWorker:
                 await delivery.acknowledgement.ack()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - leave the delivery pending on storage or transport failure
             self.counters["pending_failure"] += 1
 
     async def run(self, *, once=False):
@@ -96,7 +96,7 @@ class GatewayCommandWorker:
                         await asyncio.wait_for(self.stop.wait(), 1)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - restart the transport for adapter-specific failures
                 self.counters["transport_failure"] += 1
                 reconnects += 1
                 if once:

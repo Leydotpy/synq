@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -38,6 +39,7 @@ def main():
 
     django.setup()
     import uvicorn
+    from apps.meetings.services.lifecycle import MeetingLifecycleService
     from asgiref.sync import sync_to_async
     from cryptography.hazmat.primitives import serialization
     from django.conf import settings
@@ -46,7 +48,7 @@ def main():
     from django.test import TransactionTestCase, override_settings
     from django.test.runner import DiscoverRunner
     from django.utils import timezone
-    from jrtc_signalling.bus import command_route
+    from jrtc_signalling.bus import EVENTS, command_route
     from jrtc_signalling.bus_transport import Streams
     from jrtc_signalling.command_store import outcome
     from media_helpers import Browser
@@ -65,6 +67,7 @@ def main():
         prepare_delivery,
         receive_outcome,
     )
+    from apps.meetings.services.gateway_dispatcher import GatewayCommandWorker
     from apps.meetings.services.gateway_event_worker import GatewayEventWorker
     from apps.meetings.services.gateway_events import receive_event
     from apps.meetings.tests.test_gateway_ownership import OwnershipFixture
@@ -214,8 +217,9 @@ def main():
                     log_level="error",
                 )
             )
-            projection = GatewayEventWorker(self.bus)
-            projection.transport = Streams(redis_url, "django-lifecycle-v1")
+            control_bus = replace(self.bus, redis_url=redis_url)
+            projection = GatewayEventWorker(control_bus)
+            commands = GatewayCommandWorker(control_bus)
             tasks = []
             redis = Redis.from_url(redis_url, decode_responses=True)
             streams = Streams(redis_url, "sg15-verification")
@@ -351,6 +355,8 @@ def main():
                         while not authority_server.started:
                             await asyncio.sleep(0.02)
                     await streams.start()
+                    await commands.transport.start()
+                    await commands.transport.subscribe(EVENTS, commands.handle)
                     await asyncio.gather(*(launch(owner) for owner in owners))
                     one = await route(1)
                     owner = one.owner_id
@@ -400,7 +406,9 @@ def main():
                     # Replay the original signed command on the wire and submit its delayed signed ACK.
                     old_packet = self.bus.signer.sign(command, "command")
                     await streams.publish(
-                        command_route(owner), old_packet, command["command_id"]
+                        command_route(owner, str(one.owner_incarnation)),
+                        old_packet,
+                        command["command_id"],
                     )
                     self.assertFalse(await sync_to_async(authorize_command)(command))
                     event = outcome(
@@ -457,6 +465,40 @@ def main():
                         3,
                     )
                     await asyncio.wait_for(second.wait_closed(), 12)
+                    # Drive a fresh intent through the regular Django dispatcher to this incarnation.
+                    await sync_to_async(MeetingLifecycleService.remove_participant)(
+                        session=self.session,
+                        actor_profile=self.host,
+                        participant=self.guest_participant,
+                    )
+                    await commands.sweep()
+                    async with asyncio.timeout(12):
+                        while True:
+                            row = (
+                                await GatewayAuthorizationOutbox.objects.select_related(
+                                    "command"
+                                ).aget(
+                                    session=self.session,
+                                    action="participant.disconnect",
+                                )
+                            )
+                            if row.status == "applied":
+                                break
+                            await asyncio.sleep(0.1)
+                    delivered = row.command.envelope
+                    self.assertEqual(delivered["expected_owner_generation"], 3)
+                    signed = self.bus.signer.sign(delivered, "command")
+                    await streams.publish(
+                        command_route(owner, str(three.owner_incarnation)),
+                        signed,
+                        delivered["command_id"],
+                    )
+                    self.assertEqual(
+                        await GatewayAuthorizationOutbox.objects.filter(
+                            pk=row.pk, status="applied"
+                        ).acount(),
+                        1,
+                    )
                     # Outlast the owner's renewal interval with an actual broker outage.
                     await redis.execute_command("CLIENT", "PAUSE", 8500, "ALL")
                     await asyncio.wait_for(third.wait_closed(), 18)
@@ -481,6 +523,7 @@ def main():
                     authority_server.should_exit = True
                     projection.stop.set()
                     await asyncio.gather(*tasks, return_exceptions=True)
+                    await commands.transport.close()
                     await streams.close()
                     await redis.aclose()
                     await janus.stop()

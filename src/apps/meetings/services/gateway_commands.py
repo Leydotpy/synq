@@ -219,6 +219,10 @@ def prepare_delivery(outbox_id, *, now=None):
             "lease_id": row.lease_id,
             "command_id": command.pk,
             "envelope": command.envelope,
+            "route": command_route(
+                route.owner_id,
+                str(route.owner_incarnation) if route.janus_pool else None,
+            ),
         }
 
 
