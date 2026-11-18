@@ -39,6 +39,12 @@ def main():
 
     django.setup()
     import uvicorn
+    from aiortc import (
+        AudioStreamTrack,
+        RTCConfiguration,
+        RTCPeerConnection,
+        RTCSessionDescription,
+    )
     from apps.meetings.services.lifecycle import MeetingLifecycleService
     from asgiref.sync import sync_to_async
     from cryptography.hazmat.primitives import serialization
@@ -51,7 +57,7 @@ def main():
     from jrtc_signalling.bus import EVENTS, command_route
     from jrtc_signalling.bus_transport import Streams
     from jrtc_signalling.command_store import outcome
-    from media_helpers import Browser
+    from media_helpers import Browser, publish_payload
     from redis.asyncio import Redis
     from test_janus_live import JanusServer
     from websockets.asyncio.client import connect
@@ -205,6 +211,7 @@ def main():
             env.pop("DJANGO_SETTINGS_MODULE", None)
             workers = {}
             sockets = []
+            peers = []
             authority_server = uvicorn.Server(
                 uvicorn.Config(
                     ASGIHandler(),
@@ -312,8 +319,18 @@ def main():
                 reply = await request(
                     ws, wire, "session.resume" if prev else "session.hello", payload
                 )
-                joined = await request(ws, wire, "media.publisher.join")
-                return ws, claims, reply, joined
+                await request(ws, wire, "media.publisher.join")
+                peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                peers.append(peer)
+                peer.addTransceiver(AudioStreamTrack(), direction="sendonly")
+                await peer.setLocalDescription(await peer.createOffer())
+                payload = publish_payload()
+                payload["offer"]["sdp"] = peer.localDescription.sdp
+                published = await request(ws, wire, "media.publisher.publish", payload)
+                await peer.setRemoteDescription(
+                    RTCSessionDescription(**published["jsep"])
+                )
+                return ws, claims, reply, peer
 
             async def observed(generation):
                 async with asyncio.timeout(12):
@@ -321,7 +338,12 @@ def main():
                         row = await GatewaySessionObservation.objects.filter(
                             participant=self.participant
                         ).afirst()
-                        if row and row.envelope["gateway_generation"] == generation:
+                        if (
+                            row
+                            and row.envelope["gateway_generation"] == generation
+                            and row.envelope["snapshot"]["connection"]
+                            == "MEDIA_CONNECTED"
+                        ):
                             return row.envelope
                         await asyncio.sleep(0.1)
 
@@ -525,6 +547,7 @@ def main():
                     await asyncio.gather(*tasks, return_exceptions=True)
                     await commands.transport.close()
                     await streams.close()
+                    await asyncio.gather(*(peer.close() for peer in peers))
                     await redis.aclose()
                     await janus.stop()
                     await sync_to_async(connections.close_all)()

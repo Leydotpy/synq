@@ -43,4 +43,4 @@ override-dependencies = ["django>=6.0.7,<6.1"]
 jrtc = { git = "https://github.com/Leydotpy/jrtc.git", rev = "b0998af03c0702302855cc7c52c3dd53ac7a32af" }
 jrtc-video = { git = "https://github.com/Leydotpy/jrtc-plugins.git", rev = "eed430960cc88fa574370d62eae502093757a9f1", subdirectory = "jrtc-video" }
 
-jrtc-signalling = { git = "https://github.com/Leydotpy/jrtc-signalling.git", rev = "381eeeaaa1d2d964d783d3f8df98454be094880d" }
+jrtc-signalling = { git = "https://github.com/Leydotpy/jrtc-signalling.git", rev = "b4acf6002ddb4f7991c4c7b4ad241da7d90f7423" }

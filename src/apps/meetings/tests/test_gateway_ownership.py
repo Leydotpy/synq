@@ -373,6 +373,27 @@ class MultiworkerOwnershipTests(OwnershipFixture, TestCase):
         with self.assertRaises(GatewayDenied):
             self.request("elect", 2, pool=self.pool, session_id=345, incarnation=first)
 
+    def test_rollback_uses_a_fresh_legacy_session_after_release(self):
+        self.request("elect", pool=self.pool, session_id=501)
+        self.request("release", 1)
+        Lifecycle.end_session(session=self.session, actor_profile=self.host)
+        with override_settings(
+            GATEWAY_MULTIWORKER_ENABLED=False, GATEWAY_RUNTIME_ENABLED=False
+        ):
+            replacement = Lifecycle.start_session(
+                room=self.room, started_by_profile=self.host
+            )
+        self.session.refresh_from_db()
+        self.assertNotEqual(replacement.pk, self.session.pk)
+        self.assertEqual(
+            (self.session.signalling_backend, replacement.signalling_backend),
+            ("gateway", "legacy"),
+        )
+        self.assertTrue(GatewayCommandRoute.objects.get(session=self.session).released)
+        self.assertFalse(
+            GatewayCommandRoute.objects.filter(session=replacement).exists()
+        )
+
     def test_legacy_crash_needs_legacy_cleanup_and_rollout_requires_flag(self):
         self.request()
         old = self.incarnation

@@ -687,7 +687,7 @@ kafka = [
 [[package]]
 name = "jrtc-signalling"
 version = "0.1.0"
-source = { git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=381eeeaaa1d2d964d783d3f8df98454be094880d#381eeeaaa1d2d964d783d3f8df98454be094880d" }
+source = { git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=b4acf6002ddb4f7991c4c7b4ad241da7d90f7423#b4acf6002ddb4f7991c4c7b4ad241da7d90f7423" }
 dependencies = [
     { name = "httpx2" },
     { name = "jsonschema" },
@@ -1350,7 +1350,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.140.0" },
     { name = "gunicorn", specifier = ">=26.0.0" },
     { name = "jrtc", extras = ["kafka"], git = "https://github.com/Leydotpy/jrtc.git?rev=b0998af03c0702302855cc7c52c3dd53ac7a32af" },
-    { name = "jrtc-signalling", extras = ["bus"], git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=381eeeaaa1d2d964d783d3f8df98454be094880d" },
+    { name = "jrtc-signalling", extras = ["bus"], git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=b4acf6002ddb4f7991c4c7b4ad241da7d90f7423" },
     { name = "jrtc-video", git = "https://github.com/Leydotpy/jrtc-plugins.git?subdirectory=jrtc-video&rev=eed430960cc88fa574370d62eae502093757a9f1" },
     { name = "logvista", specifier = ">=0.1,<1" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.4" },

@@ -431,3 +431,12 @@ integration and the new live Janus/Broka/projection/SSE integration. Targeted Ru
 and migration drift checks passed. The corresponding local run passed 228 tests
 and both live integrations against PostgreSQL 16.2, Redis 7.0.15 and Janus 1.1.2.
 The audit state is `ready_for_review`; only the maintainer accepts the task.
+
+
+## SG-15 worker ownership
+
+Set `GATEWAY_MULTIWORKER_ENABLED` to enable the signed inspect/elect protocol for gateway-assigned meetings. Migration `0020_gateway_route_recovery` adds the Janus pool fingerprint and dedicated session ID to the existing command route. The meeting lock serializes generations. A contender must present the expected previous generation after physical cleanup. Django rejects a live grant, a changed pool and a retired process incarnation. A release retains the last resource identity for recovery.
+
+The dispatcher selects a Redis stream scoped to the current process incarnation for pooled meetings. An old outcome or a replayed command cannot mark enforcement applied on a successor. Admission, grant generation, owner generation and observed presence keep their distinct meanings. An absolute TLS address is configured at each gateway. Django receives control metadata only.
+
+The opt-in two-process exercise runs in `scripts/check_gateway_multiworker.py`. It uses the pinned gateway, TLS Django, Redis, PostgreSQL and a local Janus instance. For rollback, drain the active gateway processes, verify prior resources have closed, disable the pool flag and create a new session for the selected backend. Existing assignments remain immutable.
