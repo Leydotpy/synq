@@ -346,6 +346,16 @@ class MultiworkerOwnershipTests(OwnershipFixture, TestCase):
     def test_recovery_is_bound_to_pool_exact_session_and_previous_generation(self):
         self.assertEqual(self.request("inspect", pool=self.pool)["generation"], 0)
         self.request("elect", pool=self.pool, session_id=345)
+        expiry = GatewayCommandRoute.objects.get(session=self.session).lease_expires_at
+        self.assertEqual(
+            self.request("elect", pool=self.pool, session_id=345)["generation"], 1
+        )
+        self.assertEqual(
+            GatewayCommandRoute.objects.get(session=self.session).lease_expires_at,
+            expiry,
+        )
+        with self.assertRaises(GatewayDenied):
+            self.request("elect", pool=self.pool, session_id=999)
         first = self.incarnation
         self.incarnation = str(uuid.uuid4())
         with self.assertRaises(GatewayDenied):

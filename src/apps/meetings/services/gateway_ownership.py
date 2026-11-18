@@ -46,6 +46,17 @@ def require_legacy_key(session_id):
         raise JanusGatewayError("This meeting is owned by the signalling gateway.")
 
 
+def _lease_result(request, route, now):
+    return {
+        "request_id": request["request_id"],
+        "meeting_id": request["meeting_id"],
+        "owner_id": route.owner_id,
+        "incarnation": str(route.owner_incarnation),
+        "generation": route.owner_generation,
+        "lease_seconds": max(0, (route.lease_expires_at - now).total_seconds()),
+    }
+
+
 def ownership_request(packet, *, config=None, now=None):
     try:
         config = config or BusConfig.read(
@@ -93,6 +104,17 @@ def ownership_request(packet, *, config=None, now=None):
         if action in {"inspect", "elect"}:
             if not getattr(settings, "GATEWAY_MULTIWORKER_ENABLED", False):
                 raise GatewayDenied("UNAVAILABLE", 503)
+            if (
+                action == "elect"
+                and matches
+                and not route.released
+                and route.lease_expires_at > now
+                and route.janus_pool == request["pool"]
+                and route.janus_session_id == request["session_id"]
+                and route.owner_generation == request["generation"] + 1
+            ):
+                # A lost reply can be retried without extending the committed lease.
+                return _lease_result(request, route, now)
             previous = route.owner_generation if route else 0
             if route and (
                 (route.janus_pool and route.janus_pool != request["pool"])
@@ -195,11 +217,4 @@ def ownership_request(packet, *, config=None, now=None):
                 route.released = True
                 route.lease_expires_at = now
             route.save(update_fields=["released", "lease_expires_at", "updated_at"])
-        return {
-            "request_id": request["request_id"],
-            "meeting_id": str(session.pk),
-            "owner_id": route.owner_id,
-            "incarnation": str(route.owner_incarnation),
-            "generation": route.owner_generation,
-            "lease_seconds": max(0, (route.lease_expires_at - now).total_seconds()),
-        }
+        return _lease_result(request, route, now)
