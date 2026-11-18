@@ -4,13 +4,13 @@ import time
 import uuid
 from datetime import timedelta
 
+from apps.meetings.exceptions import JanusGatewayError
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from jrtc_signalling.bus import BusConfig, BusError
 from jrtc_signalling.ownership import LEASE_SECONDS
 
-from apps.meetings.exceptions import JanusGatewayError
 from apps.meetings.models import (
     GatewayCommandRoute,
     GatewayOwnerGeneration,
@@ -63,7 +63,6 @@ def ownership_request(packet, *, config=None, now=None):
         settings, "GATEWAY_RUNTIME_ENABLED", False
     ):
         raise GatewayDenied("UNAVAILABLE", 503)
-    now = now or timezone.now()
     incarnation = uuid.UUID(request["incarnation"])
     with transaction.atomic():
         session = (
@@ -83,12 +82,66 @@ def ownership_request(packet, *, config=None, now=None):
             .filter(session=session)
             .first()
         )
+        # Observe time after taking the serialization lock. Lock contention must
+        # never extend a stale lease or make a live one appear expired.
+        now = now or timezone.now()
         matches = (
             route is not None
             and route.owner_id == owner
             and route.owner_incarnation == incarnation
         )
-        if action == "claim":
+        if action in {"inspect", "elect"}:
+            if not getattr(settings, "GATEWAY_MULTIWORKER_ENABLED", False):
+                raise GatewayDenied("UNAVAILABLE", 503)
+            previous = route.owner_generation if route else 0
+            if route and (
+                (route.janus_pool and route.janus_pool != request["pool"])
+                or (
+                    not route.released
+                    and (not route.janus_pool or route.lease_expires_at > now)
+                )
+            ):
+                raise GatewayDenied("CONFLICT", 409)
+            if GatewayOwnerGeneration.objects.filter(
+                session=session, incarnation=incarnation
+            ).exists():
+                raise GatewayDenied("CONFLICT", 409)
+            if action == "inspect":
+                if request["generation"] != 0:
+                    raise GatewayDenied("CONFLICT", 409)
+                return {
+                    "request_id": request["request_id"],
+                    "meeting_id": str(session.pk),
+                    "owner_id": owner,
+                    "incarnation": str(incarnation),
+                    "generation": previous,
+                    "previous_session": route.janus_session_id if route else None,
+                }
+            if previous != request["generation"] or previous >= 2**53 - 1:
+                raise GatewayDenied("CONFLICT", 409)
+            # The trusted elector has confirmed disposal of exactly the inspected
+            # generation. Persist the new session before it can create any handles.
+            route, _ = GatewayCommandRoute.objects.update_or_create(
+                session=session,
+                defaults={
+                    "owner_id": owner,
+                    "owner_incarnation": incarnation,
+                    "owner_generation": previous + 1,
+                    "janus_pool": request["pool"],
+                    "janus_session_id": request["session_id"],
+                    "released": False,
+                    "lease_expires_at": now + timedelta(seconds=LEASE_SECONDS),
+                },
+            )
+            GatewayOwnerGeneration.objects.create(
+                session=session,
+                incarnation=incarnation,
+                owner_id=owner,
+                generation=previous + 1,
+            )
+        elif action == "claim":
+            if route and route.janus_pool:
+                raise GatewayDenied("CONFLICT", 409)
             if request["generation"] != 0:
                 raise GatewayDenied("CONFLICT", 409)
             if route is None:
@@ -125,12 +178,16 @@ def ownership_request(packet, *, config=None, now=None):
                 route.save()
             else:
                 # Expiry is not proof that remote Janus handles were destroyed.
-                # SG-15 adds reconciled takeover; SG-07 fails closed.
+                # The legacy protocol has no physical recovery evidence.
                 raise GatewayDenied("CONFLICT", 409)
         else:
             if not matches or request["generation"] != route.owner_generation:
                 raise GatewayDenied("CONFLICT", 409)
             if action == "renew":
+                if route.janus_pool and not getattr(
+                    settings, "GATEWAY_MULTIWORKER_ENABLED", False
+                ):
+                    raise GatewayDenied("UNAVAILABLE", 503)
                 if route.released or route.lease_expires_at <= now:
                     raise GatewayDenied("CONFLICT", 409)
                 route.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)

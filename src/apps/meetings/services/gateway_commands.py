@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.db import connection, transaction
 from django.utils import timezone
+from jrtc_signalling.bus import BusError, canonical, command_route, digest
+from jrtc_signalling.contracts import validate_message
 
 from apps.meetings.models import (
     GatewayAuthorizationOutbox,
@@ -20,15 +22,13 @@ from apps.meetings.models import (
 )
 from apps.meetings.services.gateway_outbox import enabled
 from apps.meetings.services.gateway_tickets import GatewayDenied, current_permissions
-from jrtc_signalling.bus import BusError, canonical, command_route, digest
-from jrtc_signalling.contracts import validate_message
 
 OPEN = ("pending", "accepted")
 TERMINAL = ("applied", "failed", "timed_out", "superseded")
 
 
 def _time(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(value)
 
 
 def _current(row, session, participant):
@@ -66,6 +66,7 @@ def _bound(command, route, participant, now):
     body = command.envelope
     if (
         route is None
+        or route.released
         or route.lease_expires_at <= now
         or route.owner_id != body["target_owner"]
         or route.owner_generation != body["expected_owner_generation"]
@@ -138,7 +139,7 @@ def prepare_delivery(outbox_id, *, now=None):
             _terminal(row, command, "failed", row.last_error or "unavailable", now)
             return None
         route = GatewayCommandRoute.objects.filter(
-            session=session, lease_expires_at__gt=now
+            session=session, released=False, lease_expires_at__gt=now
         ).first()
         row.delivery_attempts += 1
         row.next_attempt_at = now + timedelta(

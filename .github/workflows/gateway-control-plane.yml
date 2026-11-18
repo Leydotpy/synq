@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Leydotpy/jrtc-signalling
-          ref: 4676d03bb108d048bbae726f23e3b4c52a14d5f8
+          ref: 10faa0818cb1a7feeb0b87ed86f0b7a015ec7164
           path: gateway-integration
       - name: Install isolated Janus integration dependency
         run: |
@@ -81,3 +81,9 @@ jobs:
         run: >-
           uv run --frozen --with pytest --with aiortc python
           scripts/check_gateway_state.py --gateway gateway-integration
+      - name: Verify two-worker election, routed WSS, crash recovery and rolling SIGTERM
+        env:
+          DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
+        run: >-
+          uv run --frozen --with pytest --with aiortc python
+          scripts/check_gateway_multiworker.py --gateway gateway-integration

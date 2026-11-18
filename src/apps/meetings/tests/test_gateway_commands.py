@@ -6,6 +6,8 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
+from apps.meetings.tests.test_gateway_admission import GatewayAdmissionFixture
 from asgiref.sync import async_to_sync
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from django.db import OperationalError, transaction
@@ -16,6 +18,14 @@ from django.test import (
     skipUnlessDBFeature,
 )
 from django.utils import timezone
+from jrtc_signalling.bus import (
+    BusConfig,
+    BusError,
+    Signer,
+    TrustedKey,
+    Verifier,
+)
+from jrtc_signalling.command_store import outcome
 
 from apps.meetings.models import (
     GatewayAuthorizationOutbox,
@@ -32,17 +42,7 @@ from apps.meetings.services.gateway_commands import (
     receive_outcome,
 )
 from apps.meetings.services.gateway_dispatcher import GatewayCommandWorker
-from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
 from apps.meetings.tests import test_gateway_ticket_races as race_support
-from apps.meetings.tests.test_gateway_admission import GatewayAdmissionFixture
-from jrtc_signalling.bus import (
-    BusConfig,
-    BusError,
-    Signer,
-    TrustedKey,
-    Verifier,
-)
-from jrtc_signalling.command_store import outcome
 
 
 class GatewayCommandFixture(GatewayAdmissionFixture):
@@ -146,6 +146,22 @@ class GatewayCommandTests(GatewayCommandFixture, TestCase):
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "failed")
         self.assertEqual(GatewayCommand.objects.get().envelope, claim["envelope"])
+
+    def test_retired_owner_ack_and_replayed_delivery_cannot_apply_to_successor(self):
+        claim = self.claim()
+        packet = dict(claim["envelope"])
+        publication_finished(claim, success=True, now=self.now)
+        self.route.owner_id = "owner-2"
+        self.route.owner_generation += 1
+        self.route.save()
+        self.assertFalse(authorize_command(packet, now=self.now))
+        old_ack = self.event(claim)
+        self.assertEqual(receive_outcome("owner-1", old_ack, now=self.now), "stale")
+        self.assertEqual(receive_outcome("owner-1", old_ack, now=self.now), "duplicate")
+        self.assertIsNone(self.claim(now=self.now + timedelta(seconds=3)))
+        self.assertEqual(GatewayCommand.objects.get().envelope, packet)
+        self.row.refresh_from_db()
+        self.assertNotEqual(self.row.status, "applied")
 
     def test_new_connection_binding_fences_old_command(self):
         claim = self.claim()

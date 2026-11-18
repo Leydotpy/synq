@@ -511,4 +511,5 @@ GATEWAY_COMMANDS_ENABLED = config("GATEWAY_COMMANDS_ENABLED", default=False, cas
 GATEWAY_EVENTS_ENABLED = config("GATEWAY_EVENTS_ENABLED", default=False, cast=bool)
 GATEWAY_STATE_ENABLED = config("GATEWAY_STATE_ENABLED", default=False, cast=bool)
 GATEWAY_RUNTIME_ENABLED = config("GATEWAY_RUNTIME_ENABLED", default=False, cast=bool)
+GATEWAY_MULTIWORKER_ENABLED = config("GATEWAY_MULTIWORKER_ENABLED", default=False, cast=bool)
 GATEWAY_BUS_CONFIG_FILE = config("GATEWAY_BUS_CONFIG_FILE", default="", cast=str)

@@ -6,6 +6,14 @@ import uuid
 from datetime import timedelta
 from unittest.mock import patch
 
+from apps.meetings.exceptions import JanusGatewayError
+from apps.meetings.services.janus import (
+    call_video_room_management_method,
+    resolve_janus_session,
+)
+from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
+from apps.meetings.services.signaling import _prepare_media_handle
+from apps.meetings.tests.test_gateway_admission import GatewayAdmissionFixture
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from django.test import (
     TestCase,
@@ -17,7 +25,6 @@ from django.utils import timezone
 from jrtc_signalling.bus import BusConfig, Signer, TrustedKey, Verifier
 from rest_framework.test import APIClient
 
-from apps.meetings.exceptions import JanusGatewayError
 from apps.meetings.models import (
     GatewayCommandRoute,
     GatewayOwnerGeneration,
@@ -27,14 +34,7 @@ from apps.meetings.models import (
 from apps.meetings.services.gateway_commands import prepare_delivery
 from apps.meetings.services.gateway_ownership import ownership_request
 from apps.meetings.services.gateway_tickets import GatewayDenied
-from apps.meetings.services.janus import (
-    call_video_room_management_method,
-    resolve_janus_session,
-)
-from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
-from apps.meetings.services.signaling import _prepare_media_handle
 from apps.meetings.tests import test_gateway_ticket_races as race_support
-from apps.meetings.tests.test_gateway_admission import GatewayAdmissionFixture
 
 
 class OwnershipFixture(GatewayAdmissionFixture):
@@ -78,14 +78,14 @@ class OwnershipFixture(GatewayAdmissionFixture):
         )
 
     def packet(self, action="claim", generation=0, **changes):
-        body = dict(
-            request_id=str(uuid.uuid4()),
-            meeting_id=str(self.session.pk),
-            incarnation=self.incarnation,
-            generation=generation,
-            action=action,
-            issued_at=int(time.time()),
-        )
+        body = {
+            "request_id": str(uuid.uuid4()),
+            "meeting_id": str(self.session.pk),
+            "incarnation": self.incarnation,
+            "generation": generation,
+            "action": action,
+            "issued_at": int(time.time()),
+        }
         body.update(changes)
         return self.owner.sign(body, "owner-request")
 
@@ -334,6 +334,85 @@ class OwnershipRaceTests(OwnershipFixture, TransactionTestCase):
         self.assertEqual(
             GatewayCommandRoute.objects.filter(session=self.session).count(), 1
         )
+        self.assertEqual(
+            GatewayOwnerGeneration.objects.filter(session=self.session).count(), 1
+        )
+
+
+@override_settings(GATEWAY_MULTIWORKER_ENABLED=True)
+class MultiworkerOwnershipTests(OwnershipFixture, TestCase):
+    pool = "a" * 64
+
+    def test_recovery_is_bound_to_pool_exact_session_and_previous_generation(self):
+        self.assertEqual(self.request("inspect", pool=self.pool)["generation"], 0)
+        self.request("elect", pool=self.pool, session_id=345)
+        first = self.incarnation
+        self.incarnation = str(uuid.uuid4())
+        with self.assertRaises(GatewayDenied):
+            self.request("inspect", pool=self.pool)
+        GatewayCommandRoute.objects.filter(session=self.session).update(
+            lease_expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        with self.assertRaises(GatewayDenied):
+            self.request("inspect", pool="b" * 64)
+        inspected = self.request("inspect", pool=self.pool)
+        self.assertEqual(
+            (inspected["generation"], inspected["previous_session"]), (1, 345)
+        )
+        with self.assertRaises(GatewayDenied):
+            self.request("elect", pool=self.pool, session_id=456)
+        self.assertEqual(
+            self.request("elect", 1, pool=self.pool, session_id=456)["generation"], 2
+        )
+        for action in ("renew", "release"):
+            with self.assertRaises(GatewayDenied):
+                self.request(action, 1, incarnation=first)
+        self.request("release", 2)
+        with self.assertRaises(GatewayDenied):
+            self.request("claim", incarnation=str(uuid.uuid4()))
+        with self.assertRaises(GatewayDenied):
+            self.request("elect", 2, pool=self.pool, session_id=345, incarnation=first)
+
+    def test_legacy_crash_needs_legacy_cleanup_and_rollout_requires_flag(self):
+        self.request()
+        old = self.incarnation
+        self.incarnation = str(uuid.uuid4())
+        GatewayCommandRoute.objects.filter(session=self.session).update(
+            lease_expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        with self.assertRaises(GatewayDenied):
+            self.request("inspect", pool=self.pool)
+        self.request("release", 1, incarnation=old)
+        with (
+            override_settings(GATEWAY_MULTIWORKER_ENABLED=False),
+            self.assertRaises(GatewayDenied),
+        ):
+            self.request("inspect", pool=self.pool)
+        inspected = self.request("inspect", pool=self.pool)
+        self.assertIsNone(inspected["previous_session"])
+        self.assertEqual(
+            self.request("elect", 1, pool=self.pool, session_id=101)["generation"], 2
+        )
+
+
+@override_settings(GATEWAY_MULTIWORKER_ENABLED=True)
+@skipUnlessDBFeature("has_select_for_update")
+class MultiworkerElectionRace(OwnershipFixture, TransactionTestCase):
+    race = race_support.GatewayTicketRaceTests.race
+
+    def test_elect_after_shared_inspection_has_one_winner(self):
+        pool = "c" * 64
+
+        def elect(signer, sid):
+            packet = json.loads(self.packet("elect", pool=pool, session_id=sid))
+            body = dict(packet["body"], incarnation=str(uuid.uuid4()))
+            ownership_request(signer.sign(body, "owner-request"), config=self.bus)
+            return "elected"
+
+        results = self.race(
+            lambda: elect(self.owner, 1001), lambda: elect(self.other, 1002)
+        )
+        self.assertCountEqual(results, ["elected", "denied"])
         self.assertEqual(
             GatewayOwnerGeneration.objects.filter(session=self.session).count(), 1
         )

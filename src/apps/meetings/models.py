@@ -912,6 +912,8 @@ class GatewayCommandRoute(UUIDTimestampedModel):
     owner_generation = models.PositiveBigIntegerField()
     lease_expires_at = models.DateTimeField()
     owner_incarnation = models.UUIDField(null=True, editable=False)
+    janus_pool = models.CharField(max_length=64, blank=True, default="", editable=False)
+    janus_session_id = models.PositiveBigIntegerField(null=True, editable=False)
     released = models.BooleanField(default=False)
 
 
