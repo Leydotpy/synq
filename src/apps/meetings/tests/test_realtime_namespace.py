@@ -86,7 +86,7 @@ class MeetingNamespaceErrorHandlingTests(SimpleTestCase):
         namespace = MeetingNamespace("/meetings")
         namespace.server = SimpleNamespace(get_environ=lambda *args, **kwargs: {})
         profile = SimpleNamespace(pk="profile-id")
-        session = SimpleNamespace(pk="session-id", room=SimpleNamespace())
+        session = SimpleNamespace(pk="session-id", room=SimpleNamespace(), signalling_backend="legacy")
         connection = SimpleNamespace(
             participant_id=None,
             status=RealtimeConnectionStatus.SUBSCRIBED,
@@ -125,6 +125,17 @@ class MeetingNamespaceErrorHandlingTests(SimpleTestCase):
             {"session": "personalized"},
             to="socket-id",
         )
+
+    def test_gateway_session_refuses_legacy_subscription_before_binding(self) -> None:
+        namespace = MeetingNamespace("/meetings")
+        namespace._get_profile = AsyncMock(return_value=SimpleNamespace(pk="profile-id"))
+        namespace._get_session = AsyncMock(return_value=SimpleNamespace(signalling_backend="gateway"))
+        with (
+            patch("apps.meetings.realtime.namespace.MeetingLifecycleService.bind_connection_to_session") as bind,
+            self.assertRaisesRegex(ValueError, "SSE"),
+        ):
+            async_to_sync(namespace.on_session_subscribe)("socket-id", {"session_id": "session-id"})
+        bind.assert_not_called()
 
     def test_intentional_leave_unsubscribes_both_session_rooms(self) -> None:
         """The client leave command receives a positive acknowledgement and exits fan-out rooms."""

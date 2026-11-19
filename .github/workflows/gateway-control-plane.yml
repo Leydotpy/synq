@@ -71,6 +71,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends janus redis-server
           sudo systemctl stop janus || true
           dpkg-query --show janus
+      - name: Rehearse staged cutover and failback with live media
+        env:
+          GATEWAY_TEST_REDIS_URL: redis://127.0.0.1:6379/14
+          DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
+        run: >-
+          uv run --frozen --with pytest --with aiortc python
+          scripts/check_gateway_cutover.py --gateway gateway-integration
       - name: Verify live gateway lifecycle events against Django
         env:
           DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
@@ -96,9 +103,3 @@ jobs:
           for first in legacy gateway; do
             uv run --frozen --with pytest --with aiortc python scripts/benchmark_gateway_ice.py --gateway gateway-integration --first "$first"
           done
-      - name: Rehearse staged cutover and failback with live media
-        env:
-          DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
-        run: >-
-          uv run --frozen --with pytest --with aiortc python
-          scripts/check_gateway_cutover.py --gateway gateway-integration
