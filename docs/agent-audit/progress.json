@@ -608,6 +608,25 @@
           "https://github.com/Leydotpy/synq/actions/runs/44364899582",
           "https://github.com/Leydotpy/jrtc-signalling/actions/runs/44364848787"
         ]
+      },
+      {
+        "id": "SG-16",
+        "status": "ready_for_review",
+        "baseline_commit": "3eea31e88e4b06169323f341b132769681572c7f",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-control-plane.md",
+        "notes": "254 PostgreSQL/Redis tests and live lifecycle, SSE, two-worker failover and matched four-publisher benchmarks passed. All 512 timed requests completed. The report records both the lower p95 and the higher gateway p99 observed in the first run.",
+        "review_status": "pending_maintainer_review",
+        "implementation_commit": "90af54cb573826fe46ff508696e0e34fde5b778d",
+        "last_updated": "2026-11-19",
+        "verification_evidence": [
+          "scripts/benchmark_gateway_ice.py",
+          "scripts/check_gateway_multiworker.py",
+          "src/apps/meetings/tests/test_gateway_telemetry.py",
+          "https://github.com/Leydotpy/synq/actions/runs/44463194571",
+          "https://github.com/Leydotpy/jrtc-signalling/actions/runs/44463084544"
+        ]
       }
     ]
   }
