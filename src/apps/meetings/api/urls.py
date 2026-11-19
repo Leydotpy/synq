@@ -3,7 +3,7 @@
 from django.urls import path
 from apps.meetings.services.gateway_telemetry import metrics as gateway_metrics
 from apps.meetings.api.gateway_state import GatewaySnapshotView, GatewayStateStreamView
-from apps.meetings.api.gateway_application import GatewayApplicationView
+from apps.meetings.api.gateway_application import GatewayApplicationView, SignallingRouteView
 
 from apps.meetings.api.gateway import GatewayAuthorityView, GatewayCommandAuthorityView, GatewayCommandStatusView, GatewayTicketView, GatewayJoinIntentView, GatewayAdmissionDecisionView, GatewayOwnershipView
 
@@ -25,6 +25,7 @@ from apps.meetings.api.views import (
 app_name = "meetings-api"
 
 urlpatterns = [
+    path("sessions/<uuid:session_id>/signalling-route/", SignallingRouteView.as_view(), name="signalling-route"),
     path("internal/gateway/metrics/", gateway_metrics, name="gateway-metrics"),
     path("sessions/<uuid:session_id>/gateway/chat/", GatewayApplicationView.as_view(), {"operation": "chat"}, name="gateway-chat"),
     path("sessions/<uuid:session_id>/gateway/reactions/", GatewayApplicationView.as_view(), {"operation": "reactions"}, name="gateway-reactions"),

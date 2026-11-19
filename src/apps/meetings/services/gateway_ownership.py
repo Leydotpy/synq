@@ -4,7 +4,7 @@ import time
 import uuid
 from datetime import timedelta
 
-from apps.meetings.exceptions import JanusGatewayError
+from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -20,6 +20,22 @@ from apps.meetings.services.gateway_tickets import GatewayDenied
 
 
 def selected_backend(room):
+    if room.gateway_canary is not None or settings.GATEWAY_STAGED_ROUTING:
+        if room.gateway_canary is not True:
+            return "legacy"
+        if not all(
+            (
+                settings.GATEWAY_STAGED_ROUTING,
+                settings.GATEWAY_TICKETS_ENABLED,
+                settings.GATEWAY_ADMISSION_ENABLED,
+                settings.GATEWAY_COMMANDS_ENABLED,
+                settings.GATEWAY_RUNTIME_ENABLED,
+                settings.GATEWAY_EVENTS_ENABLED,
+                settings.GATEWAY_STATE_ENABLED,
+            )
+        ):
+            raise MeetingDomainError("The selected gateway cohort is unavailable.")
+        return "gateway"
     flags = room.feature_flags if isinstance(room.feature_flags, dict) else {}
     selected = (
         getattr(settings, "GATEWAY_RUNTIME_ENABLED", False)
@@ -84,8 +100,19 @@ def ownership_request(packet, *, config=None, now=None):
         if session.signalling_backend != "gateway":
             raise GatewayDenied("FORBIDDEN", 403)
         action = request["action"]
+        ended = session.ended_at is not None or session.lifecycle_state in {
+            "ended",
+            "failed",
+        }
+        # Let an authenticated holder finish disposal on its original deadline when
+        # the renewal timer races a staged termination. A new owner cannot claim.
+        finishing = (
+            ended and action == "renew" and session.room.gateway_canary is not None
+        )
         if action != "release" and (
-            selected_backend(session.room) != "gateway" or session.ended_at is not None
+            (ended and not finishing)
+            or not settings.GATEWAY_ADMISSION_ENABLED
+            or not settings.GATEWAY_COMMANDS_ENABLED
         ):
             raise GatewayDenied("FORBIDDEN", 403)
         route = (
@@ -212,6 +239,8 @@ def ownership_request(packet, *, config=None, now=None):
                     raise GatewayDenied("UNAVAILABLE", 503)
                 if route.released or route.lease_expires_at <= now:
                     raise GatewayDenied("CONFLICT", 409)
+                if finishing:
+                    return _lease_result(request, route, now)
                 route.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
             else:
                 route.released = True

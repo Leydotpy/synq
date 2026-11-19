@@ -90,6 +90,10 @@ def advance_epoch(participant: Participant) -> None:
 def current_permissions(
     participant: Participant, session: MeetingSession
 ) -> tuple[list[str], dict]:
+    if session.signalling_backend != "gateway" and (
+        settings.GATEWAY_STAGED_ROUTING or session.room.gateway_canary is not None
+    ):
+        raise GatewayDenied()
     if session.lifecycle_state not in {
         MeetingLifecycleState.PROVISIONING,
         MeetingLifecycleState.WAITING,

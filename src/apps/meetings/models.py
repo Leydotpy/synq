@@ -252,6 +252,8 @@ class ParticipantQuerySet(models.QuerySet):
 class MeetingRoom(UUIDTimestampedModel):
     """Persistent collaboration space that owns admission policy and durable coordinators."""
 
+    # Operator choice for future sessions. Null retains the original rehearsal policy.
+    gateway_canary = models.BooleanField(null=True, default=None, editable=False)
     # Human-readable room title shown in meeting lists, invitations, and waiting-room views.
     title = models.CharField(max_length=255)
     # URL-safe public slug used in shareable meeting links and API lookups.

@@ -1,7 +1,11 @@
 """Authenticated application commands for the gateway cohort; never SDP/ICE."""
 
 from django.db import transaction
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import exceptions, response, serializers
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.views import APIView
 
 from core.api.api import CurrentProfileMixin
 from apps.meetings.api.gateway import GatewayAPIView, StrictSerializer
@@ -10,6 +14,7 @@ from apps.meetings.services.gateway_state import ADMITTED, _audience, _session
 from apps.meetings.services.gateway_tickets import GatewayDenied
 from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
 from apps.meetings.exceptions import MeetingDomainError
+from apps.meetings.models import GatewayCommandRoute, MeetingSession
 from apps.meetings.services.state import MeetingStateBuilder as State
 
 
@@ -65,3 +70,35 @@ class GatewayApplicationView(CurrentProfileMixin, GatewayAPIView):
             raise exceptions.ValidationError(str(exc)) from exc
         result["event_context"] = {"kind": "snapshot", "session_id": str(session.pk)}
         return response.Response(result, status=201)
+
+
+class SignallingRouteView(APIView):
+    """Pre-admission discovery returns only the transport of the supplied UUID."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, session_id):
+        if not request.is_secure():
+            raise exceptions.PermissionDenied("HTTPS required.")
+        if request.auth:
+            credentials(request)
+        session = get_object_or_404(MeetingSession, pk=session_id)
+        headers = {"Cache-Control": "private, no-store"}
+        if session.ended_at is not None or session.lifecycle_state in {
+            "ended",
+            "failed",
+        }:
+            return response.Response(status=410, headers=headers)
+        if (
+            session.signalling_backend == "gateway"
+            and not GatewayCommandRoute.objects.filter(
+                session=session, released=False, lease_expires_at__gt=timezone.now()
+            ).exists()
+        ):
+            return response.Response(
+                status=503, headers={**headers, "Retry-After": "2"}
+            )
+        return response.Response(
+            {"session_id": str(session.pk), "backend": session.signalling_backend},
+            headers=headers,
+        )

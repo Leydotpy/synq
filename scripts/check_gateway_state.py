@@ -51,7 +51,9 @@ async def cancellable_django(scope, receive, send):
         raise
 
 
-async def build_test_gateway(fixture, directory, server, url, *, metrics_token_file=""):
+async def build_test_gateway(
+    fixture, directory, server, url, *, metrics_token_file="", staged_routing=False
+):
     """Use the real Django ASGI authority, Janus runtime and Broka clients."""
     import httpx2 as httpx
     from jrtc_signalling.app import create_app
@@ -102,6 +104,7 @@ async def build_test_gateway(fixture, directory, server, url, *, metrics_token_f
         Settings(
             media_rehearsal=True,
             lifecycle_events=True,
+            staged_routing=staged_routing,
             shutdown_timeout=30,
             metrics_token_file=metrics_token_file,
         ),

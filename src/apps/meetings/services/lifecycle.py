@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
@@ -181,7 +182,13 @@ class MeetingLifecycleService:
             if created:
                 from apps.meetings.services.gateway_ownership import selected_backend
 
+                from apps.meetings.services.gateway_cutover import require_drained
+
                 backend = selected_backend(locked_room)
+                if locked_room.gateway_canary is not None or settings.GATEWAY_STAGED_ROUTING:
+                    previous = locked_room.sessions.order_by("-created_at").first()
+                    if previous is not None and previous.signalling_backend == "gateway":
+                        require_drained(previous)
                 session = MeetingSession.objects.create(
                     room=locked_room,
                     started_by_profile=started_by_profile,
@@ -1221,6 +1228,12 @@ class MeetingLifecycleService:
                 payload={"reason": reason},
             )
             MeetingLifecycleService.refresh_session_metrics(session=session)
+            if session.signalling_backend == "gateway":
+                from apps.meetings.services.gateway_cutover import settle_unowned
+                from apps.meetings.services.gateway_state import project_event
+
+                settle_unowned(session)
+                project_event(session)
 
         def emit_updates() -> None:
             """Broadcast session completion and queue Janus room teardown after commit."""
@@ -1228,6 +1241,8 @@ class MeetingLifecycleService:
             from apps.meetings.realtime.emitter import MeetingSocketEmitter
             from apps.meetings.tasks import queue_janus_room_cleanup
 
+            if session.signalling_backend == "gateway":
+                return
             queue_janus_room_cleanup(str(session.pk))
             MeetingSocketEmitter.emit_session_ended(session=session, reason=reason)
             MeetingSocketEmitter.emit_session_state(session=session)

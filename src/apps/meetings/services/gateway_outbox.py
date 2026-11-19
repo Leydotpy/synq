@@ -10,7 +10,14 @@ from apps.meetings.services.gateway_tickets import GatewayDenied, current_permis
 def enabled(session):
     return (
         getattr(settings, "GATEWAY_ADMISSION_ENABLED", False)
-        and session.room.feature_flags.get("gateway_control_plane") is True
+        and (
+            session.signalling_backend == "gateway"
+            or (
+                not settings.GATEWAY_STAGED_ROUTING
+                and session.room.gateway_canary is None
+                and session.room.feature_flags.get("gateway_control_plane") is True
+            )
+        )
     )
 
 
