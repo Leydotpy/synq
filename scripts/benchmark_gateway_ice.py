@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import platform
+import secrets
 import shutil
 import socket
 import sys
@@ -12,6 +13,7 @@ import tempfile
 import time
 from contextlib import AsyncExitStack, ExitStack
 from pathlib import Path
+from traceback import extract_tb
 from threading import Lock
 from unittest.mock import patch
 
@@ -162,6 +164,7 @@ def main():
         "DJANGO_SETTINGS_MODULE", "conf.gateway_postgres_test_settings"
     )
     import django
+    import httpx2 as httpx
 
     django.setup()
     from aiortc import (
@@ -253,6 +256,7 @@ def main():
         async def run_pair(self, directory, addresses):
             server = JanusServer(directory)
             async with AsyncExitStack() as stack:
+                stack.push_async_callback(sync_to_async(connections.close_all))
                 await server.start()
                 stack.push_async_callback(server.stop)
                 redis, url = await private_redis(directory, stack)
@@ -284,12 +288,33 @@ def main():
                             )
                             namespace = MeetingNamespace("/meetings")
                         else:
+                            token = secrets.token_hex(32)
+                            token_file = directory / "metrics.key"
+                            token_file.write_text(token)
                             runtime, app = await build_test_gateway(
-                                self, directory, server, url
+                                self,
+                                directory,
+                                server,
+                                url,
+                                metrics_token_file=str(token_file),
                             )
                             await phase.enter_async_context(
                                 app.router.lifespan_context(app)
                             )
+
+                        def report_failure(kind, exc, tb, mode=mode):
+                            if exc is not None:
+                                last = extract_tb(tb)[-1]
+                                print(
+                                    "SG16_CHECK_FAILURE",
+                                    mode,
+                                    kind.__name__,
+                                    Path(last.filename).name,
+                                    last.lineno,
+                                    flush=True,
+                                )
+
+                        phase.push(report_failure)
                         for i, profile in enumerate(self.people):
                             peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
                             phase.push_async_callback(peer.close)
@@ -366,8 +391,44 @@ def main():
                             await send(real, False)
                             flows.append((send, real[0]))
                         await media_ready(peers)
-                        result[mode] = await measure(flows, addresses, meter)
                         if mode == "gateway":
+                            timing = app.state.auth_endpoint.metrics.operations[
+                                "media.trickle"
+                            ]
+                            queued_before, time_before = (
+                                timing.queue_seconds,
+                                timing.total_seconds,
+                            )
+                        result[mode] = await measure(flows, addresses, meter)
+                        print(
+                            f"SG16_WAVE {mode} acks={result[mode]['acks']}", flush=True
+                        )
+                        if mode == "gateway":
+                            result[mode]["mean_dispatch_ms"] = round(
+                                1000
+                                * (timing.total_seconds - time_before)
+                                / result[mode]["acks"],
+                                3,
+                            )
+                            result[mode]["mean_queue_ms"] = round(
+                                1000
+                                * (timing.queue_seconds - queued_before)
+                                / result[mode]["acks"],
+                                3,
+                            )
+                            async with httpx.AsyncClient(
+                                transport=httpx.ASGITransport(app=app),
+                                base_url="https://testserver",
+                            ) as client:
+                                scrape = await client.get(
+                                    "/metrics",
+                                    headers={"Authorization": "Bearer " + token},
+                                )
+                                assert scrape.status_code == 200
+                                assert (
+                                    f"jrtc_ice_ack_seconds_count {result[mode]['acks'] + len(peers)}\n"
+                                    in scrape.text
+                                )
                             # This Redis process and Janus process belong exclusively to this script.
                             await redis.execute_command("CLIENT", "PAUSE", 2500, "ALL")
                             start = time.perf_counter()
@@ -375,7 +436,9 @@ def main():
                             result["broker_pause_all_peer_acks_ms"] = round(
                                 1000 * (time.perf_counter() - start), 2
                             )
+                            assert result["broker_pause_all_peer_acks_ms"] < 2500
                             await redis.ping()
+                            await media_ready(peers)
                             result["ready_sessions"] = len(
                                 [s for s in runtime.manager.sessions if s.ready]
                             )
@@ -384,22 +447,37 @@ def main():
                                 for s in runtime.manager.sessions
                                 if s.ready
                             )
-                            old = runtime.session(str(self.session.pk))
+                            meeting = str(self.session.pk)
+                            old = runtime.session(meeting)
                             start = time.perf_counter()
                             await server.stop()
                             async with asyncio.timeout(15):
                                 while old.ready or runtime.registry.bindings:
                                     await asyncio.sleep(0.05)
-                            result["janus_loss_cleanup_ms"] = round(
+                            result["janus_invalidation_ms"] = round(
                                 1000 * (time.perf_counter() - start), 2
                             )
                             await server.start()
                             async with asyncio.timeout(25):
-                                while not runtime.manager.ready:
+                                while (
+                                    not runtime.manager.ready
+                                    or runtime.session(meeting) is old
+                                    or runtime.registry.uncertain
+                                    or app.state.auth_endpoint.sessions
+                                ):
                                     await asyncio.sleep(0.05)
+                            await runtime.management(
+                                meeting,
+                                runtime.leases[meeting].generation,
+                                "list_rooms",
+                            )
+                            assert not runtime.registry.cleanup_failed
+                            result["janus_reconciled_ms"] = round(
+                                1000 * (time.perf_counter() - start), 2
+                            )
+                            print("SG16_RECOVERY verified", flush=True)
                         else:
                             await asyncio.gather(*(send([], True) for send, _ in flows))
-                await sync_to_async(connections.close_all)()
                 return result
 
     Benchmark.__module__ = __name__
