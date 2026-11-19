@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Leydotpy/jrtc-signalling
-          ref: 50ff93d94cd1354e4046dd2d17e93a57ffa48c8e
+          ref: 2797d26abe6e995e6ad702b0ccb63652bf46f71e
           path: gateway-integration
       - name: Install isolated Janus integration dependency
         run: |
