@@ -51,11 +51,51 @@ class SqlMeter:
                     value["writes"] += 1
 
 
-async def measure(flows, addresses, meter):
+def observe_gateway_stages(stack, peers, authority):
+    """Time real calls on each publisher during the wave. A peer has one in-flight request."""
+    slots = [{} for peer in peers]
+
+    def timed(call, slot, name):
+        async def observe(op, payload):
+            if op != "media.trickle":
+                return await call(op, payload)
+            start = time.perf_counter()
+            try:
+                return await call(op, payload)
+            finally:
+                slot[name] = 1000 * (time.perf_counter() - start)
+
+        return observe
+
+    by_session = {}
+    for peer, slot in zip(peers, slots, strict=True):
+        by_session[peer.authorization.claims["participant_session_id"]] = slot
+        for name in ("authorize", "dispatch"):
+            stack.enter_context(
+                patch.object(peer, name, timed(getattr(peer, name), slot, name))
+            )
+
+    check = authority.check
+
+    async def check_grant(claims, *, operation, consume):
+        if operation != "media.trickle":
+            return await check(claims, operation=operation, consume=consume)
+        slot = by_session[claims["participant_session_id"]]
+        started = time.perf_counter()
+        try:
+            return await check(claims, operation=operation, consume=consume)
+        finally:
+            slot["grant_rpc"] = 1000 * (time.perf_counter() - started)
+
+    stack.enter_context(patch.object(authority, "check", check_grant))
+    return slots
+
+
+async def measure(flows, addresses, meter, stages=None):
     samples = []
     tally = {"statements": 0, "writes": 0, "sql_ms": 0.0}
 
-    async def wave(send, base, ports):
+    async def wave(send, base, ports, stage):
         for i, port in enumerate(ports):
             # Low-priority additional host candidates. Every destination is a
             # bound UDP socket on this test host. The original audio pair stays live.
@@ -63,33 +103,49 @@ async def measure(flows, addresses, meter):
                 **base,
                 "candidate": f"candidate:{i + 100} 1 udp 1 127.0.0.1 {port} typ host",
             }
+            stage.clear()
             start = time.perf_counter()
             await send([candidate], False)
-            samples.append((time.perf_counter() - start) * 1000)
+            samples.append(((time.perf_counter() - start) * 1000, stage.copy()))
 
     with meter.lock:
         meter.value = tally
     start = time.perf_counter()
     try:
         async with asyncio.TaskGroup() as tasks:
-            for (send, base), ports in zip(flows, addresses, strict=True):
-                tasks.create_task(wave(send, base, ports))
+            for i, ((send, base), ports) in enumerate(
+                zip(flows, addresses, strict=True)
+            ):
+                tasks.create_task(wave(send, base, ports, stages[i] if stages else {}))
     finally:
         elapsed = time.perf_counter() - start
         with meter.lock:
             meter.value = None
-    samples.sort()
+    samples.sort(key=lambda sample: sample[0])
     assert len(samples) == sum(map(len, addresses))
-    return {
+    result = {
         "acks": len(samples),
         "batches_s": round(len(samples) / elapsed, 2),
         **{
-            f"p{q}_ms": round(samples[math.ceil(q * len(samples) / 100) - 1], 3)
+            f"p{q}_ms": round(samples[math.ceil(q * len(samples) / 100) - 1][0], 3)
             for q in (50, 95, 99)
         },
         **tally,
         "sql_ms": round(tally["sql_ms"], 2),
     }
+
+    if stages:
+        latency, sample = samples[math.ceil(0.99 * len(samples)) - 1]
+        result["p99_components_ms"] = {
+            "authorize": round(sample["authorize"], 3),
+            "dispatch": round(sample["dispatch"], 3),
+            "other": round(latency - sample["authorize"] - sample["dispatch"], 3),
+            "rpc_within_authorize": round(sample.get("grant_rpc", 0), 3),
+        }
+        result["acks_with_grant_rpc"] = sum(
+            "grant_rpc" in sample for _, sample in samples
+        )
+    return result
 
 
 async def media_ready(peers):
@@ -264,7 +320,8 @@ def main():
                 order = [args.first, "gateway" if args.first == "legacy" else "legacy"]
                 for mode in order:
                     async with asyncio.timeout(90), AsyncExitStack() as phase:
-                        peers, flows = [], []
+                        peers, flows, gateway_peers = [], [], []
+                        stages = None
                         if mode == "legacy":
                             phase.enter_context(
                                 override_settings(
@@ -358,6 +415,11 @@ def main():
                                 )
                                 phase.push_async_callback(browser.close)
                                 assert (await browser.open())["ok"]
+                                gateway_peers.append(
+                                    app.state.auth_endpoint.media.peers[
+                                        (claims["meeting_id"], claims["participant_id"])
+                                    ]
+                                )
                                 payload = publish_payload()
                                 payload["offer"]["sdp"] = sdp
                                 reply = await browser.request(
@@ -399,7 +461,10 @@ def main():
                                 timing.queue_seconds,
                                 timing.total_seconds,
                             )
-                        result[mode] = await measure(flows, addresses, meter)
+                            stages = observe_gateway_stages(
+                                phase, gateway_peers, app.state.auth_endpoint.authority
+                            )
+                        result[mode] = await measure(flows, addresses, meter, stages)
                         print(
                             f"SG16_WAVE {mode} acks={result[mode]['acks']}", flush=True
                         )

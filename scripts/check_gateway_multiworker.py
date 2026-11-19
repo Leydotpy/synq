@@ -38,6 +38,7 @@ def main():
     import django
 
     django.setup()
+    import httpx2 as httpx
     import uvicorn
     from aiortc import (
         AudioStreamTrack,
@@ -195,6 +196,7 @@ def main():
                     "workers": targets,
                 },
             )
+            metrics_key = uuid4().hex
             env = {
                 **os.environ,
                 "SSL_CERT_FILE": tls,
@@ -202,6 +204,7 @@ def main():
                 "PYTHONPATH": str(gateway / "src"),
                 "JRTC_SIGNALLING_AUTH_CONFIG_FILE": config,
                 "JRTC_SIGNALLING_RUNTIME_CONFIG_FILE": runtime_config,
+                "JRTC_SIGNALLING_METRICS_TOKEN_FILE": write("scrape-key", metrics_key),
                 "JRTC_SIGNALLING_MEDIA_REHEARSAL": "true",
                 "JRTC_SIGNALLING_LIFECYCLE_EVENTS": "true",
                 "JRTC_SIGNALLING_SHUTDOWN_TIMEOUT": "30",
@@ -406,6 +409,48 @@ def main():
                         (await janus_request(one.janus_session_id))["janus"], "ack"
                     )
                     old_observation = await observed(1)
+                    footprint = {}
+                    async with httpx.AsyncClient(
+                        verify=context, trust_env=False
+                    ) as telemetry:
+                        for role, worker in (("owner", owner), ("standby", standby)):
+                            response = await telemetry.get(
+                                f"https://{host}:{ports[worker]}/metrics",
+                                headers={"Authorization": "Bearer " + metrics_key},
+                            )
+                            response.raise_for_status()
+                            footprint[role] = {
+                                name: int(value)
+                                for name, value in (
+                                    line.split()
+                                    for line in response.text.splitlines()
+                                    if line.startswith(
+                                        (
+                                            "jrtc_janus_sessions ",
+                                            "jrtc_janus_handles ",
+                                            "jrtc_owned_meetings ",
+                                        )
+                                    )
+                                )
+                            }
+                    self.assertEqual(
+                        [
+                            footprint[role]["jrtc_janus_sessions"]
+                            for role in ("owner", "standby")
+                        ],
+                        [1, 1],
+                    )
+                    self.assertEqual(
+                        [
+                            footprint[role]["jrtc_owned_meetings"]
+                            for role in ("owner", "standby")
+                        ],
+                        [1, 0],
+                    )
+                    self.assertGreaterEqual(footprint["owner"]["jrtc_janus_handles"], 1)
+                    print(
+                        "SG16_POOL=" + json.dumps(footprint, sort_keys=True), flush=True
+                    )
                     command = (await sync_to_async(prepare_delivery)(outbox_id))[
                         "envelope"
                     ]
