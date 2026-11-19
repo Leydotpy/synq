@@ -1,6 +1,7 @@
 """Authenticated, observation-only lifecycle inbox. No Janus or browser side effects."""
 
 import uuid
+from functools import partial
 from datetime import datetime, timedelta
 
 from django.db import transaction
@@ -16,6 +17,7 @@ from apps.meetings.models import (
     MeetingSession,
     Participant,
 )
+from apps.meetings.services.gateway_telemetry import log_observed_session
 from apps.meetings.services.gateway_tickets import GatewayDenied, current_permissions
 from jrtc_signalling.bus import BusError, canonical, digest
 from jrtc_signalling.contracts import validate_message
@@ -157,6 +159,18 @@ def receive_event(producer, event, *, now=None):
                 from apps.meetings.services.gateway_state import project_event
 
                 project_event(session, now=now)
+                if event["type"] in {
+                    "participant.lobby_connected",
+                    "participant.signaling_connected",
+                }:
+                    transaction.on_commit(
+                        partial(
+                            log_observed_session,
+                            event["meeting_id"],
+                            event["participant_session_id"],
+                        ),
+                        robust=True,
+                    )
         GatewayLifecycleReceipt.objects.create(
             id=ids["event_id"],
             participant=participant,

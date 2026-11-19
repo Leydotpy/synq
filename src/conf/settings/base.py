@@ -503,6 +503,10 @@ GATEWAY_TICKET_KEY_ID = config("GATEWAY_TICKET_KEY_ID", default="", cast=str)
 GATEWAY_TICKET_PRIVATE_KEY_FILE = config("GATEWAY_TICKET_PRIVATE_KEY_FILE", default="", cast=str)
 GATEWAY_TICKET_TTL_SECONDS = config("GATEWAY_TICKET_TTL_SECONDS", default=60, cast=int)
 # Dedicated credential, not the external meeting-provider service token.
+from jrtc_signalling.telemetry import read_key as read_gateway_observability_key
+
+GATEWAY_METRICS_KEY = read_gateway_observability_key(config("GATEWAY_METRICS_TOKEN_FILE", default=""))
+GATEWAY_TRACE_KEY = read_gateway_observability_key(config("GATEWAY_TRACE_KEY_FILE", default=""))
 GATEWAY_AUTHORITY_TOKEN = config("GATEWAY_AUTHORITY_TOKEN", default="", cast=str)
 GATEWAY_ADMISSION_ENABLED = config("GATEWAY_ADMISSION_ENABLED", default=False, cast=bool)
 

@@ -22,6 +22,7 @@ from rest_framework.views import APIView
 
 from core.api.api import CurrentProfileMixin
 from apps.meetings.services.gateway_state import next_update, snapshot
+from apps.meetings.services.gateway_telemetry import observe_frame
 from apps.meetings.services.gateway_tickets import GatewayDenied
 
 POLL_SECONDS = 1
@@ -141,7 +142,9 @@ async def state_stream(
                 return
             if update:
                 cursor = update[1]
-                yield encode_frame(update)
+                frame = encode_frame(update)
+                observe_frame(update)
+                yield frame
                 heartbeat = time.monotonic()
             else:
                 replay = False

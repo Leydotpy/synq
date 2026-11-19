@@ -51,6 +51,70 @@ async def cancellable_django(scope, receive, send):
         raise
 
 
+async def build_test_gateway(fixture, directory, server, url, *, metrics_token_file=""):
+    """Use the real Django ASGI authority, Janus runtime and Broka clients."""
+    import httpx2 as httpx
+    from jrtc_signalling.app import create_app
+    from jrtc_signalling.auth import AuthConfig, HTTPAuthority
+    from jrtc_signalling.bus import BusConfig, TrustedKey, Verifier
+    from jrtc_signalling.config import Settings
+    from jrtc_signalling.janus_runtime import JanusConfig, JanusRuntime
+
+    bus = BusConfig(
+        url,
+        fixture.owner,
+        Verifier(
+            {
+                fixture.bus.signer.key_id: TrustedKey(
+                    "django-control", fixture.bus.signer.key.public_key()
+                )
+            }
+        ),
+        str(directory / "inbox.sqlite3"),
+        "https://testserver/api/v1/meetings/internal/gateway/commands/authorize/",
+        "test-service-" + "x" * 32,
+    )
+    runtime = JanusRuntime(
+        bus,
+        JanusConfig(
+            f"ws://127.0.0.1:{server.port}/",
+            server.secret,
+            "https://testserver/api/v1/meetings/internal/gateway/owners/",
+            (str(fixture.session.pk),),
+        ),
+    )
+    await runtime.authority.client.aclose()
+    runtime.authority.client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=cancellable_django)
+    )
+    await runtime.control.authority.client.aclose()
+    runtime.control.authority.client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=cancellable_django)
+    )
+    auth = AuthConfig(
+        "https://synq.example",
+        {"test-key": fixture.key.public_key()},
+        frozenset({"https://meet.example"}),
+        "https://testserver/api/v1/meetings/internal/gateway/authority/",
+        bus.authority_token,
+    )
+    app = create_app(
+        Settings(
+            media_rehearsal=True,
+            lifecycle_events=True,
+            shutdown_timeout=30,
+            metrics_token_file=metrics_token_file,
+        ),
+        runtime_factory=lambda: runtime,
+        auth_config=auth,
+        authority_factory=lambda config: HTTPAuthority(
+            config,
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=cancellable_django)),
+        ),
+    )
+    return runtime, app
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gateway", type=Path, required=True)
@@ -83,11 +147,7 @@ def main():
     from redis.asyncio import Redis
     from test_janus_live import JanusServer
 
-    from jrtc_signalling.app import create_app
-    from jrtc_signalling.auth import AuthConfig, HTTPAuthority
-    from jrtc_signalling.bus import LIFECYCLE, BusConfig, TrustedKey, Verifier
-    from jrtc_signalling.config import Settings
-    from jrtc_signalling.janus_runtime import JanusConfig, JanusRuntime
+    from jrtc_signalling.bus import LIFECYCLE
 
     @override_settings(GATEWAY_STATE_ENABLED=True)
     class StateIntegration(OwnershipFixture, TransactionTestCase):
@@ -125,57 +185,7 @@ def main():
                 url = os.environ["GATEWAY_TEST_REDIS_URL"]
                 server = JanusServer(directory)
                 await server.start()
-                bus = BusConfig(
-                    url,
-                    self.owner,
-                    Verifier(
-                        {
-                            self.bus.signer.key_id: TrustedKey(
-                                "django-control", self.bus.signer.key.public_key()
-                            )
-                        }
-                    ),
-                    str(directory / "inbox.sqlite3"),
-                    "https://testserver/api/v1/meetings/internal/gateway/commands/authorize/",
-                    "test-service-" + "x" * 32,
-                )
-                runtime = JanusRuntime(
-                    bus,
-                    JanusConfig(
-                        f"ws://127.0.0.1:{server.port}/",
-                        server.secret,
-                        "https://testserver/api/v1/meetings/internal/gateway/owners/",
-                        (str(self.session.pk),),
-                    ),
-                )
-                await runtime.authority.client.aclose()
-                runtime.authority.client = httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=cancellable_django)
-                )
-                await runtime.control.authority.client.aclose()
-                runtime.control.authority.client = httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=cancellable_django)
-                )
-                auth = AuthConfig(
-                    "https://synq.example",
-                    {"test-key": self.key.public_key()},
-                    frozenset({"https://meet.example"}),
-                    "https://testserver/api/v1/meetings/internal/gateway/authority/",
-                    bus.authority_token,
-                )
-                app = create_app(
-                    Settings(
-                        media_rehearsal=True, lifecycle_events=True, shutdown_timeout=30
-                    ),
-                    runtime_factory=lambda: runtime,
-                    auth_config=auth,
-                    authority_factory=lambda config: HTTPAuthority(
-                        config,
-                        httpx.AsyncClient(
-                            transport=httpx.ASGITransport(app=cancellable_django)
-                        ),
-                    ),
-                )
+                runtime, app = await build_test_gateway(self, directory, server, url)
                 worker = GatewayEventWorker(replace(self.bus, redis_url=url))
                 task = asyncio.create_task(worker.run())
                 peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
