@@ -5,6 +5,7 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 from jrtc_signalling.telemetry import Histogram, trace_ref
 
+from apps.meetings.exceptions import MeetingPermissionDeniedError
 from apps.meetings.models import GatewayLifecycleQuarantine
 from apps.meetings.services import gateway_telemetry as telemetry
 
@@ -12,6 +13,13 @@ from apps.meetings.services import gateway_telemetry as telemetry
 class GatewayTelemetryTests(TestCase):
     path = "/api/v1/meetings/internal/gateway/metrics/"
     key = b"a" * 32
+
+    def test_permission_exception_logs_only_its_class(self):
+        detail = "Denied for fixture-only room and participant"
+        with patch("apps.meetings.exceptions.logger") as log:
+            error = MeetingPermissionDeniedError(detail)
+        self.assertEqual(str(error), detail)
+        log.error.assert_called_once_with("meeting.MeetingPermissionDeniedError")
 
     def test_meeting_request_logs_discard_private_context(self):
         session = "00000000-0000-4000-8000-000000000018"

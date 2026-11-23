@@ -26,6 +26,8 @@ jobs:
       UV_PYTHON: "3.14"
       GATEWAY_TEST_REDIS_URL: redis://127.0.0.1:6379/15
       GATEWAY_TEST_DB_PASSWORD: test-only-password
+      # Expected constraint failures must not disclose fixture rows in service logs.
+      PGOPTIONS: "-c log_error_verbosity=terse -c log_min_error_statement=panic"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78

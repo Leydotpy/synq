@@ -12,12 +12,8 @@ class MeetingDomainError(Exception):
 
     def __init__(self, msg: str) -> None:
         super().__init__(msg)
+        logger.error(f"meeting.{type(self).__name__}")
 
-        self._logger = get_logger(self.__class__.__name__)
-        self._logger.error(
-            f"{self.__class__.__name__} error!",
-            message=msg,
-        )
 
 class MeetingPermissionDeniedError(PermissionDenied, MeetingDomainError):
     """Raised when a user attempts an action without the required coordinator privileges."""
