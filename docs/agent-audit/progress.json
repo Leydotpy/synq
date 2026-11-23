@@ -627,6 +627,23 @@
           "https://github.com/Leydotpy/synq/actions/runs/44463194571",
           "https://github.com/Leydotpy/jrtc-signalling/actions/runs/44463084544"
         ]
+      },
+      {
+        "id": "SG-17",
+        "status": "ready_for_review",
+        "baseline_commit": "b9bbd51a380d7db02bce33a30ce802df5fe00aeb",
+        "implementation": "present",
+        "verification": "runtime_subset_passed",
+        "evidence": "docs/gateway-control-plane.md",
+        "notes": "261 PostgreSQL/Redis tests passed. The isolated canary carried gateway and legacy audio at the same time. Pending commands and unreleased ownership blocked recreation. Janus rejected the old session before the legacy replacement published audio. The ended session replayed its terminal state through SSE.",
+        "review_status": "pending_maintainer_review",
+        "implementation_commit": "de06dd041cd2b4b54693ebf60d4291cae37ac88f",
+        "last_updated": "2026-11-23",
+        "verification_evidence": [
+          "scripts/check_gateway_cutover.py",
+          "src/apps/meetings/tests/test_gateway_cutover.py",
+          "https://github.com/Leydotpy/synq/actions/runs/44571821543"
+        ]
       }
     ]
   }
