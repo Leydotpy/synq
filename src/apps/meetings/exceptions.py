@@ -12,7 +12,7 @@ class MeetingDomainError(Exception):
 
     def __init__(self, msg: str) -> None:
         super().__init__(msg)
-        logger.error(f"meeting.{type(self).__name__}")
+        logger.error("meeting.domain_error", message=type(self).__name__)
 
 
 class MeetingPermissionDeniedError(PermissionDenied, MeetingDomainError):

@@ -16,10 +16,12 @@ class GatewayTelemetryTests(TestCase):
 
     def test_permission_exception_logs_only_its_class(self):
         detail = "Denied for fixture-only room and participant"
-        with patch("apps.meetings.exceptions.logger") as log:
+        with patch("apps.meetings.exceptions.logger.error", autospec=True) as log_error:
             error = MeetingPermissionDeniedError(detail)
         self.assertEqual(str(error), detail)
-        log.error.assert_called_once_with("meeting.MeetingPermissionDeniedError")
+        log_error.assert_called_once_with(
+            "meeting.domain_error", message="MeetingPermissionDeniedError"
+        )
 
     def test_meeting_request_logs_discard_private_context(self):
         session = "00000000-0000-4000-8000-000000000018"
