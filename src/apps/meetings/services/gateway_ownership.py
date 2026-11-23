@@ -92,10 +92,8 @@ def ownership_request(packet, *, config=None, now=None):
         raise GatewayDenied("UNAVAILABLE", 503)
     incarnation = uuid.UUID(request["incarnation"])
     with transaction.atomic():
-        session = (
-            MeetingSession.objects.select_for_update(of=("self",))
-            .select_related("room")
-            .get(pk=request["meeting_id"])
+        session = MeetingSession.objects.select_for_update().get(
+            pk=request["meeting_id"]
         )
         if session.signalling_backend != "gateway":
             raise GatewayDenied("FORBIDDEN", 403)
@@ -104,11 +102,9 @@ def ownership_request(packet, *, config=None, now=None):
             "ended",
             "failed",
         }
-        # Let an authenticated holder finish disposal on its original deadline when
-        # the renewal timer races a staged termination. A new owner cannot claim.
-        finishing = (
-            ended and action == "renew" and session.room.gateway_canary is not None
-        )
+        # Every gateway session can have a terminal command delayed by the broker.
+        # The existing holder may read its remaining time to finish disposal.
+        finishing = ended and action == "renew"
         if action != "release" and (
             (ended and not finishing)
             or not settings.GATEWAY_ADMISSION_ENABLED

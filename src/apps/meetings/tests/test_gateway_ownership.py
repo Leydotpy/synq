@@ -197,6 +197,33 @@ class OwnershipTests(OwnershipFixture, TestCase):
             GatewayOwnerGeneration.objects.filter(session=self.session).count(), 2
         )
 
+    def test_end_preserves_only_the_current_holders_original_cleanup_deadline(self):
+        self.assertIsNone(self.room.gateway_canary)
+        self.request("claim")
+        route = GatewayCommandRoute.objects.get(session=self.session)
+        deadline = route.lease_expires_at
+        self.session.lifecycle_state = "ended"
+        self.session.save(update_fields=["lifecycle_state"])
+
+        def at(command, now):
+            return ownership_request(command, config=self.bus, now=now)
+
+        remaining = deadline - timedelta(seconds=2)
+        self.assertEqual(at(self.packet("renew", 1), remaining)["lease_seconds"], 2)
+        route.refresh_from_db()
+        self.assertEqual(route.lease_expires_at, deadline)
+        for packet in (
+            self.packet("claim", incarnation=str(uuid.uuid4())),
+            self.packet("renew", 1, incarnation=str(uuid.uuid4())),
+            self.packet("renew", 2),
+        ):
+            with self.assertRaises(GatewayDenied):
+                at(packet, remaining)
+        with self.assertRaises(GatewayDenied):
+            at(self.packet("renew", 1), deadline)
+        with self.assertRaises(GatewayDenied):
+            self.issue(self.host)
+
     def test_old_claim_cannot_return_after_multiple_releases(self):
         old = self.packet()
         ownership_request(old, config=self.bus)
