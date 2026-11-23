@@ -494,7 +494,7 @@ LOG_COLOR = config("LOGVISTA_COLOR", default="auto", cast=str).strip().lower()
 # Django invokes this only after the complete settings module has loaded. This
 # matters because production.py/local.py finalize DEBUG after importing base.py.
 LOGGING_CONFIG = "conf.logging.configure_logging"
-LOGGING = {"version": 1}
+LOGGING = {}
 
 # Additive gateway control-plane rehearsal; legacy transport remains selected.
 GATEWAY_TICKETS_ENABLED = config("GATEWAY_TICKETS_ENABLED", default=False, cast=bool)

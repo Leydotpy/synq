@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import logging
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
@@ -11,6 +12,39 @@ from apps.meetings.services import gateway_telemetry as telemetry
 class GatewayTelemetryTests(TestCase):
     path = "/api/v1/meetings/internal/gateway/metrics/"
     key = b"a" * 32
+
+    def test_meeting_request_logs_discard_private_context(self):
+        session = "00000000-0000-4000-8000-000000000018"
+        path = f"/api/v1/meetings/sessions/{session}/gateway/state/"
+        with self.assertLogs("django.request", level="WARNING") as captured:
+            response = self.client.get(path, secure=True)
+        self.assertIn(response.status_code, (401, 403, 404))
+        record = captured.records[-1]
+        self.assertEqual(
+            record.getMessage(), f"Meeting HTTP response ({response.status_code})"
+        )
+        self.assertIsNone(record.request)
+        self.assertIsNone(record.exc_info)
+
+    def test_access_log_keeps_status_without_private_path_query_or_address(self):
+        from uvicorn.logging import AccessFormatter
+
+        path = "/api/v1/meetings/rooms/example/?value=fixture-only"
+        with self.assertLogs("uvicorn.access", level="INFO") as captured:
+            logging.getLogger("uvicorn.access").info(
+                '%s - "%s %s HTTP/%s" %d', "private-client", "GET", path, "1.1", 403
+            )
+        formatter = AccessFormatter(
+            "%(client_addr)s %(request_line)s %(status_code)s", use_colors=False
+        )
+        line = formatter.format(captured.records[0])
+        self.assertIn("403", line)
+        self.assertNotIn("private-client", line)
+        self.assertNotIn("example", line)
+        self.assertNotIn("fixture-only", line)
+        with self.assertLogs("django.request", level="WARNING") as unrelated:
+            logging.getLogger("django.request").warning("Status for %s", "/health/")
+        self.assertEqual(unrelated.records[0].getMessage(), "Status for /health/")
 
     def test_off_without_configuration(self):
         self.assertEqual(self.client.get(self.path, secure=True).status_code, 404)
