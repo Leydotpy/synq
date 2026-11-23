@@ -16,7 +16,11 @@ from apps.meetings.models import (
     ParticipantStatus,
 )
 from apps.meetings.services.gateway_outbox import enabled, record_authorization_intent
-from apps.meetings.services.gateway_tickets import GatewayDenied, advance_epoch
+from apps.meetings.services.gateway_tickets import (
+    GatewayDenied,
+    advance_epoch,
+    rejected_join_requests,
+)
 from apps.meetings.services.lifecycle import (
     MeetingLifecycleService,
     record_session_event,
@@ -102,6 +106,8 @@ def request_intent(
         with transaction.atomic():
             session = _session(session_id)
             profile = _profile(profile_id)
+            if rejected_join_requests(session).filter(profile=profile).exists():
+                raise GatewayDenied()
             membership = _membership(session, profile)
             existing = (
                 Participant.objects.select_for_update()
@@ -122,11 +128,6 @@ def request_intent(
                     return _snapshot(existing, existing.join_request)
                 if existing.status != ParticipantStatus.WAITING:
                     raise GatewayDenied()
-            # A rejected request does not become direct-entry when room policy changes.
-            if session.join_requests.filter(
-                profile=profile, status=MeetingJoinRequestStatus.REJECTED
-            ).exists():
-                raise GatewayDenied()
             durable = MeetingLifecycleService._has_durable_direct_entry(
                 room=session.room, profile=profile, membership=membership
             )
@@ -280,6 +281,12 @@ def review_intent(
             raise GatewayDenied("STALE_AUTHORIZATION", 409)
         if approve:
             # Recheck subject activity and role at the decision, never trust requested_role.
+            if (
+                rejected_join_requests(session)
+                .filter(profile_id=intent.profile_id)
+                .exists()
+            ):
+                raise GatewayDenied()
             subject = _profile(intent.profile_id)
             subject_membership = _membership(session, subject)
             participant.membership = subject_membership

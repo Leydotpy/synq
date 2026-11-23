@@ -36,7 +36,7 @@ from apps.meetings.models import (
     RealtimeConnectionStatus,
 )
 from apps.meetings.services.permissions import MeetingPermissionService
-from apps.meetings.services.gateway_tickets import advance_epoch
+from apps.meetings.services.gateway_tickets import advance_epoch, rejected_join_requests
 from apps.meetings.services.gateway_outbox import enabled as gateway_admission_enabled, record_authorization_intent, record_meeting_termination
 from apps.meetings.services.invitations import MeetingInvitationService
 from core.utils import generate_short_code
@@ -410,10 +410,12 @@ class MeetingLifecycleService:
 
     @staticmethod
     def _validate_profile_not_removed(*, session: MeetingSession, profile) -> None:
-        """Keep a moderator removal in force for the lifetime of a session."""
+        """Honor removals and gateway waiting-room decisions for this session."""
 
         if session.participants.filter(profile=profile, status=ParticipantStatus.REMOVED).exists():
             raise MeetingDomainError("This participant was removed from the session and cannot rejoin.")
+        if session.signalling_backend == "gateway" and rejected_join_requests(session).filter(profile=profile).exists():
+            raise MeetingDomainError("Admission to this session was denied.")
 
     @staticmethod
     def _validate_join_gate(
@@ -512,8 +514,7 @@ class MeetingLifecycleService:
                 session=session,
                 profile=profile,
             ).first()
-            if participant and participant.status == ParticipantStatus.REMOVED:
-                raise MeetingDomainError("This participant was removed from the session and cannot rejoin.")
+            MeetingLifecycleService._validate_profile_not_removed(session=session, profile=profile)
             was_present = bool(
                 participant
                 and participant.status not in {ParticipantStatus.LEFT, ParticipantStatus.REMOVED}
@@ -635,8 +636,7 @@ class MeetingLifecycleService:
                     session=session,
                     profile=join_request.profile,
                 ).first()
-                if existing_participant and existing_participant.status == ParticipantStatus.REMOVED:
-                    raise MeetingDomainError("This participant was removed from the session and cannot rejoin.")
+                MeetingLifecycleService._validate_profile_not_removed(session=session, profile=join_request.profile)
                 if existing_participant is None or existing_participant.status == ParticipantStatus.LEFT:
                     MeetingLifecycleService._validate_session_capacity(session=session)
                 membership = MeetingPermissionService.get_room_membership(room=join_request.room, profile_or_user=join_request.profile)

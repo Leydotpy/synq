@@ -10,6 +10,7 @@ import uuid
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from apps.meetings.models import (
@@ -24,6 +25,7 @@ from apps.meetings.services.gateway_tickets import (
     MAX_COUNTER,
     GatewayDenied,
     current_permissions,
+    rejected_join_requests,
 )
 
 RETAIN = 256
@@ -71,6 +73,7 @@ def _audience(session, profile_id):
     if terminal:
         if (
             participant.status not in ADMITTED | {ParticipantStatus.LEFT}
+            or rejected_join_requests(session).filter(profile_id=profile_id).exists()
             or not participant.profile.is_active
             or not participant.profile.user.is_active
         ):
@@ -109,6 +112,11 @@ def _materialize(session, now):
         "join_request",
         "join_request__profile",
         "join_request__reviewed_by_profile",
+    )
+    participants = participants.annotate(
+        prior_gateway_denial=Exists(
+            rejected_join_requests(session).filter(profile_id=OuterRef("profile_id"))
+        )
     )
     for p in participants:
         grant = getattr(p, "gateway_grant", None)

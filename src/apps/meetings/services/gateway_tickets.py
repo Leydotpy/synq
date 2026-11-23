@@ -87,6 +87,10 @@ def advance_epoch(participant: Participant) -> None:
     participant.authorization_epoch += 1
 
 
+def rejected_join_requests(session: MeetingSession):
+    return session.join_requests.filter(status=MeetingJoinRequestStatus.REJECTED)
+
+
 def current_permissions(
     participant: Participant, session: MeetingSession
 ) -> tuple[list[str], dict]:
@@ -102,6 +106,16 @@ def current_permissions(
         raise GatewayDenied()
     if not participant.profile.is_active or not participant.profile.user.is_active:
         raise GatewayDenied()
+    if session.signalling_backend == "gateway":
+        rejected = getattr(participant, "prior_gateway_denial", None)
+        if rejected is None:
+            rejected = (
+                rejected_join_requests(session)
+                .filter(profile_id=participant.profile_id)
+                .exists()
+            )
+        if rejected:
+            raise GatewayDenied()
     if participant.role not in MeetingRole.values:
         raise GatewayDenied()
     if participant.role in {MeetingRole.HOST, MeetingRole.CO_HOST}:

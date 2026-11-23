@@ -108,7 +108,11 @@ def main():
             api = f"https://127.0.0.1:{api_port}"
             gateway = f"wss://127.0.0.1:{gateway_port}/ws"
             identities = {}
-            for name, profile in (("host", self.host), ("guest", self.guest)):
+            for name, profile in (
+                ("host", self.host),
+                ("guest", self.guest),
+                ("denied", self.profile("denied")),
+            ):
                 client = APIClient()
                 client.force_login(profile.user)
                 identities[name] = {

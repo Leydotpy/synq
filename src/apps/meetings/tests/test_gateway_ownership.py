@@ -6,7 +6,7 @@ import uuid
 from datetime import timedelta
 from unittest.mock import patch
 
-from apps.meetings.exceptions import JanusGatewayError
+from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
 from apps.meetings.services.janus import (
     call_video_room_management_method,
     resolve_janus_session,
@@ -28,9 +28,12 @@ from rest_framework.test import APIClient
 from apps.meetings.models import (
     GatewayCommandRoute,
     GatewayOwnerGeneration,
+    MeetingAccessPolicy,
+    MeetingJoinRequestStatus,
     MeetingSession,
     ParticipantStatus,
 )
+from apps.meetings.services.gateway_admission import request_intent
 from apps.meetings.services.gateway_commands import prepare_delivery
 from apps.meetings.services.gateway_ownership import ownership_request
 from apps.meetings.services.gateway_tickets import GatewayDenied
@@ -96,6 +99,59 @@ class OwnershipFixture(GatewayAdmissionFixture):
 
 
 class OwnershipTests(OwnershipFixture, TestCase):
+    def test_lobby_denial_survives_room_policy_changes_and_compatibility_admission(
+        self,
+    ):
+        self.intent()
+        self.decision(approve=False)
+        self.room.access_policy = MeetingAccessPolicy.OPEN
+        self.room.save(update_fields=["access_policy"])
+
+        for admit in (Lifecycle.request_join, Lifecycle.request_admission):
+            with (
+                self.subTest(method=admit.__name__),
+                self.assertRaises(MeetingDomainError),
+            ):
+                admit(session=self.session, profile=self.guest)
+        self.assertEqual(
+            self.session.join_requests.filter(profile=self.guest).count(), 1
+        )
+        with self.assertRaises(GatewayDenied):
+            self.issue(self.guest)
+        other = self.profile("other-guest")
+        self.assertEqual(
+            request_intent(session_id=self.session.pk, profile_id=other.pk)[
+                "participant_status"
+            ],
+            ParticipantStatus.ADMITTED,
+        )
+
+    @override_settings(GATEWAY_STATE_ENABLED=True)
+    def test_prior_denial_controls_existing_rows_and_terminal_state_access(self):
+        from apps.meetings.services.gateway_state import snapshot
+
+        self.intent()
+        self.decision(approve=False)
+        # Existing installations can contain a later participant or pending request.
+        pending = self.session.join_requests.create(room=self.room, profile=self.guest)
+        with self.assertRaises(MeetingDomainError):
+            Lifecycle.review_join_request(
+                join_request=pending, reviewer_profile=self.host, approve=True
+            )
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, MeetingJoinRequestStatus.PENDING)
+
+        self.guest_participant.status = ParticipantStatus.ADMITTED
+        self.guest_participant.save(update_fields=["status"])
+        with self.assertRaises(GatewayDenied):
+            request_intent(session_id=self.session.pk, profile_id=self.guest.pk)
+        with self.assertRaises(GatewayDenied):
+            self.issue(self.guest)
+        self.session.lifecycle_state = "ended"
+        self.session.save(update_fields=["lifecycle_state"])
+        with self.assertRaises(GatewayDenied):
+            snapshot(session_id=self.session.pk, profile_id=self.guest.pk)
+
     def test_cohort_is_fixed_at_creation_and_host_is_not_media_present(self):
         self.assertEqual(self.session.signalling_backend, "gateway")
         self.assertEqual(self.participant.status, ParticipantStatus.ADMITTED)
