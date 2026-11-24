@@ -363,9 +363,11 @@
         "src/apps/meetings/tests/test_legacy_retirement.py",
         "scripts/check_gateway_cutover.py",
         "scripts/check_gateway_browser.py",
-        ".github/workflows/gateway-control-plane.yml"
+        ".github/workflows/gateway-control-plane.yml",
+        "https://github.com/Leydotpy/synq/actions/runs/45454502343"
       ],
-      "notes": "205 PostgreSQL tests, five live gateway probes, 63 gateway ICE tests and the paired React/Chromium suite passed. Full discovery reproduces seven baseline launcher failures. One historical gateway comparator imports the retired Django ICE module. Production drain and operator approval are outstanding."
+      "notes": "205 PostgreSQL tests, five live gateway probes, 63 gateway ICE tests and the paired React/Chromium suite passed. Full discovery reproduces seven baseline launcher failures. One historical gateway comparator imports the retired Django ICE module. Production drain and operator approval are outstanding.",
+      "implementation_commit": "78d76a3052295ee63bbbe06678f9f2821166099e"
     }
   ],
   "verification_limits": "Full Django tests were not run: this environment has Python 3.12.14, whereas Synq declares Python >=3.14, and Django/Broka dependencies are unavailable. A focused AST extraction executed the actual trickle method with infrastructure doubles; final-three and empty-incomplete both called only complete_trickle. This establishes control flow, not database or Janus integration.",

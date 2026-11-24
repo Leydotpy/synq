@@ -30,6 +30,8 @@ For the checks on this branch, Synq's lock installed gateway runtime `8ad22c05f1
 
 ## Verification on the review branch
 
+GitHub Actions passed on implementation commit `78d76a3052295ee63bbbe06678f9f2821166099e`. The hosted run repeated the 205 Django tests against PostgreSQL 16, all 63 gateway ICE checks, the migration and drain checks, and all five live integration probes. The separate paired-client results below were collected locally. [Hosted verification](https://github.com/Leydotpy/synq/actions/runs/45454502343)
+
 Checks used disposable PostgreSQL 17, Redis, Janus 1.1.2, coturn, Chromium 143 and Python 3.14.10. No production credentials, records or service endpoints were used. The commands below take the test database and Redis settings from the environment. `../gateway` and `../client` refer to the revisions above.
 
 | Check | Result |
