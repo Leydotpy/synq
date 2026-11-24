@@ -49,7 +49,6 @@ def main():
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.x509.oid import NameOID
     from django.conf import settings
-    from django.core.handlers.asgi import ASGIHandler
     from django.http import HttpRequest
     from django.middleware.csrf import get_token
     from django.test import TransactionTestCase, override_settings
@@ -97,6 +96,31 @@ def main():
         ALLOWED_HOSTS=["testserver", "localhost", "127.0.0.1"],
     )
     class BrowserIntegration(OwnershipFixture, TransactionTestCase):
+        def test_early_disconnect_closes_request_database_connection(self):
+            opened = []
+
+            @sync_to_async
+            def open_request_connection():
+                db = connections["default"]
+                db.ensure_connection()
+                return db.connection
+
+            async def disconnect():
+                # Hold the real driver connection so garbage collection cannot
+                # conceal a missed close when Django aborts before dispatch.
+                opened.append(await open_request_connection())
+                return {"type": "http.disconnect"}
+
+            async def unexpected_response(_message):
+                self.fail("Django sent a response after the client disconnected")
+
+            asyncio.run(
+                cancellable_django({"type": "http"}, disconnect, unexpected_response)
+            )
+            self.assertEqual(len(opened), 1)
+            self.addCleanup(opened[0].close)
+            self.assertTrue(opened[0].closed)
+
         def test_browser_admission_media_state_and_revocation(self):
             observer = patch(
                 "jrtc_video.plugin.parse_videoroom_response",
@@ -283,7 +307,7 @@ def main():
                     if path.endswith("/tickets/"):
                         counters["tickets"] += 1
                     if not path.endswith("/events/"):
-                        await ASGIHandler()(scope, receive, send)
+                        await cancellable_django(scope, receive, send)
                         return
                     counters["sse_requests"] += 1
                     if dict(scope["headers"]).get(b"last-event-id"):
@@ -327,7 +351,7 @@ def main():
                         else:
                             await send(message)
 
-                    await ASGIHandler()(scope, stream_receive, stream_send)
+                    await cancellable_django(scope, stream_receive, stream_send)
 
                 subject = x509.Name(
                     [x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]
@@ -446,17 +470,17 @@ def main():
                 finally:
                     for server in servers:
                         server.should_exit = True
-                    await asyncio.wait_for(
-                        asyncio.gather(*server_tasks, return_exceptions=True), 40
-                    )
-                    for worker in workers:
-                        worker.stop.set()
-                    for task in worker_tasks:
-                        task.cancel()
-                    await asyncio.gather(*worker_tasks, return_exceptions=True)
-                    await turn.close()
-                    await janus.stop()
-                    await sync_to_async(connections.close_all, thread_sensitive=True)()
+                    try:
+                        await asyncio.wait_for(asyncio.gather(*server_tasks), 40)
+                    finally:
+                        for worker in workers:
+                            worker.stop.set()
+                        try:
+                            await asyncio.wait_for(asyncio.gather(*worker_tasks), 10)
+                        finally:
+                            await turn.close()
+                            await janus.stop()
+                            await sync_to_async(connections.close_all)()
 
             with (
                 tempfile.TemporaryDirectory() as directory,

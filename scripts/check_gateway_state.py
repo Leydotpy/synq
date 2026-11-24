@@ -16,13 +16,15 @@ from unittest.mock import patch
 
 
 async def cancellable_django(scope, receive, send):
-    """Model an actual disconnect when an in-process HTTP client is cancelled.
+    """Drain Django requests and release their database connections on disconnect.
 
     httpx's ASGI transport cancels the application task rather than sending the
     disconnect an ASGI server would send. Let Django close its request children.
     The SSE probe below uses its own explicit ASGI disconnect unchanged.
     """
+    from asgiref.sync import ThreadSensitiveContext, sync_to_async
     from django.core.handlers.asgi import ASGIHandler
+    from django.db import connections
 
     disconnected = asyncio.Event()
 
@@ -42,13 +44,18 @@ async def cancellable_django(scope, receive, send):
                     child.cancel()
             await asyncio.gather(incoming, cancelled, return_exceptions=True)
 
-    task = asyncio.create_task(ASGIHandler()(scope, read, send))
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        disconnected.set()
-        await asyncio.wait_for(task, 5)
-        raise
+    # An early disconnect can skip request_finished. Keep the request's ORM
+    # thread alive until it has closed its own connections.
+    async with ThreadSensitiveContext():
+        task = asyncio.create_task(ASGIHandler()(scope, read, send))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            disconnected.set()
+            await asyncio.wait_for(task, 5)
+            raise
+        finally:
+            await sync_to_async(connections.close_all)()
 
 
 async def build_test_gateway(
