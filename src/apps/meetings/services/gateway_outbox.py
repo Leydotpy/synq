@@ -9,15 +9,7 @@ from apps.meetings.services.gateway_tickets import GatewayDenied, current_permis
 
 def enabled(session):
     return (
-        getattr(settings, "GATEWAY_ADMISSION_ENABLED", False)
-        and (
-            session.signalling_backend == "gateway"
-            or (
-                not settings.GATEWAY_STAGED_ROUTING
-                and session.room.gateway_canary is None
-                and session.room.feature_flags.get("gateway_control_plane") is True
-            )
-        )
+        settings.GATEWAY_ADMISSION_ENABLED and session.signalling_backend == "gateway"
     )
 
 
@@ -29,7 +21,7 @@ def record_authorization_intent(
     actor_profile=None,
     reason_code="permission_changed",
 ):
-    if not enabled(session):
+    if session.signalling_backend != "gateway":
         return None
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("Authorization intent requires a decision transaction.")
@@ -83,7 +75,7 @@ def record_authorization_intent(
 
 
 def record_meeting_termination(*, session, actor_profile=None):
-    if not enabled(session):
+    if session.signalling_backend != "gateway":
         return None
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("Authorization intent requires a decision transaction.")

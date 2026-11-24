@@ -84,17 +84,19 @@ class SignallingRouteView(APIView):
             credentials(request)
         session = get_object_or_404(MeetingSession, pk=session_id)
         headers = {"Cache-Control": "private, no-store"}
-        if session.ended_at is not None or session.lifecycle_state in {
-            "ended",
-            "failed",
-        }:
-            return response.Response(status=410, headers=headers)
         if (
-            session.signalling_backend == "gateway"
-            and not GatewayCommandRoute.objects.filter(
-                session=session, released=False, lease_expires_at__gt=timezone.now()
-            ).exists()
+            session.signalling_backend != "gateway"
+            or session.ended_at is not None
+            or session.lifecycle_state
+            in {
+                "ended",
+                "failed",
+            }
         ):
+            return response.Response(status=410, headers=headers)
+        if not GatewayCommandRoute.objects.filter(
+            session=session, released=False, lease_expires_at__gt=timezone.now()
+        ).exists():
             return response.Response(
                 status=503, headers={**headers, "Retry-After": "2"}
             )

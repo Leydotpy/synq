@@ -14,20 +14,23 @@ dependencies = [
     "django-guardian>=3.3.3",
     "django-redis>=7.0.0",
     "djangorestframework>=3.17.1",
-    "fastapi>=0.140.0",
     "gunicorn>=26.0.0",
-    "aio-pika>=10.0.1,<11",
-    "jrtc[kafka]>=3.2,<4",
-    "jrtc-video>=3.0.3,<4",
     "logvista>=0.1,<1",
     "python-decouple>=3.8",
-    "python-socketio>=5.16.3",
     "redis>=8.0.1",
-    "starlette>=1.3.1",
     "uvicorn>=0.51.0",
     "psycopg[binary,pool]>=3.3.4",
     "PyJWT[crypto]>=2.10.1,<3",
     "jrtc-signalling[bus]>=0.1,<0.2",
+]
+
+[dependency-groups]
+# Live acceptance starts a separate gateway process and actual media peers.
+gateway-integration = [
+    "jrtc-signalling[runtime]>=0.1,<0.2",
+    "aiortc",
+    "pytest",
+    "pytest-asyncio>=1.4,<2",
 ]
 
 [tool.uv]

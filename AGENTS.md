@@ -63,3 +63,7 @@ uv run python src/manage.py test apps.meetings.tests.test_jrtc_signaling_contrac
 ```
 
 These are required follow-up gates, not claims that they passed in this audit. See the audit for what actually ran. A final completion report must include cross-repository compatibility and any live checks required by the selected concern.
+
+## Gateway-only retirement branch (24 November 2026)
+
+On `codex/retire-legacy-signalling`, SYNQ-LEGACY-RETIRE-01 supersedes the earlier instructions to run a Django Socket.IO/Janus owner. Django serves HTTP/SSE and persists the authority, signed gateway work and projections. The separate gateway owns media. Preserve the historical field aliases, schema and outstanding records on upgrades. Use the current [retirement report](docs/legacy-signalling-cleanup-report.md) and [branch workflow](.github/workflows/gateway-control-plane.yml) for verification and rollback. Merge and production decommissioning require operator approval and evidence of a completed drain.

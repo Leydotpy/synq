@@ -491,7 +491,6 @@ def main():
                 override_settings(
                     GATEWAY_TICKET_TTL_SECONDS=24,
                     CSRF_TRUSTED_ORIGINS=[api],
-                    SOCKET_IO_REDIS_URL=os.environ["GATEWAY_TEST_REDIS_URL"],
                 ),
             ):
                 asyncio.run(exercise(Path(directory)))

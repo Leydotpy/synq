@@ -34,7 +34,6 @@ class GatewayCommandStreamsTests(GatewayCommandFixture, TransactionTestCase):
     def setUp(self):
         for target in (
             "apps.meetings.services.lifecycle.dispatch_task",
-            "apps.meetings.realtime.emitter.MeetingSocketEmitter",
         ):
             mock = patch(target)
             mock.start()

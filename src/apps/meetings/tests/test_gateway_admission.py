@@ -306,7 +306,9 @@ class GatewayAdmissionTests(GatewayAdmissionFixture, TestCase):
             ).exists()
         )
 
-    def test_default_flag_and_room_selection_are_required(self):
+    def test_disabled_admission_fails_closed_and_room_flags_cannot_reroute_a_session(
+        self,
+    ):
         with (
             override_settings(GATEWAY_ADMISSION_ENABLED=False),
             self.assertRaises(GatewayDenied),
@@ -314,8 +316,7 @@ class GatewayAdmissionTests(GatewayAdmissionFixture, TestCase):
             self.intent()
         self.room.feature_flags = {}
         self.room.save(update_fields=["feature_flags"])
-        with self.assertRaises(GatewayDenied):
-            self.intent()
+        self.assertEqual(self.intent()["participant_status"], ParticipantStatus.WAITING)
 
     def test_http_uses_authenticated_actor_and_rejects_role_and_coerced_booleans(self):
         url = f"/api/v1/meetings/sessions/{self.session.pk}/gateway/join-intents/"
@@ -369,11 +370,8 @@ class GatewayAdmissionRaceTests(GatewayAdmissionFixture, TransactionTestCase):
 
     def setUp(self):
         self.dispatch = patch("apps.meetings.services.lifecycle.dispatch_task")
-        self.emitter = patch("apps.meetings.realtime.emitter.MeetingSocketEmitter")
         self.dispatch.start()
-        self.emitter.start()
         self.addCleanup(self.dispatch.stop)
-        self.addCleanup(self.emitter.stop)
         super().setUp()
 
     def test_concurrent_retries_create_one_decision_and_one_outbox(self):

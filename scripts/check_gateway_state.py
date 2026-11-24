@@ -125,6 +125,18 @@ async def build_test_gateway(
     return runtime, app
 
 
+def use_available_interfaces(test):
+    """Use real loopback UDP when the runner restricts interface enumeration."""
+    from aioice.ice import get_host_addresses
+
+    try:
+        get_host_addresses(use_ipv4=True, use_ipv6=False)
+    except PermissionError:
+        test.enterContext(
+            patch("aioice.ice.get_host_addresses", return_value=["127.0.0.1"])
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gateway", type=Path, required=True)
@@ -162,18 +174,7 @@ def main():
     @override_settings(GATEWAY_STATE_ENABLED=True)
     class StateIntegration(OwnershipFixture, TransactionTestCase):
         def test_real_media_lobby_projection_sse_and_broker_stall(self):
-            from aioice.ice import get_host_addresses
-
-            try:
-                get_host_addresses(use_ipv4=True, use_ipv6=False)
-            except PermissionError:
-                # Restricted local runners cannot enumerate interfaces; actual
-                # media still crosses UDP to Janus on the available loopback.
-                interfaces = patch(
-                    "aioice.ice.get_host_addresses", return_value=["127.0.0.1"]
-                )
-                interfaces.start()
-                self.addCleanup(interfaces.stop)
+            use_available_interfaces(self)
             issued, claims = self.issue()
             self.waiting()
             lobby_ticket, lobby_claims = self.issue(self.guest)

@@ -13,10 +13,9 @@ from django.test import (
 )
 from django.utils import timezone
 
-from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
+from apps.meetings.exceptions import MeetingDomainError
 from apps.meetings.models import GatewayAuthorizationOutbox, GatewayCommandRoute
 from apps.meetings.services.gateway_cutover import drain, set_cohort
-from apps.meetings.services.gateway_ownership import require_legacy
 from apps.meetings.services.gateway_tickets import GatewayDenied, issue_ticket
 from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
 from apps.meetings.tests.test_gateway_ownership import OwnershipFixture
@@ -37,13 +36,10 @@ class CutoverTests(OwnershipFixture, TestCase):
             title="New staged room",
             feature_flags=self.room.feature_flags,
         )
-        dark = self.start(room)
-        self.assertEqual(dark.signalling_backend, "legacy")
+        with self.assertRaisesRegex(MeetingDomainError, "paused"):
+            self.start(room)
+        self.assertFalse(room.sessions.exists())
         set_cohort(room.pk, selected=True)
-        self.assertEqual(self.start(room).pk, dark.pk)
-        with self.assertRaises(GatewayDenied):
-            issue_ticket(session_id=dark.pk, profile_id=self.host.pk)
-        Lifecycle.end_session(session=dark)
         canary = self.start(room)
         self.assertEqual(canary.signalling_backend, "gateway")
         generation = self.request(meeting_id=str(canary.pk))["generation"]
@@ -53,8 +49,8 @@ class CutoverTests(OwnershipFixture, TestCase):
             self.request("renew", generation, meeting_id=str(canary.pk))["generation"],
             generation,
         )
-        with self.assertRaises(JanusGatewayError):
-            require_legacy(canary)
+        with self.assertRaises(GatewayDenied):
+            issue_ticket(session_id=self.legacy_session.pk, profile_id=self.host.pk)
 
     @override_settings(GATEWAY_STAGED_ROUTING=True, GATEWAY_EVENTS_ENABLED=False)
     def test_selected_room_fails_closed_when_stack_is_incomplete(self):
@@ -83,8 +79,8 @@ class CutoverTests(OwnershipFixture, TestCase):
         )
         self.assertIn("no-store", response["Cache-Control"])
         self.assertEqual(
-            self.client.get(url(self.legacy_session), secure=True).json()["backend"],
-            "legacy",
+            self.client.get(url(self.legacy_session), secure=True).status_code,
+            410,
         )
         self.request("release", 1)
         self.assertEqual(
@@ -128,8 +124,11 @@ class CutoverTests(OwnershipFixture, TestCase):
             drain(self.room.pk, uuid4())
         drain(self.room.pk, self.session.pk)
         drain(self.room.pk, self.session.pk)
+        with self.assertRaisesRegex(MeetingDomainError, "paused"):
+            self.start(self.room)
+        set_cohort(self.room.pk, selected=True)
         replacement = self.start(self.room)
-        self.assertEqual(replacement.signalling_backend, "legacy")
+        self.assertEqual(replacement.signalling_backend, "gateway")
         self.assertNotEqual(replacement.pk, self.session.pk)
         with self.assertRaises(MeetingDomainError):
             drain(self.room.pk, self.session.pk)
@@ -163,6 +162,7 @@ class CutoverRaceTests(OwnershipFixture, TransactionTestCase):
             barrier.wait(timeout=5)
             drain(self.room.pk, self.session.pk)
             owned = result.result(timeout=10)
+        set_cohort(self.room.pk, selected=True)
         if owned:
             with self.assertRaises(MeetingDomainError):
                 Lifecycle.start_session(room=self.room, started_by_profile=self.host)
@@ -174,7 +174,7 @@ class CutoverRaceTests(OwnershipFixture, TransactionTestCase):
                 Lifecycle.start_session(
                     room=self.room, started_by_profile=self.host
                 ).signalling_backend,
-                "legacy",
+                "gateway",
             )
             self.assertFalse(
                 GatewayCommandRoute.objects.filter(session=self.session).exists()

@@ -21,7 +21,3 @@ class MeetingPermissionDeniedError(PermissionDenied, MeetingDomainError):
 
 class MeetingJoinRequestStateError(MeetingDomainError):
     """Raised when a join request is modified from an invalid lifecycle state."""
-
-
-class JanusGatewayError(MeetingDomainError):
-    """Raised when Janus room or handle operations fail."""

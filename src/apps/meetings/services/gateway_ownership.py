@@ -4,7 +4,7 @@ import time
 import uuid
 from datetime import timedelta
 
-from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
+from apps.meetings.exceptions import MeetingDomainError
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -19,47 +19,23 @@ from apps.meetings.models import (
 from apps.meetings.services.gateway_tickets import GatewayDenied
 
 
-def selected_backend(room):
-    if room.gateway_canary is not None or settings.GATEWAY_STAGED_ROUTING:
-        if room.gateway_canary is not True:
-            return "legacy"
-        if not all(
-            (
-                settings.GATEWAY_STAGED_ROUTING,
-                settings.GATEWAY_TICKETS_ENABLED,
-                settings.GATEWAY_ADMISSION_ENABLED,
-                settings.GATEWAY_COMMANDS_ENABLED,
-                settings.GATEWAY_RUNTIME_ENABLED,
-                settings.GATEWAY_EVENTS_ENABLED,
-                settings.GATEWAY_STATE_ENABLED,
-            )
-        ):
-            raise MeetingDomainError("The selected gateway cohort is unavailable.")
-        return "gateway"
-    flags = room.feature_flags if isinstance(room.feature_flags, dict) else {}
-    selected = (
-        getattr(settings, "GATEWAY_RUNTIME_ENABLED", False)
-        and getattr(settings, "GATEWAY_ADMISSION_ENABLED", False)
-        and getattr(settings, "GATEWAY_COMMANDS_ENABLED", False)
-        and flags.get("gateway_control_plane") is True
-        and flags.get("gateway_runtime") is True
-    )
-    return "gateway" if selected else "legacy"
-
-
-def require_legacy(session):
-    if session.signalling_backend != "legacy":
-        raise JanusGatewayError("This meeting is owned by the signalling gateway.")
-
-
-def require_legacy_key(session_id):
-    if (
-        session_id is not None
-        and MeetingSession.objects.filter(
-            pk=session_id, signalling_backend="gateway"
-        ).exists()
+def require_gateway_start(room):
+    """A paused room or an incomplete gateway stack cannot start a new meeting."""
+    if room.gateway_canary is False or (
+        settings.GATEWAY_STAGED_ROUTING and room.gateway_canary is not True
     ):
-        raise JanusGatewayError("This meeting is owned by the signalling gateway.")
+        raise MeetingDomainError("Gateway admission is paused for this room.")
+    if not all(
+        (
+            settings.GATEWAY_TICKETS_ENABLED,
+            settings.GATEWAY_ADMISSION_ENABLED,
+            settings.GATEWAY_COMMANDS_ENABLED,
+            settings.GATEWAY_RUNTIME_ENABLED,
+            settings.GATEWAY_EVENTS_ENABLED,
+            settings.GATEWAY_STATE_ENABLED,
+        )
+    ):
+        raise MeetingDomainError("The signalling gateway is unavailable.")
 
 
 def _lease_result(request, route, now):

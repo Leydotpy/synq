@@ -63,12 +63,13 @@ jobs:
           apps.meetings.tests.test_gateway_sdk
           apps.meetings.tests.test_admission_and_invites
           apps.meetings.tests.test_lifecycle_hardening
-          apps.meetings.tests.test_jrtc_signaling_contracts
           apps.meetings.tests.test_jrtc_contracts
           apps.meetings.tests.test_jrtc_persistence_contracts
-          apps.meetings.tests.test_runtime_lifecycle_contracts
-          apps.meetings.tests.test_jrtc_event_plane
-          apps.meetings.tests.test_realtime_namespace
+          apps.meetings.tests.test_invitation_lifecycle
+          apps.meetings.tests.test_invitation_rollout_regressions
+          apps.meetings.tests.test_lifecycle_maintenance
+          apps.meetings.tests.test_celery_schedule_reconciliation
+          apps.meetings.tests.test_legacy_retirement
           --settings=conf.gateway_postgres_test_settings
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -82,35 +83,42 @@ jobs:
           sudo apt-get install -y --no-install-recommends janus redis-server
           sudo systemctl stop janus || true
           dpkg-query --show janus
-      - name: Rehearse staged cutover and failback with live media
+      - name: Check fresh migrations and retained legacy work inventory
+        env:
+          DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
+        run: |
+          uv run --frozen python src/manage.py migrate --noinput
+          uv run --frozen python src/manage.py check_legacy_signalling_drain
+      - name: Verify gateway ICE contracts against the client batch fixtures
+        run: >-
+          uv run --frozen --group gateway-integration python -m pytest -q
+          gateway-integration/tests/test_ice.py gateway-integration/tests/test_ice_signalling.py
+      - name: Rehearse gateway drain and replacement with live media
         env:
           GATEWAY_TEST_REDIS_URL: redis://127.0.0.1:6379/14
           DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
         run: >-
-          uv run --frozen --with pytest --with aiortc python
+          uv run --frozen --group gateway-integration python
           scripts/check_gateway_cutover.py --gateway gateway-integration
       - name: Verify live gateway lifecycle events against Django
         env:
           DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
         run: >-
-          uv run --frozen --with pytest --with aiortc python
+          uv run --frozen --group gateway-integration python
           gateway-integration/scripts/check_django_lifecycle.py --synq .
       - name: Verify live gateway state projection and SSE
         env:
           DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
         run: >-
-          uv run --frozen --with pytest --with aiortc python
+          uv run --frozen --group gateway-integration python
           scripts/check_gateway_state.py --gateway gateway-integration
       - name: Verify two-worker election, routed WSS, crash recovery and rolling SIGTERM
         env:
           DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
         run: >-
-          uv run --frozen --with pytest --with aiortc python
+          uv run --frozen --group gateway-integration python
           scripts/check_gateway_multiworker.py --gateway gateway-integration
-      - name: Compare ICE paths with live audio and isolated broker and Janus faults
+      - name: Measure gateway ICE with live audio and isolated broker and Janus faults
         env:
           DJANGO_SETTINGS_MODULE: conf.gateway_postgres_test_settings
-        run: |
-          for first in legacy gateway; do
-            uv run --frozen --with pytest --with aiortc python scripts/benchmark_gateway_ice.py --gateway gateway-integration --first "$first"
-          done
+        run: uv run --frozen --group gateway-integration python scripts/benchmark_gateway_ice.py --gateway gateway-integration

@@ -91,8 +91,7 @@ class GatewayStateTests(StateFixture, TestCase):
     def test_terminal_meeting_clears_presence_and_reports_end(self):
         self.receive(self.event(state="MEDIA_CONNECTED"))
         start = self.state()
-        with patch("apps.meetings.tasks.queue_janus_room_cleanup"):
-            Lifecycle.end_session(session=self.session, actor_profile=self.host)
+        Lifecycle.end_session(session=self.session, actor_profile=self.host)
         state = self.state()
         self.assertEqual(state["meeting"]["lifecycle"], "ended")
         self.assertFalse(state["can_manage_waiting_room"])
@@ -346,19 +345,18 @@ class GatewayStateTests(StateFixture, TestCase):
         self.assertEqual(state["participants"], [])
         self.assertNotIn("janus", state)
 
-    def test_socket_state_emitter_excluded_only_for_enabled_gateway_cohort(self):
-        from apps.meetings.realtime.emitter import MeetingSocketEmitter
+    def test_old_socket_path_is_gone_and_historical_state_is_fenced(self):
+        from django.core.exceptions import PermissionDenied
+        from apps.meetings.services.state import MeetingStateBuilder
 
-        with patch(
-            "apps.meetings.realtime.emitter.ParticipantConnection.objects.filter"
-        ) as query:
-            MeetingSocketEmitter.emit_session_state(session=self.session)
-            async_to_sync(MeetingSocketEmitter.aemit_session_state)(
-                session=self.session
-            )
-            query.assert_not_called()
-            MeetingSocketEmitter.emit_session_state(session=self.legacy_session)
-            query.assert_called_once()
+        with self.assertRaises(PermissionDenied):
+            MeetingStateBuilder.build(self.legacy_session, self.host)
+        self.assertEqual(
+            self.client.get(
+                "/socket.io/", {"transport": "polling", "EIO": "4"}
+            ).status_code,
+            404,
+        )
 
     def test_role_visibility_change_advances_version(self):
         self.intent()

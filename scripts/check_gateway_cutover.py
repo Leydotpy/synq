@@ -1,4 +1,4 @@
-"""Rehearse an isolated room's staged cutover and failback with actual Janus peers."""
+"""Verify gateway-only routing, physical drain, replacement and terminal SSE with real peers."""
 
 import argparse
 import asyncio
@@ -24,7 +24,6 @@ def main():
     os.environ.setdefault(
         "DJANGO_SETTINGS_MODULE", "conf.gateway_postgres_test_settings"
     )
-    os.environ["SOCKET_IO_REDIS_URL"] = os.environ["GATEWAY_TEST_REDIS_URL"]
     import django
 
     django.setup()
@@ -42,35 +41,22 @@ def main():
     from django.db import connections
     from django.test import TransactionTestCase, override_settings
     from django.test.runner import DiscoverRunner
-    from jrtc.core.exceptions import JanusErrorResponse
-    from jrtc.models.request import KeepAliveRequest
-    from jrtc.models.response import ErrorResponse
-    from jrtc_video import VideoRoomCreateRequest
+    from websockets.asyncio.client import connect
     from media_helpers import Browser, publish_payload
     from test_janus_live import JanusServer
 
     from benchmark_gateway_ice import media_ready
-    from check_gateway_state import build_test_gateway
-    from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
+    from check_gateway_state import build_test_gateway, use_available_interfaces
+    from apps.meetings.exceptions import MeetingDomainError
     from apps.meetings.models import (
         GatewayAuthorizationOutbox,
         GatewayCommandRoute,
-        ParticipantConnection,
     )
-    from apps.meetings.realtime.namespace import MeetingNamespace
     from apps.meetings.services.gateway_cutover import drain, set_cohort
     from apps.meetings.services.gateway_dispatcher import GatewayCommandWorker
     from apps.meetings.services.gateway_event_worker import GatewayEventWorker
     from apps.meetings.services.gateway_state import snapshot
-    from apps.meetings.services.janus import (
-        acall_video_room_management_method as manage,
-    )
-    from apps.meetings.services.janus import janus_room_id_for_session, janus_runtime
     from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
-    from apps.meetings.tasks import (
-        provision_janus_room_for_session,
-        attach_participant_media_handles,
-    )
     from apps.meetings.tests.test_gateway_ownership import OwnershipFixture
 
     class Cutover(OwnershipFixture, TransactionTestCase):
@@ -82,14 +68,15 @@ def main():
             GATEWAY_STATE_ENABLED=True,
             GATEWAY_EVENTS_ENABLED=True,
         )
-        def test_dark_canary_drain_and_legacy_recreation(self):
+        def test_gateway_only_drain_and_recreation(self):
+            use_available_interfaces(self)
             dark = Lifecycle.create_room(
                 creator_profile=self.host,
                 title="Dark",
                 feature_flags=self.room.feature_flags,
             )
-            self.dark = self.start(dark)
-            self.assertEqual(self.dark.signalling_backend, "legacy")
+            with self.assertRaisesRegex(MeetingDomainError, "paused"):
+                self.start(dark)
             self.room = Lifecycle.create_room(
                 creator_profile=self.host, title="Staged canary"
             )
@@ -97,14 +84,6 @@ def main():
             self.session = self.start(self.room)
             self.assertEqual(self.session.signalling_backend, "gateway")
             self.participant = self.session.participants.get(profile=self.host)
-            self.assertEqual(
-                provision_janus_room_for_session.run(str(self.session.pk)),
-                {"status": "gateway_owned"},
-            )
-            self.assertEqual(
-                attach_participant_media_handles.run(str(self.participant.pk)),
-                {"status": "gateway_owned"},
-            )
             self.ticket, self.claims = self.issue()
             self.client.force_login(self.host.user)
             self.cookie = (
@@ -119,42 +98,23 @@ def main():
             ):
                 asyncio.run(self.exercise(Path(directory)))
 
-        async def legacy_audio(self, stack, session):
-            participant = await sync_to_async(session.participants.get)(
-                profile=self.host
-            )
-            sid = "legacy-" + str(session.pk)
-            await sync_to_async(ParticipantConnection.objects.create)(
-                session=session,
-                profile=self.host,
-                participant=participant,
-                socket_id=sid,
-                status="active",
-            )
-            await manage(
-                session,
-                "create",
-                VideoRoomCreateRequest(
-                    room=janus_room_id_for_session(session),
-                    publishers=4,
-                    permanent=False,
-                ),
-            )
+        async def publish_audio(self, stack, app, claims, ticket):
+            browser = Browser(app, claims, lambda _: ticket["ticket"])
+            stack.push_async_callback(browser.close)
+            self.assertTrue((await browser.open())["ok"])
             peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
             stack.push_async_callback(peer.close)
             peer.addTransceiver(AudioStreamTrack(), direction="sendonly")
             await peer.setLocalDescription(await peer.createOffer())
-            reply = await MeetingNamespace("/meetings").on_session_media_publish(
-                sid,
-                {
-                    "session_id": str(session.pk),
-                    "handle_type": "publisher",
-                    "offer": {"type": "offer", "sdp": peer.localDescription.sdp},
-                },
+            payload = publish_payload()
+            payload["offer"]["sdp"] = peer.localDescription.sdp
+            reply = await browser.request("media.publisher.publish", payload)
+            self.assertTrue(reply["ok"], reply.get("error", {}).get("code"))
+            await peer.setRemoteDescription(
+                RTCSessionDescription(**reply["result"]["jsep"])
             )
-            await peer.setRemoteDescription(RTCSessionDescription(**reply["jsep"]))
             await media_ready([peer])
-            return peer
+            return browser
 
         async def replay_terminal(self, old, final):
             path = f"/api/v1/meetings/sessions/{self.session.pk}/gateway/events/"
@@ -211,16 +171,6 @@ def main():
                 stack.push_async_callback(sync_to_async(connections.close_all))
                 await server.start()
                 stack.push_async_callback(server.stop)
-                stack.enter_context(
-                    override_settings(
-                        JANUS_SESSION_URL=f"ws://127.0.0.1:{server.port}/",
-                        JANUS_API_SECRET=server.secret,
-                        JANUS_STARTUP_FAIL_FAST=True,
-                        JRTC_EVENTS_ENABLED=False,
-                    )
-                )
-                await stack.enter_async_context(janus_runtime.lifespan(None))
-                dark_peer = await self.legacy_audio(stack, self.dark)
                 runtime, app = await build_test_gateway(
                     self, directory, server, url, staged_routing=True
                 )
@@ -250,21 +200,9 @@ def main():
                     async with asyncio.timeout(10):
                         while (await http.get("/health/ready")).status_code != 200:
                             await asyncio.sleep(0.05)
-                    browser = Browser(app, self.claims, lambda _: self.ticket["ticket"])
-                    stack.push_async_callback(browser.close)
-                    self.assertTrue((await browser.open())["ok"])
-                    peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-                    stack.push_async_callback(peer.close)
-                    peer.addTransceiver(AudioStreamTrack(), direction="sendonly")
-                    await peer.setLocalDescription(await peer.createOffer())
-                    payload = publish_payload()
-                    payload["offer"]["sdp"] = peer.localDescription.sdp
-                    reply = await browser.request("media.publisher.publish", payload)
-                    self.assertTrue(reply["ok"], reply.get("error", {}).get("code"))
-                    await peer.setRemoteDescription(
-                        RTCSessionDescription(**reply["result"]["jsep"])
+                    browser = await self.publish_audio(
+                        stack, app, self.claims, self.ticket
                     )
-                    await media_ready([dark_peer, peer])
                     async with asyncio.timeout(12):
                         while True:
                             old = await read_state(self.session.pk, self.host.pk)
@@ -276,8 +214,6 @@ def main():
                             await asyncio.sleep(0.05)
                     old_room = app.state.auth_endpoint.media.rooms[meeting].id
                     old_janus_session = runtime.session(meeting).id
-                    with self.assertRaises(JanusGatewayError):
-                        await manage(self.session, "exists", old_room)
                     # The dispatcher is deliberately started after the operator request.
                     await sync_to_async(drain)(self.room.pk, self.session.pk)
                     with self.assertRaisesRegex(MeetingDomainError, "pending"):
@@ -296,9 +232,6 @@ def main():
                         )()
                     )
                     self.assertFalse(runtime.registry.bindings)
-                    self.assertFalse(
-                        (await manage(self.dark, "exists", old_room)).data.exists
-                    )
                     await asyncio.wait_for(browser.task, 5)
                     with self.assertRaisesRegex(MeetingDomainError, "release"):
                         await sync_to_async(self.start)(self.room)
@@ -310,22 +243,60 @@ def main():
                         ).exists
                     )()
                 )
-                observer = janus_runtime.adapter.get_session(str(self.dark.pk))
-                try:
-                    result = await observer.send(
-                        KeepAliveRequest(session_id=old_janus_session), timeout=2
-                    )
-                except JanusErrorResponse as exc:
-                    self.assertEqual(exc.code, 458)
-                else:
-                    self.assertIsInstance(result, ErrorResponse)
-                    self.assertEqual(result.error.code, 458)
+                # An independent Janus control connection verifies physical disposal.
+                from uuid import uuid4
+
+                async with connect(
+                    f"ws://127.0.0.1:{server.port}", subprotocols=["janus-protocol"]
+                ) as observer:
+
+                    async def janus(action, **fields):
+                        transaction = str(uuid4())
+                        await observer.send(
+                            json.dumps(
+                                {
+                                    "janus": action,
+                                    "transaction": transaction,
+                                    "apisecret": server.secret,
+                                    **fields,
+                                }
+                            )
+                        )
+                        async with asyncio.timeout(5):
+                            while True:
+                                reply = json.loads(await observer.recv())
+                                if (
+                                    reply.get("transaction") == transaction
+                                    and reply["janus"] != "ack"
+                                ):
+                                    return reply
+
+                    missing = await janus("keepalive", session_id=old_janus_session)
+                    self.assertEqual(missing["error"]["code"], 458)
+                    observer_id = (await janus("create"))["data"]["id"]
+                    try:
+                        handle = (
+                            await janus(
+                                "attach",
+                                session_id=observer_id,
+                                plugin="janus.plugin.videoroom",
+                            )
+                        )["data"]["id"]
+                        room = await janus(
+                            "message",
+                            session_id=observer_id,
+                            handle_id=handle,
+                            body={"request": "exists", "room": old_room},
+                        )
+                        self.assertFalse(room["plugindata"]["data"]["exists"])
+                    finally:
+                        await janus("destroy", session_id=observer_id)
+                with self.assertRaisesRegex(MeetingDomainError, "paused"):
+                    await sync_to_async(self.start)(self.room)
+                await sync_to_async(set_cohort)(self.room.pk, selected=True)
                 new = await sync_to_async(self.start)(self.room)
-                self.assertEqual(new.signalling_backend, "legacy")
+                self.assertEqual(new.signalling_backend, "gateway")
                 self.assertNotEqual(new.pk, self.session.pk)
-                replacement_peer = await self.legacy_audio(stack, new)
-                await media_ready([dark_peer, replacement_peer])
-                self.assertFalse((await manage(new, "exists", old_room)).data.exists)
                 final = await read_state(self.session.pk, self.host.pk)
                 self.assertEqual(final["meeting"]["lifecycle"], "ended")
                 self.assertEqual(
@@ -335,8 +306,28 @@ def main():
                     final["projection_version"], old["projection_version"]
                 )
                 await self.replay_terminal(old, final)
+                self.session = new
+                self.participant = await new.participants.aget(profile=self.host)
+                ticket, claims = await sync_to_async(self.issue)()
+                _, replacement = await build_test_gateway(
+                    self, directory, server, url, staged_routing=True
+                )
+                async with (
+                    replacement.router.lifespan_context(replacement),
+                    httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=replacement),
+                        base_url="https://testserver",
+                    ) as replacement_http,
+                    AsyncExitStack() as replacement_media,
+                ):
+                    async with asyncio.timeout(10):
+                        while (
+                            await replacement_http.get("/health/ready")
+                        ).status_code != 200:
+                            await asyncio.sleep(0.05)
+                    await self.publish_audio(replacement_media, replacement, claims, ticket)
                 print(
-                    "SG17_CANARY_OK legacy and gateway audio, pending commands blocked, signed termination applied, Janus 458, clean release, fresh legacy audio and terminal SSE replay",
+                    "Gateway RTP, signed termination, Janus 458, VideoRoom absence, terminal SSE and fresh gateway RTP verified",
                     flush=True,
                 )
 

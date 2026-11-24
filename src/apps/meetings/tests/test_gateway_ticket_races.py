@@ -17,11 +17,8 @@ from apps.meetings.tests.test_gateway_tickets import GatewayTicketFixture
 class GatewayTicketRaceTests(GatewayTicketFixture, TransactionTestCase):
     def setUp(self):
         self.dispatch = patch("apps.meetings.services.lifecycle.dispatch_task")
-        self.emitter = patch("apps.meetings.realtime.emitter.MeetingSocketEmitter")
         self.dispatch.start()
-        self.emitter.start()
         self.addCleanup(self.dispatch.stop)
-        self.addCleanup(self.emitter.stop)
         super().setUp()
 
     def race(self, *operations):

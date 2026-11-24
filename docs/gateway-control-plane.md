@@ -1,5 +1,7 @@
 # Dedicated gateway control plane
 
+This document records the staged implementation. For current startup, routing and rollback on the gateway-only branch, see the [retirement report](legacy-signalling-cleanup-report.md).
+
 SG-03 is additive to the existing meeting APIs. `GATEWAY_TICKETS_ENABLED` defaults
 to false. It does not select a media transport, start Janus, move a room owner,
 or enable production gateway traffic. SG-04 verifies tickets; SG-05 supplies a

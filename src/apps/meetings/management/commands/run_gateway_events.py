@@ -17,11 +17,6 @@ class Command(BaseCommand):
         if not settings.GATEWAY_EVENTS_ENABLED:
             raise CommandError("Gateway lifecycle events are disabled.")
         try:
-            if (
-                settings.JRTC_EVENT_BROKER_ENGINE != "redis"
-                or settings.JRTC_REDIS_MODE != "streams"
-            ):
-                raise BusError("Lifecycle events require Redis Streams.")
             config = BusConfig.read(settings.GATEWAY_BUS_CONFIG_FILE, gateway=False)
 
             async def run():

@@ -1,5 +1,7 @@
 # SG-14: resume authority and recovery acceptance
 
+This document records the staged implementation. For current startup, routing and rollback on the gateway-only branch, see the [retirement report](legacy-signalling-cleanup-report.md).
+
 The existing ticket service is the authority for resumption. A resume request
 requires the exact current participant session and generation, rechecks admission,
 membership and permissions under database locks, then advances the generation.

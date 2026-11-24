@@ -1,7 +1,6 @@
 """Historical migration compatibility for the retired Janus plugin field.
 
-Active models use ordinary ``PositiveBigIntegerField`` columns and resolve live
-JRTC plugins through ``JrtcHandleRegistry``.  This module remains importable so
+Active models use ordinary ``PositiveBigIntegerField`` columns.  This module remains importable so
 the existing migration graph can be replayed; it deliberately never constructs
 or adopts a live plugin from a persisted handle identifier.
 """
@@ -70,8 +69,7 @@ class BoundPluginHandle(Generic[PluginT]):
     @property
     def plugin(self) -> PluginT:
         raise RuntimeError(
-            "JanusPluginField no longer materializes live handles; use the "
-            "process-local JRTC handle registry.",
+            "Historical Janus fields cannot materialize live handles.",
         )
 
 

@@ -1,5 +1,7 @@
 # Gateway state and SSE (SG-11)
 
+This document records the staged implementation. For current startup, routing and rollback on the gateway-only branch, see the [retirement report](legacy-signalling-cleanup-report.md).
+
 Implemented behind `GATEWAY_STATE_ENABLED=False` on the gateway control-plane
 branch. This is a server contract for SG-12, not a frontend cutover. Run migration
 `0019_gateway_state_projection` before enabling the flag in an isolated gateway

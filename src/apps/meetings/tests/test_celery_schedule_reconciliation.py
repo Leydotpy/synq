@@ -18,25 +18,13 @@ from apps.management.commands.reconcile_celery_schedule import (
     configured_meeting_schedules,
     registered_meeting_task_names,
 )
-from apps.meetings.tasks import mark_stale_connections
+from apps.meetings.tasks import end_scheduled_sessions
 from conf.celery import app as celery_app
 from conf.settings.base import env_positive_int
 
 
 COMMAND_MODULE = "apps.management.commands.reconcile_celery_schedule"
 EXPECTED_SCHEDULES = {
-    "recover-stale-meeting-provisioning": (
-        "apps.meetings.tasks.recover_stale_provisioning_sessions",
-        30.0,
-    ),
-    "mark-stale-meeting-connections": (
-        "apps.meetings.tasks.mark_stale_connections",
-        30.0,
-    ),
-    "cleanup-finished-meeting-sessions": (
-        "apps.meetings.tasks.cleanup_finished_sessions",
-        300.0,
-    ),
     "end-scheduled-meeting-sessions": (
         "apps.meetings.tasks.end_scheduled_sessions",
         30.0,
@@ -111,13 +99,13 @@ class CeleryBeatConfigurationTests(TransactionTestCase):
             self.assertNotIn("expire_seconds", entry.options)
 
     def test_static_schedule_update_preserves_operator_disabled_state(self) -> None:
-        task_name, _seconds = EXPECTED_SCHEDULES["mark-stale-meeting-connections"]
+        task_name, _seconds = EXPECTED_SCHEDULES["end-scheduled-meeting-sessions"]
         interval = IntervalSchedule.objects.create(
             every=30,
             period=IntervalSchedule.SECONDS,
         )
         schedule = PeriodicTask.objects.create(
-            name="mark-stale-meeting-connections",
+            name="end-scheduled-meeting-sessions",
             task=task_name,
             interval=interval,
             enabled=False,
@@ -183,7 +171,7 @@ class ReconcileCeleryScheduleTests(TestCase):
         stale.save(update_fields=["last_run_at"])
         registered = self.create_schedule(
             name="registered-meeting-task",
-            task=mark_stale_connections.name,
+            task=end_scheduled_sessions.name,
         )
         external = self.create_schedule(
             name="external-task",
@@ -226,19 +214,19 @@ class ReconcileCeleryScheduleTests(TestCase):
     def test_auto_restores_only_marker_owned_registered_rows(self) -> None:
         marked = self.create_schedule(
             name="previously-quarantined",
-            task=mark_stale_connections.name,
+            task=end_scheduled_sessions.name,
             enabled=False,
             description=f"Keep this note\n{QUARANTINE_MARKER}",
         )
         intentional = self.create_schedule(
             name="intentionally-disabled",
-            task=mark_stale_connections.name,
+            task=end_scheduled_sessions.name,
             enabled=False,
             description="Operator disabled this schedule",
         )
         marker_lookalike = self.create_schedule(
             name="marker-mentioned-inline",
-            task=mark_stale_connections.name,
+            task=end_scheduled_sessions.name,
             enabled=False,
             description=f"Incident note mentions {QUARANTINE_MARKER} inline",
         )
@@ -256,9 +244,9 @@ class ReconcileCeleryScheduleTests(TestCase):
         self.assertIn("Re-enabled 1 Celery schedule", output.getvalue())
 
     def test_explicit_mode_reenables_only_exact_configured_pairs(self) -> None:
-        task_name, _seconds = EXPECTED_SCHEDULES["mark-stale-meeting-connections"]
+        task_name, _seconds = EXPECTED_SCHEDULES["end-scheduled-meeting-sessions"]
         configured = self.create_schedule(
-            name="mark-stale-meeting-connections",
+            name="end-scheduled-meeting-sessions",
             task=task_name,
             enabled=False,
         )
@@ -290,13 +278,13 @@ class ReconcileCeleryScheduleTests(TestCase):
         )
         marked = self.create_schedule(
             name="previously-quarantined",
-            task=mark_stale_connections.name,
+            task=end_scheduled_sessions.name,
             enabled=False,
             description=QUARANTINE_MARKER,
         )
         configured = self.create_schedule(
-            name="mark-stale-meeting-connections",
-            task=mark_stale_connections.name,
+            name="end-scheduled-meeting-sessions",
+            task=end_scheduled_sessions.name,
             enabled=False,
         )
         before_change = PeriodicTasks.last_change()
@@ -350,7 +338,7 @@ class ReconcileCeleryScheduleTests(TestCase):
 
         def retarget_before_update(description: str) -> str:
             PeriodicTask.objects.filter(pk=stale.pk).update(
-                task=mark_stale_connections.name,
+                task=end_scheduled_sessions.name,
             )
             return QUARANTINE_MARKER
 
@@ -362,17 +350,17 @@ class ReconcileCeleryScheduleTests(TestCase):
 
         stale.refresh_from_db()
         self.assertTrue(stale.enabled)
-        self.assertEqual(stale.task, mark_stale_connections.name)
+        self.assertEqual(stale.task, end_scheduled_sessions.name)
         self.assertEqual(stale.description, "")
         update_changed.assert_not_called()
         self.assertIn("no schedule rows need reconciliation", output.getvalue())
 
     def test_configured_retarget_and_marker_restore_finish_in_same_run(self) -> None:
         target_task, _seconds = EXPECTED_SCHEDULES[
-            "recover-stale-meeting-provisioning"
+            "expire-pending-meeting-join-requests"
         ]
         schedule = self.create_schedule(
-            name="recover-stale-meeting-provisioning",
+            name="expire-pending-meeting-join-requests",
             task="apps.meetings.tasks.legacy_recovery_task",
             enabled=False,
             description=f"Retain this note\n{QUARANTINE_MARKER}",
@@ -390,7 +378,7 @@ class ReconcileCeleryScheduleTests(TestCase):
     def test_guarded_restore_preserves_concurrent_admin_edit(self) -> None:
         schedule = self.create_schedule(
             name="marked-but-edited",
-            task=mark_stale_connections.name,
+            task=end_scheduled_sessions.name,
             enabled=False,
             description=QUARANTINE_MARKER,
         )

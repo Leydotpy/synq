@@ -22,13 +22,6 @@ class Command(BaseCommand):
         if not settings.GATEWAY_COMMANDS_ENABLED:
             raise CommandError("Gateway commands are disabled.")
         try:
-            if (
-                settings.JRTC_EVENT_BROKER_ENGINE != "redis"
-                or settings.JRTC_REDIS_MODE != "streams"
-            ):
-                raise BusError(
-                    "Gateway commands require the configured Redis Streams backend."
-                )
             config = BusConfig.read(settings.GATEWAY_BUS_CONFIG_FILE, gateway=False)
 
             async def run():

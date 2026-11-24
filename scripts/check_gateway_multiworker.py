@@ -22,6 +22,9 @@ def free_port():
         return sock.getsockname()[1]
 
 
+from check_gateway_state import use_available_interfaces
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gateway", required=True, type=Path)
@@ -34,7 +37,6 @@ def main():
     os.environ.setdefault(
         "DJANGO_SETTINGS_MODULE", "conf.gateway_postgres_test_settings"
     )
-    os.environ["SOCKET_IO_REDIS_URL"] = os.environ["GATEWAY_TEST_REDIS_URL"]
     import django
 
     django.setup()
@@ -84,6 +86,7 @@ def main():
             GATEWAY_MULTIWORKER_ENABLED=True, ALLOWED_HOSTS=["127.0.0.1"]
         )
         def test_rolling_drain_expired_live_owner_and_broker_loss(self):
+            use_available_interfaces(self)
             self.intent()
             self.decision()
             outbox = GatewayAuthorizationOutbox.objects.get(

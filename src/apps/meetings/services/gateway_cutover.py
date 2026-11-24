@@ -1,6 +1,5 @@
 """Operator switches and the evidence required to reuse a room after a staged drain."""
 
-from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -19,8 +18,6 @@ from apps.meetings.services.gateway_commands import OPEN
 @transaction.atomic
 def set_cohort(room_id, *, selected):
     room = MeetingRoom.objects.select_for_update().get(pk=room_id)
-    if selected and not settings.GATEWAY_STAGED_ROUTING:
-        raise MeetingDomainError("Enable staged routing before selecting a room.")
     room.gateway_canary = selected
     room.save(update_fields=["gateway_canary", "updated_at"])
 
@@ -44,7 +41,7 @@ def drain(room_id, session_id):
     # Concurrent starts reuse this exact session until its end commits. A delayed
     # operator request never ends a replacement session.
     return MeetingLifecycleService.end_session(
-        session=session, reason="Staged gateway failback"
+        session=session, reason="Gateway meeting drained"
     )
 
 

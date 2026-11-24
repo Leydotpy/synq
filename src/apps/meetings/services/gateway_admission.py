@@ -15,6 +15,7 @@ from apps.meetings.models import (
     Participant,
     ParticipantStatus,
 )
+from apps.meetings.services.gateway_state import project_event
 from apps.meetings.services.gateway_outbox import enabled, record_authorization_intent
 from apps.meetings.services.gateway_tickets import (
     GatewayDenied,
@@ -98,6 +99,7 @@ def request_intent(
     profile_id,
     display_name="",
     note="",
+    client_state=None,
     passcode=None,
     invite_token=None,
 ):
@@ -162,6 +164,7 @@ def request_intent(
                     profile=profile,
                     requested_display_name=display_name,
                     note=note,
+                    client_state=client_state or {},
                     requested_role=MeetingRole.PARTICIPANT,
                 )
             participant = existing or Participant(
@@ -213,6 +216,7 @@ def request_intent(
                 payload={"join_request_id": str(intent.pk), "direct_entry": direct},
             )
             MeetingLifecycleService.refresh_session_metrics(session=session)
+            project_event(session)
             return _snapshot(participant, intent)
     except MeetingDomainError:
         raise GatewayDenied() from None
@@ -348,4 +352,5 @@ def review_intent(
             },
         )
         MeetingLifecycleService.refresh_session_metrics(session=session)
+        project_event(session)
         return _snapshot(participant, intent, decision)

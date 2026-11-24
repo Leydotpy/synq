@@ -2,8 +2,7 @@
 A module to extend Django's `runserver` command with Uvicorn-based ASGI server support.
 
 This module replaces the default WSGI-based development server with an ASGI-compatible
-server powered by Uvicorn, enabling features like WebSockets and better performance for
-asynchronous operations. It provides custom argument handling and static file serving
+server powered by Uvicorn for Django HTTP requests and authenticated SSE. It provides custom argument handling and static file serving
 logic while retaining compatibility with Django conventions.
 
 Classes:
@@ -81,7 +80,7 @@ class Command(RunserverCommand):
     help = (
         "Starts a lightweight ASGI development server powered by Uvicorn. "
         "Replaces Django's default WSGI server to enable WebSocket support, "
-        "asynchronous request handling, and ASGI application lifespan events. "
+        "asynchronous request handling, and server-sent events. "
         "Includes automatic reloading, static file serving, and Django system checks. "
         "Use --noasgi to fall back to the standard WSGI-based runserver."
     )
@@ -199,8 +198,8 @@ class Command(RunserverCommand):
             reload=is_reloader_active,
             # Set workers if not in reload mode
             workers=options["workers"] if not is_reloader_active else 1,
-            # Crucial: explicitly set lifespan to ensure it runs
-            lifespan="on",
+            # Django ASGI serves HTTP and SSE without a lifespan protocol.
+            lifespan="off",
             # Uvicorn handles its own internal logging, but we can set the level
             log_level="info" if settings.DEBUG else "warning",
         )

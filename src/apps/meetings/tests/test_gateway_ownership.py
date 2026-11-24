@@ -6,13 +6,8 @@ import uuid
 from datetime import timedelta
 from unittest.mock import patch
 
-from apps.meetings.exceptions import JanusGatewayError, MeetingDomainError
-from apps.meetings.services.janus import (
-    call_video_room_management_method,
-    resolve_janus_session,
-)
+from apps.meetings.exceptions import MeetingDomainError
 from apps.meetings.services.lifecycle import MeetingLifecycleService as Lifecycle
-from apps.meetings.services.signaling import _prepare_media_handle
 from apps.meetings.tests.test_gateway_admission import GatewayAdmissionFixture
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from django.test import (
@@ -46,7 +41,15 @@ class OwnershipFixture(GatewayAdmissionFixture):
         self.dispatcher = self.dispatch.start()
         self.addCleanup(self.dispatch.stop)
         super().setUp()
-        self.legacy_session = self.session
+        legacy_room = Lifecycle.create_room(
+            creator_profile=self.host, title="Historical legacy room"
+        )
+        self.legacy_session = MeetingSession.objects.create(
+            room=legacy_room,
+            started_by_profile=self.host,
+            signalling_backend="legacy",
+            lifecycle_state="active",
+        )
         flags = override_settings(
             GATEWAY_RUNTIME_ENABLED=True, GATEWAY_COMMANDS_ENABLED=True
         )
@@ -172,13 +175,14 @@ class OwnershipTests(OwnershipFixture, TestCase):
             "gateway_runtime": True,
         }
         self.legacy_session.room.save(update_fields=["feature_flags"])
-        existing = Lifecycle.start_session(
-            room=self.legacy_session.room, started_by_profile=self.host
-        )
-        self.assertEqual(existing.pk, self.legacy_session.pk)
-        self.assertEqual(existing.signalling_backend, "legacy")
+        with self.assertRaisesRegex(MeetingDomainError, "legacy"):
+            Lifecycle.start_session(
+                room=self.legacy_session.room, started_by_profile=self.host
+            )
+        self.legacy_session.refresh_from_db()
+        self.assertEqual(self.legacy_session.signalling_backend, "legacy")
         with self.assertRaises(GatewayDenied):
-            self.request(meeting_id=str(existing.pk))
+            self.request(meeting_id=str(self.legacy_session.pk))
 
     def test_claim_retry_renew_and_clean_restart_advance_generation(self):
         first = self.request()
@@ -276,41 +280,32 @@ class OwnershipTests(OwnershipFixture, TestCase):
             self.request()
         self.assertFalse(GatewayCommandRoute.objects.exists())
 
-    def test_legacy_management_and_handle_preparation_stay_fenced_when_flags_off(self):
-        with (
-            override_settings(GATEWAY_RUNTIME_ENABLED=False),
-            patch("apps.meetings.services.janus.janus_runtime") as runtime,
+    def test_django_cannot_start_a_media_runtime_or_queue_legacy_tasks(self):
+        from celery import current_app
+        from django.core.asgi import ASGIHandler
+        from django.core.management import get_commands
+        from importlib.util import find_spec
+        from conf.asgi import application
+
+        self.assertIsInstance(application, ASGIHandler)
+        for name in (
+            "conf.socketio",
+            "apps.meetings.realtime",
+            "apps.meetings.jrtc",
+            "apps.meetings.services.signaling",
         ):
-            with self.assertRaises(JanusGatewayError):
-                resolve_janus_session(self.session)
-            with self.assertRaises(JanusGatewayError):
-                call_video_room_management_method(self.session, "list")
-            with self.assertRaises(JanusGatewayError):
-                _prepare_media_handle(
-                    participant=self.participant, handle_type="publisher"
-                )
-            runtime.run.assert_not_called()
-            runtime.session.assert_not_called()
-        self.assertFalse(self.participant.media_handles.exists())
-
-    def test_legacy_celery_entrypoints_skip_gateway_resources(self):
-        from apps.meetings import tasks
-
-        with patch("apps.meetings.tasks.call_video_room_management_method") as media:
-            for task in [
-                tasks.provision_janus_room_for_session,
-                tasks.sync_janus_participants,
-                tasks.destroy_janus_room_for_session,
-            ]:
-                self.assertEqual(
-                    task.run(str(self.session.pk)), {"status": "gateway_owned"}
-                )
-            self.assertEqual(
-                tasks.attach_participant_media_handles.run(str(self.participant.pk)),
-                {"status": "gateway_owned"},
-            )
-            tasks.detach_participant_media_handles.run(str(self.participant.pk))
-            media.assert_not_called()
+            self.assertIsNone(find_spec(name))
+        for name in ("runjanus", "run_jrtc_events"):
+            self.assertNotIn(name, get_commands())
+        for task in (
+            "provision_janus_room_for_session",
+            "attach_participant_media_handles",
+            "detach_participant_media_handles",
+            "sync_janus_participants",
+            "destroy_janus_room_for_session",
+            "mark_stale_connections",
+        ):
+            self.assertNotIn("apps.meetings.tasks." + task, current_app.tasks)
         self.assertFalse(self.participant.media_handles.exists())
 
     def test_durable_dispatch_uses_published_owner_and_generation(self):
@@ -466,26 +461,17 @@ class MultiworkerOwnershipTests(OwnershipFixture, TestCase):
         with self.assertRaises(GatewayDenied):
             self.request("elect", 2, pool=self.pool, session_id=345, incarnation=first)
 
-    def test_rollback_uses_a_fresh_legacy_session_after_release(self):
+    def test_disabled_gateway_cannot_create_a_fallback_session(self):
         self.request("elect", pool=self.pool, session_id=501)
         self.request("release", 1)
         Lifecycle.end_session(session=self.session, actor_profile=self.host)
-        with override_settings(
-            GATEWAY_MULTIWORKER_ENABLED=False, GATEWAY_RUNTIME_ENABLED=False
+        with (
+            override_settings(GATEWAY_RUNTIME_ENABLED=False),
+            self.assertRaises(MeetingDomainError),
         ):
-            replacement = Lifecycle.start_session(
-                room=self.room, started_by_profile=self.host
-            )
-        self.session.refresh_from_db()
-        self.assertNotEqual(replacement.pk, self.session.pk)
-        self.assertEqual(
-            (self.session.signalling_backend, replacement.signalling_backend),
-            ("gateway", "legacy"),
-        )
+            Lifecycle.start_session(room=self.room, started_by_profile=self.host)
+        self.assertEqual(self.room.sessions.count(), 1)
         self.assertTrue(GatewayCommandRoute.objects.get(session=self.session).released)
-        self.assertFalse(
-            GatewayCommandRoute.objects.filter(session=replacement).exists()
-        )
 
     def test_legacy_crash_needs_legacy_cleanup_and_rollout_requires_flag(self):
         self.request()

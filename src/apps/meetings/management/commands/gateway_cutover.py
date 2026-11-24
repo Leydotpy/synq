@@ -8,7 +8,7 @@ from apps.meetings.services.gateway_cutover import drain, set_cohort
 
 
 class Command(BaseCommand):
-    help = "Select or pause a room for future gateway sessions, or end an exact session for failback."
+    help = "Select or pause a room for future gateway sessions, or end an exact session for a gateway drain."
 
     def add_arguments(self, parser):
         parser.add_argument("action", choices=("select", "pause", "drain"))

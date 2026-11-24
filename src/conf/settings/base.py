@@ -10,25 +10,6 @@ from pathlib import Path
 from decouple import Csv, config
 
 
-def env_value(*names: str, default: str | None = None) -> str | None:
-    """Return the first defined environment variable from the supplied names."""
-
-    for name in names:
-        value = os.getenv(name)
-        if value not in (None, ""):
-            return value
-    return default
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    """Parse a boolean environment variable with a sensible default."""
-
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def env_positive_int(name: str, default: int) -> int:
     """Parse an environment value as a strictly positive whole number."""
 
@@ -44,6 +25,15 @@ def env_positive_int(name: str, default: int) -> int:
     return int(value)
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable with a sensible default."""
+
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def env_list(name: str, default: list[str] | None = None) -> list[str]:
     """Parse a comma-separated environment variable into a list of strings."""
 
@@ -51,15 +41,6 @@ def env_list(name: str, default: list[str] | None = None) -> list[str]:
     if raw_value is None:
         return default or []
     return [item.strip() for item in raw_value.split(",") if item.strip()]
-
-
-def env_list_any(*names: str, default: list[str] | None = None) -> list[str]:
-    """Return a normalized list from the first populated environment variable."""
-
-    raw_value = env_value(*names)
-    if raw_value is None:
-        return list(default or [])
-    return [item.strip().strip("'").strip('"') for item in raw_value.split(",") if item.strip()]
 
 
 def _config_list(name: str, default: list[str] | None = None) -> list[str]:
@@ -259,24 +240,6 @@ CELERY_WORKER_HIJACK_ROOT_LOGGER = False
 
 _MEETING_CELERY_SCHEDULES = (
     (
-        "recover-stale-meeting-provisioning",
-        "apps.meetings.tasks.recover_stale_provisioning_sessions",
-        "MEETING_PROVISIONING_RECOVERY_SWEEP_SECONDS",
-        30,
-    ),
-    (
-        "mark-stale-meeting-connections",
-        "apps.meetings.tasks.mark_stale_connections",
-        "MEETING_CONNECTION_STALE_SWEEP_SECONDS",
-        30,
-    ),
-    (
-        "cleanup-finished-meeting-sessions",
-        "apps.meetings.tasks.cleanup_finished_sessions",
-        "MEETING_FINISHED_SESSION_CLEANUP_SWEEP_SECONDS",
-        300,
-    ),
-    (
         "end-scheduled-meeting-sessions",
         "apps.meetings.tasks.end_scheduled_sessions",
         "MEETING_SCHEDULED_SESSION_END_SWEEP_SECONDS",
@@ -315,109 +278,6 @@ CELERY_BEAT_SCHEDULE = {
     )
 }
 
-SOCKET_IO_PATH = env_value("SOCKET_IO_PATH", "SOCKETIO_PATH", default="socket.io")
-SOCKET_IO_REDIS_URL = env_value("SOCKET_IO_REDIS_URL", "SOCKETIO_REDIS_URL", default=REDIS_URL)
-SOCKET_IO_CORS_ALLOWED_ORIGINS = env_list_any(
-    "SOCKET_IO_CORS_ALLOWED_ORIGINS",
-    "SOCKETIO_CORS_ALLOWED_ORIGINS",
-    default=["http://localhost:3000", "http://127.0.0.1:3000"],
-)
-
-JANUS_SESSION_URL = os.getenv("JANUS_SESSION_URL", "ws://127.0.0.1:8188/janus")
-JANUS_REQUEST_TIMEOUT = float(os.getenv("JANUS_REQUEST_TIMEOUT", "15"))
-JANUS_SESSION_POOL_SIZE = int(os.getenv("JANUS_SESSION_POOL_SIZE", "1"))
-JANUS_STARTUP_FAIL_FAST = env_bool("JANUS_STARTUP_FAIL_FAST", default=False)
-JANUS_KEEPALIVE_INTERVAL = float(os.getenv("JANUS_KEEPALIVE_INTERVAL", "25"))
-JANUS_KEEPALIVE_FAILURES = int(os.getenv("JANUS_KEEPALIVE_FAILURES", "3"))
-JANUS_SHUTDOWN_TIMEOUT = float(os.getenv("JANUS_SHUTDOWN_TIMEOUT", "10"))
-JANUS_DETACH_CONCURRENCY = int(os.getenv("JANUS_DETACH_CONCURRENCY", "16"))
-JANUS_TOKEN = os.getenv("JANUS_TOKEN") or None
-JANUS_API_SECRET = os.getenv("JANUS_API_SECRET") or None
-# The bridge timeout includes the Janus request timeout plus scheduling and
-# cleanup headroom for synchronous Django/Celery callers.
-JANUS_SYNC_CALL_TIMEOUT = float(
-    os.getenv("JANUS_SYNC_CALL_TIMEOUT", str((JANUS_REQUEST_TIMEOUT * 3) + 5)),
-)
-JANUS_RUNTIME_STARTUP_TIMEOUT = float(os.getenv("JANUS_RUNTIME_STARTUP_TIMEOUT", "20"))
-JANUS_DEFAULT_ROOM_CONFIGURATION = {
-    "publishers": int(os.getenv("JANUS_ROOM_PUBLISHERS", "100")),
-    "bitrate": int(os.getenv("JANUS_ROOM_BITRATE", "1024000")),
-    "audiocodec": os.getenv("JANUS_ROOM_AUDIO_CODEC", "opus"),
-    "videocodec": os.getenv("JANUS_ROOM_VIDEO_CODEC", "vp8"),
-    "notify_joining": True,
-    "audiolevel_ext": True,
-    "audiolevel_event": True,
-    "audio_active_packets": 100,
-    "audio_level_average": 25,
-    "videoorient_ext": True,
-    "transport_wide_cc_ext": True,
-}
-
-# JRTC application events are a separate plane from the Janus command
-# connection above. Redis Streams is the durable production default; memory
-# and local engines are intended only for tests or same-process development.
-JRTC_EVENTS_ENABLED = env_bool("JRTC_EVENTS_ENABLED", default=True)
-JRTC_EVENT_BROKER_ENGINE = os.getenv("JRTC_EVENT_BROKER_ENGINE", "redis")
-JRTC_EVENT_PHYSICAL_ROUTE = os.getenv("JRTC_EVENT_PHYSICAL_ROUTE", "janus.events")
-JRTC_EVENT_PUBLISH_WORKERS = int(os.getenv("JRTC_EVENT_PUBLISH_WORKERS", "4"))
-JRTC_EVENT_PUBLISH_QUEUE_CAPACITY = int(
-    os.getenv("JRTC_EVENT_PUBLISH_QUEUE_CAPACITY", "1024")
-)
-JRTC_EVENT_PUBLISH_ADMISSION_TIMEOUT = float(
-    os.getenv("JRTC_EVENT_PUBLISH_ADMISSION_TIMEOUT", "0.05")
-)
-JRTC_EVENT_PUBLISH_TIMEOUT = float(os.getenv("JRTC_EVENT_PUBLISH_TIMEOUT", "5"))
-JRTC_EVENT_DRAIN_TIMEOUT = float(os.getenv("JRTC_EVENT_DRAIN_TIMEOUT", "10"))
-JRTC_EVENT_RECEIPT_RETENTION_DAYS = int(
-    os.getenv("JRTC_EVENT_RECEIPT_RETENTION_DAYS", "30")
-)
-JRTC_EVENT_OUTBOX_POLL_INTERVAL = float(
-    os.getenv("JRTC_EVENT_OUTBOX_POLL_INTERVAL", "1")
-)
-JRTC_EVENT_OUTBOX_RETRY_DELAY = float(
-    os.getenv("JRTC_EVENT_OUTBOX_RETRY_DELAY", "2")
-)
-JRTC_EVENT_OUTBOX_LEASE_TIMEOUT = float(
-    os.getenv("JRTC_EVENT_OUTBOX_LEASE_TIMEOUT", "30")
-)
-JRTC_EVENT_OUTBOX_BATCH_SIZE = int(
-    os.getenv("JRTC_EVENT_OUTBOX_BATCH_SIZE", "100")
-)
-JRTC_EVENT_CONSUMER_CONCURRENCY = int(
-    os.getenv("JRTC_EVENT_CONSUMER_CONCURRENCY", "1")
-)
-JRTC_EVENT_CONSUMER_CAPACITY = int(os.getenv("JRTC_EVENT_CONSUMER_CAPACITY", "100"))
-
-JRTC_REDIS_URL = os.getenv("JRTC_REDIS_URL", REDIS_URL)
-JRTC_REDIS_MODE = os.getenv("JRTC_REDIS_MODE", "streams")
-JRTC_REDIS_GROUP = os.getenv("JRTC_REDIS_GROUP", "synq-jrtc-events")
-JRTC_REDIS_CONSUMER_NAME = os.getenv("JRTC_REDIS_CONSUMER_NAME", "synq-jrtc-events")
-JRTC_REDIS_MAX_LENGTH = int(os.getenv("JRTC_REDIS_MAX_LENGTH", "100000"))
-JRTC_REDIS_CLAIM_IDLE_MS = int(os.getenv("JRTC_REDIS_CLAIM_IDLE_MS", "60000"))
-JRTC_REDIS_CLAIM_INTERVAL = float(os.getenv("JRTC_REDIS_CLAIM_INTERVAL", "5"))
-
-JRTC_RABBITMQ_URL = os.getenv(
-    "JRTC_RABBITMQ_URL",
-    "amqp://guest:guest@127.0.0.1:5672/",
-)
-JRTC_RABBITMQ_EXCHANGE = os.getenv("JRTC_RABBITMQ_EXCHANGE", "synq.jrtc")
-JRTC_RABBITMQ_QUEUE = os.getenv("JRTC_RABBITMQ_QUEUE", "synq.jrtc.events")
-JRTC_RABBITMQ_DLX = os.getenv("JRTC_RABBITMQ_DLX", "synq.jrtc.dlx")
-
-JRTC_KAFKA_BOOTSTRAP_SERVERS = env_list(
-    "JRTC_KAFKA_BOOTSTRAP_SERVERS",
-    default=["127.0.0.1:9092"],
-)
-JRTC_KAFKA_GROUP_ID = os.getenv("JRTC_KAFKA_GROUP_ID", "synq-jrtc-events")
-JRTC_KAFKA_SECURITY_PROTOCOL = os.getenv(
-    "JRTC_KAFKA_SECURITY_PROTOCOL",
-    "PLAINTEXT",
-)
-JRTC_KAFKA_SASL_MECHANISM = os.getenv("JRTC_KAFKA_SASL_MECHANISM") or None
-JRTC_KAFKA_USERNAME = os.getenv("JRTC_KAFKA_USERNAME") or None
-JRTC_KAFKA_PASSWORD = os.getenv("JRTC_KAFKA_PASSWORD") or None
-
-MEETING_CONNECTION_STALE_SECONDS = int(os.getenv("MEETING_CONNECTION_STALE_SECONDS", "90"))
 MEETING_FRONTEND_BASE_URL = os.getenv("MEETING_FRONTEND_BASE_URL", "http://localhost:3000")
 MEETING_FRONTEND_JOIN_PATH = os.getenv("MEETING_FRONTEND_JOIN_PATH", "/meetings/{session_id}")
 MEETING_INVITE_MAX_AGE_SECONDS = int(os.getenv("MEETING_INVITE_MAX_AGE_SECONDS", str(60 * 60 * 24 * 7)))
@@ -497,7 +357,7 @@ LOGGING_CONFIG = "conf.logging.configure_logging"
 # Django invokes the custom configurator only with a nonempty settings dict.
 LOGGING = {"version": 1, "incremental": True}
 
-# Additive gateway control-plane rehearsal; legacy transport remains selected.
+# Gateway credentials and services must be configured before starting meetings.
 GATEWAY_TICKETS_ENABLED = config("GATEWAY_TICKETS_ENABLED", default=False, cast=bool)
 GATEWAY_TICKET_ISSUER = config("GATEWAY_TICKET_ISSUER", default="", cast=str)
 GATEWAY_TICKET_KEY_ID = config("GATEWAY_TICKET_KEY_ID", default="", cast=str)
@@ -511,7 +371,7 @@ GATEWAY_TRACE_KEY = read_gateway_observability_key(config("GATEWAY_TRACE_KEY_FIL
 GATEWAY_AUTHORITY_TOKEN = config("GATEWAY_AUTHORITY_TOKEN", default="", cast=str)
 GATEWAY_ADMISSION_ENABLED = config("GATEWAY_ADMISSION_ENABLED", default=False, cast=bool)
 
-# Dedicated signed gateway command delivery; the legacy event consumer is unchanged.
+# Signed gateway command delivery and state projection.
 GATEWAY_COMMANDS_ENABLED = config("GATEWAY_COMMANDS_ENABLED", default=False, cast=bool)
 GATEWAY_EVENTS_ENABLED = config("GATEWAY_EVENTS_ENABLED", default=False, cast=bool)
 GATEWAY_STATE_ENABLED = config("GATEWAY_STATE_ENABLED", default=False, cast=bool)

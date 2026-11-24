@@ -1,5 +1,7 @@
 # JRTC architecture and operations
 
+This document records the staged implementation. For current startup, routing and rollback on the gateway-only branch, see the [retirement report](legacy-signalling-cleanup-report.md).
+
 Synq separates Janus work into a direct command plane, an authoritative event
 plane, and process-local handle ownership. Persisted Janus identifiers are
 correlation data; they are never reconstructed into live network objects.

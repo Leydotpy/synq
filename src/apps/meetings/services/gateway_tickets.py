@@ -94,9 +94,7 @@ def rejected_join_requests(session: MeetingSession):
 def current_permissions(
     participant: Participant, session: MeetingSession
 ) -> tuple[list[str], dict]:
-    if session.signalling_backend != "gateway" and (
-        settings.GATEWAY_STAGED_ROUTING or session.room.gateway_canary is not None
-    ):
+    if session.signalling_backend != "gateway":
         raise GatewayDenied()
     if session.lifecycle_state not in {
         MeetingLifecycleState.PROVISIONING,
@@ -202,7 +200,7 @@ def issue_ticket(
             .filter(pk=session_id)
             .first()
         )
-        if session is None:
+        if session is None or session.signalling_backend != "gateway":
             raise GatewayDenied()
         participant = _locked_participant(session, profile_id)
         scopes, _ = current_permissions(participant, session)

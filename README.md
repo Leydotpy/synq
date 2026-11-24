@@ -1,22 +1,17 @@
 # Synq Meet server
 
-The meeting service is a Django/Socket.IO application whose Janus integration
-uses `jrtc>=3.1,<4` and the independently packaged `jrtc-video>=3,<4`.
+Django serves the meeting HTTP API, signed gateway authority, authenticated snapshots and SSE.
+Run Django ASGI with `conf.asgi:application`. The separate JRTC signalling gateway owns Janus sessions, media, SDP and ICE.
+Celery handles invitations, waiting-room expiry and scheduled meeting endings. The
+`run_gateway_commands` and `run_gateway_events` workers handle the signed Broka streams.
 
-See [docs/jrtc-operations.md](docs/jrtc-operations.md) for the command/event
-architecture, runtime ownership rules, broker configuration, deployment units,
-failure recovery, and security guidance.
+This branch requires explicit gateway configuration before a meeting can start.
+The retirement report gives the matching client configuration, checks and rollback procedure.
+[Legacy signalling retirement](docs/legacy-signalling-cleanup-report.md)
 
-Copy [`.env.example`](.env.example) to an untracked `.env` for local
-development and supply the `DATABASE_*` PostgreSQL values there. Process
-environment variables take precedence in deployed services; database secrets
-must not be placed in Django settings or committed files.
-
-Common validation commands:
-
-```powershell
+```sh
 uv sync --frozen
-uv run python src/manage.py check
-uv run python src/manage.py makemigrations --check --dry-run
-uv run python src/manage.py test apps.meetings.tests
+uv run --frozen python src/manage.py check
+uv run --frozen python src/manage.py makemigrations --check --dry-run
+uv run --frozen python src/manage.py test apps.meetings --settings=conf.gateway_postgres_test_settings
 ```

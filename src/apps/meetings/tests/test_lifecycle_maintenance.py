@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import timedelta
-from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
@@ -22,17 +20,12 @@ from apps.meetings.models import (
     MeetingRoomMembership,
     MeetingSession,
     Participant,
-    ParticipantConnection,
     ParticipantStatus,
-    RealtimeConnectionStatus,
 )
-from apps.meetings.realtime.emitter import MeetingSocketEmitter
-from apps.meetings.realtime.events import MeetingSocketEvents
 from apps.meetings.services.lifecycle import MeetingLifecycleService
 from apps.meetings.tasks import (
     end_scheduled_sessions,
     expire_pending_join_requests,
-    recover_stale_provisioning_sessions,
 )
 from apps.profiles.models import Profile
 
@@ -84,58 +77,9 @@ class MeetingLifecycleTestMixin:
 class MeetingLifecycleMaintenanceTests(MeetingLifecycleTestMixin, TestCase):
     """Exercise the recovery sweeps and their idempotency boundaries."""
 
-    @override_settings(MEETING_PROVISIONING_STALE_SECONDS=60)
-    @patch("apps.meetings.tasks.provision_janus_room_for_session.delay")
-    def test_recovery_claims_only_stale_unprovisioned_sessions_once(self, provision_delay):
-        """A recovery sweep leases eligible rows so overlapping sweeps do not duplicate work."""
 
-        _, _, stale = self.make_session(
-            handle="stale-host",
-            title="Stale provisioning",
-            lifecycle_state=MeetingLifecycleState.PROVISIONING,
-        )
-        _, _, fresh = self.make_session(
-            handle="fresh-host",
-            title="Fresh provisioning",
-            lifecycle_state=MeetingLifecycleState.PROVISIONING,
-        )
-        _, _, already_provisioned = self.make_session(
-            handle="ready-host",
-            title="Already provisioned",
-            lifecycle_state=MeetingLifecycleState.PROVISIONING,
-        )
-        _, _, terminal = self.make_session(
-            handle="terminal-host",
-            title="Terminal session",
-            lifecycle_state=MeetingLifecycleState.ENDED,
-        )
-        stale_timestamp = timezone.now() - timedelta(minutes=5)
-        MeetingSession.objects.filter(pk=stale.pk).update(updated_at=stale_timestamp)
-        MeetingSession.objects.filter(pk=already_provisioned.pk).update(
-            janus_room_id=8_181,
-            updated_at=stale_timestamp,
-        )
-        MeetingSession.objects.filter(pk=terminal.pk).update(updated_at=stale_timestamp)
-
-        first_count = recover_stale_provisioning_sessions.run()
-        second_count = recover_stale_provisioning_sessions.run()
-
-        self.assertEqual(first_count, 1)
-        self.assertEqual(second_count, 0)
-        provision_delay.assert_called_once_with(str(stale.pk))
-        stale.refresh_from_db()
-        fresh.refresh_from_db()
-        self.assertGreater(stale.updated_at, stale_timestamp)
-        self.assertEqual(fresh.lifecycle_state, MeetingLifecycleState.PROVISIONING)
-
-    @patch("apps.meetings.realtime.emitter.MeetingSocketEmitter.emit_session_state")
-    @patch("apps.meetings.realtime.emitter.MeetingSocketEmitter.emit_session_ended")
-    @patch("apps.meetings.tasks.destroy_janus_room_for_session.delay")
     def test_scheduled_end_sweep_is_due_only_and_idempotent(
         self,
-        destroy_delay,
-        emit_session_ended,
-        emit_session_state,
     ):
         """Only overdue live sessions end, with related state transitioned exactly once."""
 
@@ -187,6 +131,7 @@ class MeetingLifecycleMaintenanceTests(MeetingLifecycleTestMixin, TestCase):
             ).exists(),
         )
         self.assertEqual(due_session.participant_count, 0)
+        self.assertEqual(due_session.gateway_outbox.filter(action="meeting.terminate").count(), 1)
         self.assertEqual(pending_request.status, MeetingJoinRequestStatus.CANCELLED)
         self.assertIsNotNone(pending_request.reviewed_at)
         self.assertEqual(
@@ -196,19 +141,10 @@ class MeetingLifecycleMaintenanceTests(MeetingLifecycleTestMixin, TestCase):
             ).count(),
             1,
         )
-        destroy_delay.assert_called_once()
-        self.assertEqual(destroy_delay.call_args.args[0], str(due_session.pk))
-        uuid.UUID(destroy_delay.call_args.args[1])
-        emit_session_ended.assert_called_once()
-        emit_session_state.assert_called_once()
 
     @override_settings(MEETING_JOIN_REQUEST_TTL_SECONDS=900)
-    @patch("apps.meetings.realtime.emitter.MeetingSocketEmitter.emit_session_state")
-    @patch("apps.meetings.realtime.emitter.MeetingSocketEmitter.emit_join_request_reviewed")
     def test_join_request_expiry_is_old_pending_only_and_idempotent(
         self,
-        emit_reviewed,
-        emit_session_state,
     ):
         """The expiry sweep leaves fresh requests alone and never re-emits an expiry."""
 
@@ -243,22 +179,15 @@ class MeetingLifecycleMaintenanceTests(MeetingLifecycleTestMixin, TestCase):
         self.assertIsNotNone(old_request.reviewed_at)
         self.assertTrue(old_request.resolution_reason)
         self.assertEqual(fresh_request.status, MeetingJoinRequestStatus.PENDING)
-        emit_reviewed.assert_called_once()
-        self.assertIsNone(emit_reviewed.call_args.kwargs["participant"])
-        emit_session_state.assert_called_once_with(session=old_request.session)
+        self.assertTrue(session.events.filter(event_type=MeetingEventType.JOIN_REQUEST_REVIEWED,
+                                             payload__join_request_id=str(old_request.pk)).exists())
 
 
 class MeetingSessionEndEndpointTests(MeetingLifecycleTestMixin, TestCase):
     """Verify the public end-session contract and authorization boundary."""
 
-    @patch("apps.meetings.realtime.emitter.MeetingSocketEmitter.emit_session_state")
-    @patch("apps.meetings.realtime.emitter.MeetingSocketEmitter.emit_session_ended")
-    @patch("apps.meetings.tasks.destroy_janus_room_for_session.delay")
     def test_host_can_end_session_repeatedly_without_duplicate_side_effects(
         self,
-        destroy_delay,
-        emit_session_ended,
-        emit_session_state,
     ):
         """Repeated coordinator requests return terminal state but emit cleanup only once."""
 
@@ -277,19 +206,14 @@ class MeetingSessionEndEndpointTests(MeetingLifecycleTestMixin, TestCase):
 
         self.assertEqual(first_response.status_code, status.HTTP_200_OK)
         self.assertEqual(second_response.status_code, status.HTTP_200_OK)
-        self.assertEqual(first_response.json()["session"]["lifecycle_state"], MeetingLifecycleState.ENDED)
-        self.assertEqual(second_response.json()["session"]["lifecycle_state"], MeetingLifecycleState.ENDED)
+        self.assertEqual(first_response.json()["meeting"]["lifecycle"], MeetingLifecycleState.ENDED)
+        self.assertEqual(second_response.json()["meeting"]["lifecycle"], MeetingLifecycleState.ENDED)
         ended_events = MeetingEvent.objects.filter(
             session=session,
             event_type=MeetingEventType.SESSION_ENDED,
         )
         self.assertEqual(ended_events.count(), 1)
         self.assertEqual(ended_events.get().payload["reason"], "Agenda complete.")
-        destroy_delay.assert_called_once()
-        self.assertEqual(destroy_delay.call_args.args[0], str(session.pk))
-        uuid.UUID(destroy_delay.call_args.args[1])
-        emit_session_ended.assert_called_once()
-        emit_session_state.assert_called_once()
 
     def test_regular_room_member_cannot_end_session(self):
         """A membership without participant-management permission receives HTTP 403."""
@@ -342,56 +266,3 @@ class MeetingSessionEndEndpointTests(MeetingLifecycleTestMixin, TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         session.refresh_from_db()
         self.assertEqual(session.lifecycle_state, MeetingLifecycleState.WAITING)
-
-
-class MeetingSessionEndedRealtimeTests(MeetingLifecycleTestMixin, TestCase):
-    """Protect the client-facing terminal Socket.IO event contract."""
-
-    @patch.object(MeetingSocketEmitter, "_emit")
-    def test_session_ended_event_targets_live_session_connections(self, emit):
-        """Admitted and waiting live sockets receive the terminal event payload."""
-
-        host, _, session = self.make_session(
-            handle="socket-host",
-            title="Socket end session",
-        )
-        session.ended_at = timezone.now()
-        session.save(update_fields=["ended_at", "updated_at"])
-        ParticipantConnection.objects.create(
-            session=session,
-            profile=host,
-            socket_id="connected-socket",
-            status=RealtimeConnectionStatus.ACTIVE,
-        )
-        ParticipantConnection.objects.create(
-            session=session,
-            profile=self.make_profile("waiting-socket-user"),
-            socket_id="waiting-socket",
-            status=RealtimeConnectionStatus.SUBSCRIBED,
-        )
-        ParticipantConnection.objects.create(
-            session=session,
-            profile=host,
-            socket_id="disconnected-socket",
-            status=RealtimeConnectionStatus.DISCONNECTED,
-        )
-
-        MeetingSocketEmitter.emit_session_ended(session=session, reason="Agenda complete.")
-
-        self.assertEqual(emit.call_count, 2)
-        self.assertEqual(
-            {item.kwargs["room"] for item in emit.call_args_list},
-            {"connected-socket", "waiting-socket"},
-        )
-        expected_payload = {
-            "session_id": str(session.pk),
-            "reason": "Agenda complete.",
-            "ended_at": session.ended_at.isoformat(),
-        }
-        for item in emit.call_args_list:
-            self.assertEqual(item.kwargs["event"], MeetingSocketEvents.SESSION_ENDED)
-            context = item.kwargs["payload"]["event_context"]
-            self.assertEqual(context["kind"], "live")
-            self.assertEqual(context["event_id"], f"session-ended:{session.pk}")
-            self.assertEqual(context["occurred_at"], session.ended_at.isoformat())
-            self.assertEqual({key: value for key, value in item.kwargs["payload"].items() if key != "event_context"}, expected_payload)

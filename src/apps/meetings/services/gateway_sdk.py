@@ -59,7 +59,6 @@ def person_state(participant, membership):
 
 def application_state(session):
     summary = State.serialize_session(session)
-    summary.pop("janus_room_id", None)
     # Session metrics/heartbeat writes are not semantic gateway state changes.
     summary.pop("state_version", None)
     summary.pop("last_synced_at", None)

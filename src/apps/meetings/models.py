@@ -452,7 +452,7 @@ class MeetingSession(UUIDTimestampedModel):
 
     # Chosen at creation; disabling rollout flags never transfers ownership.
     signalling_backend = models.CharField(
-        max_length=16, default="legacy", choices=[("legacy", "Legacy"), ("gateway", "Gateway")],
+        max_length=16, default="gateway", choices=[("legacy", "Legacy"), ("gateway", "Gateway")],
         editable=False,
     )
 
