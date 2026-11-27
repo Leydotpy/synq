@@ -33,12 +33,18 @@ jobs:
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
         with:
           version: "0.13.4"
-      - run: uv sync --frozen
+      - run: uv sync --locked
+      - name: Verify project task runner and command composition
+        run: |
+          uv run --locked poe --help
+          uv run --locked poe --dry-run dev
+          uv run --locked poe --dry-run verify
+          uv run --locked poe --dry-run worker --concurrency=4
       - name: Check normal Django startup with fixture email settings
         env:
           DJANGO_EMAIL_USER: acceptance@example.invalid
           DJANGO_EMAIL_PASSWORD: fixture-only
-        run: uv run --frozen python src/manage.py check --settings=conf.settings
+        run: uv run --locked poe check --settings=conf.settings
       - name: Check meeting log filter style
         run: |
           uvx ruff@0.14.14 check src/conf/logging.py

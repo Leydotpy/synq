@@ -25,6 +25,8 @@ dependencies = [
 ]
 
 [dependency-groups]
+dev = ["poethepoet==0.49.0"]
+
 # Live acceptance starts a separate gateway process and actual media peers.
 gateway-integration = [
     "jrtc-signalling[runtime]>=0.1,<0.2",
@@ -47,3 +49,48 @@ jrtc = { git = "https://github.com/Leydotpy/jrtc.git", rev = "b0998af03c07023028
 jrtc-video = { git = "https://github.com/Leydotpy/jrtc-plugins.git", rev = "eed430960cc88fa574370d62eae502093757a9f1", subdirectory = "jrtc-video" }
 
 jrtc-signalling = { git = "https://github.com/Leydotpy/jrtc-signalling.git", rev = "8ad22c05f13a87d04a16189a8ec08bcc0276cec6" }
+
+# Invoke with uv run poe so every child inherits the uv-managed environment.
+# Avoid nested uv syncs (especially when starting workers concurrently).
+[tool.poe]
+executor = "simple"
+
+[tool.poe.tasks]
+# Development and ASGI serving
+server = { cmd = "python src/manage.py runserver", help = "Start the existing ASGI development server with reload and static files" }
+serve = { cmd = "python -m uvicorn conf.asgi:application --app-dir src --host 0.0.0.0", help = "Start standalone ASGI without reload" }
+
+# Django management (additional arguments are forwarded)
+manage = { cmd = "python src/manage.py", help = "Run any Django management command" }
+shell = { cmd = "python src/manage.py shell", help = "Open Django shell" }
+check = { cmd = "python src/manage.py check", help = "Run Django system checks" }
+migrate = { cmd = "python src/manage.py migrate", help = "Apply database migrations" }
+makemigrations = { cmd = "python src/manage.py makemigrations", help = "Generate database migrations" }
+migration-check = { cmd = "python src/manage.py makemigrations --check --dry-run", help = "Check for missing migrations without writing files" }
+showmigrations = { cmd = "python src/manage.py showmigrations", help = "Show migration status" }
+superuser = { cmd = "python src/manage.py createsuperuser", help = "Create a Django superuser" }
+collectstatic = { cmd = "python src/manage.py collectstatic --noinput", help = "Collect static assets" }
+
+# Celery: conf is in src, not the repository root.
+worker = { cmd = "python -m celery -A conf.celery:app worker --loglevel=INFO", cwd = "src", help = "Start the Celery worker (Unix prefork by default)" }
+worker-solo = { cmd = "python -m celery -A conf.celery:app worker --loglevel=INFO --pool=solo", cwd = "src", help = "Start a single-process development worker" }
+beat = { cmd = "python -m celery -A conf.celery:app beat --loglevel=INFO", cwd = "src", help = "Start the single Celery scheduler" }
+
+# Signed gateway control-plane workers; no Janus runtime is started here.
+gateway-commands = { cmd = "python src/manage.py run_gateway_commands", help = "Dispatch durable gateway commands and record outcomes" }
+gateway-events = { cmd = "python src/manage.py run_gateway_events", help = "Consume authenticated gateway lifecycle events" }
+gateway-drain = { cmd = "python src/manage.py check_legacy_signalling_drain", help = "Check retained legacy work before cutover" }
+gateway-cutover = { cmd = "python src/manage.py gateway_cutover", help = "Explicitly select, pause or drain a room; requires arguments" }
+prune-gateway-tickets = { cmd = "python src/manage.py prune_gateway_tickets", help = "Delete expired gateway ticket receipts in a bounded batch" }
+reconcile-schedule = { cmd = "python src/manage.py reconcile_celery_schedule --dry-run", help = "Preview Celery schedule reconciliation without changing it" }
+
+# Testing
+test = { cmd = "python manage.py test", cwd = "src", help = "Run Django tests (optional test labels and settings)" }
+test-meetings = { cmd = "python src/manage.py test apps.meetings", help = "Run meetings tests" }
+verify = { sequence = ["check", "migration-check", "test-meetings"], help = "Run Django checks, migration drift check and meeting tests" }
+setup = { sequence = ["migrate", "collectstatic"], help = "Apply migrations and collect static files" }
+
+# Local orchestration only; the full stack requires Linux/WSL and configured
+# PostgreSQL, Redis, Janus and a separately started signalling gateway.
+dev-core = { parallel = ["server", "worker-solo", "beat"], help = "Start Django and Celery without gateway workers" }
+dev = { parallel = ["server", "worker-solo", "beat", "gateway-commands", "gateway-events"], help = "Start all five Django-side development processes (Linux/WSL)" }

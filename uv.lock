@@ -908,6 +908,18 @@ wheels = [
 ]
 
 [[package]]
+name = "poethepoet"
+version = "0.49.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/7e/160d391368d359f7dd6dd647575499c395687beb4a6b2ebfbfbf8a20b817/poethepoet-0.49.0.tar.gz", hash = "sha256:256b72c057b5f60341bbe09498212939e558341fac4ab59d0ce478aca04f0d2a" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a1/f5/a2404b9cb3c299cd148533d07e1a378b60aa4ae640c69fb522596ca157ae/poethepoet-0.49.0-py3-none-any.whl", hash = "sha256:97b456f3c52c9af75d4bc504e0f5cfee44545a84f446ba645a0a8f6a0131422f" },
+]
+
+[[package]]
 name = "prompt-toolkit"
 version = "3.0.52"
 source = { registry = "https://pypi.org/simple" }
@@ -1455,6 +1467,9 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+dev = [
+    { name = "poethepoet" },
+]
 gateway-integration = [
     { name = "aiortc" },
     { name = "jrtc-signalling", extra = ["runtime"] },
@@ -1484,6 +1499,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+dev = [{ name = "poethepoet", specifier = "==0.49.0" }]
 gateway-integration = [
     { name = "aiortc" },
     { name = "jrtc-signalling", extras = ["runtime"], git = "https://github.com/Leydotpy/jrtc-signalling.git?rev=8ad22c05f13a87d04a16189a8ec08bcc0276cec6" },
